@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -207,9 +208,15 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
 		Writer: buf.NewWriter(conn),
 	}
+	// Vupen: метим момент входа в dispatcher, чтобы сопоставить с
+	// "[Vupen sniff] stage=..." логами из app/dispatcher и понять
+	// сколько ms ушло между accept-callback'ом gVisor и завершением
+	// диспатча (включая sniff'у).
+	dispatchStart := time.Now()
 	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))
 	}
+	errors.LogDebug(ctx, "[Vupen tun] dispatch_done dest=", destination, " elapsed_ms=", time.Since(dispatchStart).Milliseconds())
 }
 
 // Close implements common.Closable.

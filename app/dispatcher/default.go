@@ -388,7 +388,12 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 	}
 
 	contentResult, contentErr := func() (SniffResult, error) {
-		cacheDeadline := 200 * time.Millisecond
+		// Vupen: было захардкожено 200ms, теперь берём из VupenSniffCacheDeadline
+		// (см. tuning_vupen.go в этом пакете). Дефолт 800ms — компромисс между
+		// надёжностью sniff'а на медленных iOS NetworkExtension путях и worst-case
+		// latency на не-TLS трафике.
+		cacheDeadline := VupenSniffCacheDeadline
+		vupenDebugLogSniffOutcome(ctx, "start", 0, 0, 0, cacheDeadline, nil)
 		totalAttempt := 0
 		for {
 			select {
@@ -408,15 +413,20 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 					switch err {
 					case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
 						totalAttempt++
+						vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, err)
 					case protocol.ErrProtoNeedMoreData: // Protocol Need More Data: protocol matches, but need more data to complete sniffing
 						// in this case, do not add totalAttempt(allow to read until timeout)
+						vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, err)
 					default:
+						vupenDebugLogSniffOutcome(ctx, "success", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, err)
 						return result, err
 					}
 				} else {
 					totalAttempt++
+					vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, 0, cachingTimeElapsed, cacheDeadline, nil)
 				}
 				if totalAttempt >= 2 || cacheDeadline <= 0 {
+					vupenDebugLogSniffOutcome(ctx, "timeout", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, errSniffingTimeout)
 					return nil, errSniffingTimeout
 				}
 			}
