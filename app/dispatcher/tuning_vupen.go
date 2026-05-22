@@ -37,7 +37,7 @@ import (
 // использует вместо хардкоженных 200ms. Переменная, а не const — чтобы можно
 // было править ad-hoc (например через рантайм-эксперимент, A/B на стороне
 // libXray и пр.) без рекомпиляции этого пакета.
-var VupenSniffCacheDeadline = 800 * time.Millisecond
+var VupenSniffCacheDeadline = 1000 * time.Millisecond
 
 // vupenDebugLogSniffOutcome — единая точка debug-лога по итогу одной попытки
 // sniff-чтения. Вызывается из sniffer() внутри цикла; loglevel: debug в
