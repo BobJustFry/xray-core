@@ -181,6 +181,8 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		if quicParams.KeepAlivePeriod == 0 {
 			if keepAlivePeriod == 0 {
 				quicConfig.KeepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+			} else if keepAlivePeriod > 0 {
+				quicConfig.KeepAlivePeriod = keepAlivePeriod
 			}
 		}
 		if quicParams.MaxIncomingStreams == 0 {
@@ -518,6 +520,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		var seq int64
 		var lastWrite time.Time
 
+		dynamicHTTPClient := httpClient
+		dynamicXmuxClient := xmuxClient
 		for {
 			// by offloading the uploads into a buffered pipe, multiple conn.Write
 			// calls get automatically batched together into larger POST requests.
@@ -552,13 +556,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 				lastWrite = time.Now()
 
-				if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
-					(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-					httpClient, xmuxClient = getHTTPClient(ctx, dest, streamSettings)
+				if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
+					(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
+					dynamicHTTPClient, dynamicXmuxClient = getHTTPClient(ctx, dest, streamSettings)
 				}
 
-				go func() {
-					err := httpClient.PostPacket(
+				go func(hClient DialerClient) {
+					err := hClient.PostPacket(
 						ctx,
 						requestURL.String(),
 						sessionId,
@@ -571,9 +575,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 						uploadPipeReader.Interrupt()
 						doSplit.Store(false)
 					}
-				}()
+				}(dynamicHTTPClient)
 
-				if _, ok := httpClient.(*DefaultDialerClient); ok {
+				if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
 					<-wroteRequest.Wait()
 				}
 			}
