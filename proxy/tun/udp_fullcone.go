@@ -60,6 +60,10 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	conn, found = u.udpConns[src]
 	if !found {
+		if len(u.udpConns) >= mobileMaxUDPConns() {
+			errors.LogDebug(context.Background(), "drop udp: max sessions ", mobileMaxUDPConns())
+			return
+		}
 		egress := make(chan *packet, 1024)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
