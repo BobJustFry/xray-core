@@ -65,7 +65,7 @@ func (t *stackGVisor) Start() error {
 		return err
 	}
 
-	tcpForwarder := tcp.NewForwarder(ipStack, 0, 65535, func(r *tcp.ForwarderRequest) {
+	tcpForwarder := tcp.NewForwarder(ipStack, 0, mobileTCPMaxInFlight(), func(r *tcp.ForwarderRequest) {
 		go func(r *tcp.ForwarderRequest) {
 			var wq waiter.Queue
 			var id = r.ID()
@@ -240,10 +240,14 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	rOpt := tcpip.TCPRecovery(0)
 	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &rOpt)
 
+	bufMax := mobileTCPBufMaxBytes()
+	if bufMax < tcpRXBufMinSize {
+		bufMax = tcpRXBufMinSize
+	}
 	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     tcpRXBufMinSize,
 		Default: tcpRXBufDefSize,
-		Max:     tcpRXBufMaxSize,
+		Max:     bufMax,
 	}
 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt)
 	if err != nil {
@@ -253,7 +257,7 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
 		Min:     tcpTXBufMinSize,
 		Default: tcpTXBufDefSize,
-		Max:     tcpTXBufMaxSize,
+		Max:     bufMax,
 	}
 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt)
 	if err != nil {
