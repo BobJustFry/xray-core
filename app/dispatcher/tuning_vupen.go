@@ -31,6 +31,7 @@ import (
 	stdnet "net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -159,9 +160,12 @@ func vupenSniffDestinationString(ctx context.Context) string {
 	return dest.String()
 }
 
-func vupenLogSniffSecondRoundOk(ctx context.Context) {
+func vupenLogSniffSecondRoundOk(ctx context.Context, phase1Elapsed, phase2Elapsed, totalElapsed time.Duration) {
 	dest := vupenSniffDestinationString(ctx)
-	line := vupenSniffSecondRoundOkMarker + " успешный sniff на 2-й фазе (1500ms), " + dest
+	line := vupenSniffSecondRoundOkMarker + " успешный sniff на 2-й фазе, elapsed_ms=" +
+		strconv.FormatInt(totalElapsed.Milliseconds(), 10) +
+		", phase1_ms=" + strconv.FormatInt(phase1Elapsed.Milliseconds(), 10) +
+		", phase2_ms=" + strconv.FormatInt(phase2Elapsed.Milliseconds(), 10) + ", " + dest
 	vupenAppendSniffRoutingInfoLog(line)
 	errors.LogInfo(ctx, line)
 }
