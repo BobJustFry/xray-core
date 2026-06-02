@@ -314,6 +314,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 					ob.Target = destination
 				}
 			}
+			vupenMarkSniffMissIfNoDomain(content, destination, sniffingRequest.Enabled)
 			d.routedDispatch(ctx, outbound, destination)
 		}()
 	}
@@ -369,6 +370,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 				ob.Target = destination
 			}
 		}
+		vupenMarkSniffMissIfNoDomain(content, destination, sniffingRequest.Enabled)
 		d.routedDispatch(ctx, outbound, destination)
 	}
 
@@ -496,6 +498,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	ob.Tag = handler.Tag()
+	vupenMaybeLogDirectMissToProxy(ctx, destination, handler.Tag())
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
 		if tag := handler.Tag(); tag != "" {
 			if inTag == "" {

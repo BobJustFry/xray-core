@@ -31,7 +31,15 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 )
+
+// vupenSniffMissAttr — в Content.Attributes после sniff без домена (маршрут по IP).
+const vupenSniffMissAttr = "vupen_sniff_miss"
+
+// vupenDirectMissLogMarker — парсится во Flutter (баннер + красная строка в «Ошибка Xray»).
+const vupenDirectMissLogMarker = "[Vupen routing] direct-miss:"
 
 // VupenSniffCacheDeadline — переопределяемый дефолт, который app/dispatcher.sniffer
 // использует вместо хардкоженных 200ms. Переменная, а не const — чтобы можно
@@ -66,5 +74,35 @@ func vupenDebugLogSniffOutcome(
 		" cache_used_ms=", cacheUsed.Milliseconds(),
 		" budget_ms=", budget.Milliseconds(),
 		" sniff_err=", sniffErr,
+	)
+}
+
+func vupenMarkSniffMissIfNoDomain(content *session.Content, destination net.Destination, sniffEnabled bool) {
+	if !sniffEnabled || content == nil {
+		return
+	}
+	if !destination.Address.Family().IsDomain() {
+		content.SetAttribute(vupenSniffMissAttr, "1")
+	}
+}
+
+func vupenMaybeLogDirectMissToProxy(ctx context.Context, destination net.Destination, outTag string) {
+	content := session.ContentFromContext(ctx)
+	if content == nil || content.Attribute(vupenSniffMissAttr) != "1" {
+		return
+	}
+	if destination.Address.Family().IsDomain() {
+		return
+	}
+	if outTag != "proxy" {
+		return
+	}
+	errors.LogError(ctx,
+		vupenDirectMissLogMarker,
+		" sniff не распознал домен, ",
+		destination,
+		" → detour [",
+		outTag,
+		"] (правила direct по домену не применены)",
 	)
 }
