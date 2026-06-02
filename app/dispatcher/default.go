@@ -293,6 +293,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 			}
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+			vupenRecordSniffDomainHint(ctx, result)
 			if err == nil {
 				content.Protocol = result.Protocol()
 			}
@@ -349,6 +350,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		}
 		outbound.Reader = cReader
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		vupenRecordSniffDomainHint(ctx, result)
 		if err == nil {
 			content.Protocol = result.Protocol()
 		}
@@ -384,6 +386,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 	sniffer := NewSniffer(ctx)
 
 	metaresult, metadataErr := sniffer.SniffMetadata(ctx)
+	vupenRecordSniffDomainHint(ctx, metaresult)
 
 	if metadataOnly {
 		return metaresult, metadataErr
@@ -412,6 +415,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 
 				if !payload.IsEmpty() {
 					result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
+					vupenRecordSniffDomainHint(ctx, result)
 					switch err {
 					case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
 						totalAttempt++
@@ -435,11 +439,15 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 		}
 	}()
 	if contentErr != nil && metadataErr == nil {
+		vupenRecordSniffDomainHint(ctx, metaresult)
 		return metaresult, nil
 	}
 	if contentErr == nil && metadataErr == nil {
-		return CompositeResult(metaresult, contentResult), nil
+		composite := CompositeResult(metaresult, contentResult)
+		vupenRecordSniffDomainHint(ctx, composite)
+		return composite, nil
 	}
+	vupenRecordSniffDomainHint(ctx, contentResult)
 	return contentResult, contentErr
 }
 

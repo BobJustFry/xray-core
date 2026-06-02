@@ -30,6 +30,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,12 @@ import (
 
 // vupenSniffMissAttr — в Content.Attributes после sniff без домена (маршрут по IP).
 const vupenSniffMissAttr = "vupen_sniff_miss"
+
+// vupenSniffDomainAttr / vupenSniffProtocolAttr — подсказки для лога direct-miss.
+const (
+	vupenSniffDomainAttr   = "vupen_sniff_domain"
+	vupenSniffProtocolAttr = "vupen_sniff_protocol"
+)
 
 // vupenDirectMissLogMarker — парсится во Flutter (баннер + вкладка «Ошибки снифф»).
 const vupenDirectMissLogMarker = "[Vupen routing] direct-miss:"
@@ -87,6 +94,56 @@ func vupenDebugLogSniffOutcome(
 		" budget_ms=", budget.Milliseconds(),
 		" sniff_err=", sniffErr,
 	)
+}
+
+func vupenSniffResultDomain(result SniffResult) string {
+	if result == nil {
+		return ""
+	}
+	return result.Domain()
+}
+
+// vupenRecordSniffDomainHint сохраняет последний непустой домен/протокол из sniff.
+func vupenRecordSniffDomainHint(ctx context.Context, result SniffResult) {
+	content := session.ContentFromContext(ctx)
+	if content == nil || result == nil {
+		return
+	}
+	if domain := vupenSniffResultDomain(result); domain != "" {
+		content.SetAttribute(vupenSniffDomainAttr, domain)
+	}
+	if proto := result.Protocol(); proto != "" {
+		content.SetAttribute(vupenSniffProtocolAttr, proto)
+	}
+}
+
+// vupenSniffMissDomainForLog — строка для vupen_sniff_routing_miss.log и direct-miss.
+func vupenSniffMissDomainForLog(ctx context.Context) string {
+	domain := ""
+	proto := ""
+	content := session.ContentFromContext(ctx)
+	if content != nil {
+		domain = content.Attribute(vupenSniffDomainAttr)
+		proto = content.Attribute(vupenSniffProtocolAttr)
+	}
+	if domain == "" {
+		outbounds := session.OutboundsFromContext(ctx)
+		if len(outbounds) > 0 {
+			ob := outbounds[len(outbounds)-1]
+			if ob.RouteTarget.IsValid() && ob.RouteTarget.Address.Family().IsDomain() {
+				domain = ob.RouteTarget.Address.Domain()
+			} else if ob.OriginalTarget.IsValid() && ob.OriginalTarget.Address.Family().IsDomain() {
+				domain = ob.OriginalTarget.Address.Domain()
+			}
+		}
+	}
+	if domain == "" {
+		return "domain=—"
+	}
+	if proto != "" {
+		return "domain=" + domain + ", proto=" + proto
+	}
+	return "domain=" + domain
 }
 
 func vupenMarkSniffMissIfNoDomain(content *session.Content, destination net.Destination, sniffEnabled bool) {
@@ -137,8 +194,11 @@ func vupenMaybeLogDirectMissToProxy(ctx context.Context, destination net.Destina
 	if outTag != "proxy" {
 		return
 	}
-	detail := "sniff не распознал домен, " + destination.String() +
-		" → detour [" + outTag + "] (должен был direct по домену)"
+	detail := strings.Join([]string{
+		"sniff не распознал домен",
+		vupenSniffMissDomainForLog(ctx),
+		destination.String() + " → detour [" + outTag + "] (должен был direct по домену)",
+	}, ", ")
 	vupenAppendSniffRoutingMissLog(vupenDirectMissLogMarker + " " + detail)
 	errors.LogError(ctx,
 		vupenDirectMissLogMarker,
