@@ -28,6 +28,7 @@ package dispatcher
 
 import (
 	"context"
+	stdnet "net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,9 +76,43 @@ const (
 // vupenSniffSecondRoundAttr — фаза 2 была запущена (успех или финальный timeout).
 const vupenSniffSecondRoundAttr = "vupen_sniff_second_round"
 
-// vupenShouldSkipSniff — UDP:53 не снифим (маршрут по IP резолвера без задержки).
+// vupenSniffSkipResolverIPs — публичные DNS (DoH/DoT/QUIC на любых портах).
+var vupenSniffSkipResolverIPs = []stdnet.IP{
+	stdnet.ParseIP("1.1.1.1"),
+	stdnet.ParseIP("1.0.0.1"),
+	stdnet.ParseIP("8.8.8.8"),
+	stdnet.ParseIP("8.8.4.4"),
+}
+
+func vupenIsSniffSkipResolverIP(addr net.Address) bool {
+	if !addr.Family().IsIP() {
+		return false
+	}
+	ip := addr.IP()
+	if ip == nil {
+		return false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	for _, resolver := range vupenSniffSkipResolverIPs {
+		if resolver != nil && ip4.Equal(resolver.To4()) {
+			return true
+		}
+	}
+	return false
+}
+
+// vupenShouldSkipSniff — DNS без sniff: UDP:53, TCP:853 (DoT), whitelist резолверов.
 func vupenShouldSkipSniff(destination net.Destination) bool {
-	return destination.Network == net.Network_UDP && destination.Port == 53
+	if destination.Network == net.Network_UDP && destination.Port == 53 {
+		return true
+	}
+	if destination.Network == net.Network_TCP && destination.Port == 853 {
+		return true
+	}
+	return vupenIsSniffSkipResolverIP(destination.Address)
 }
 
 // vupenDebugLogSniffOutcome — единая точка debug-лога по итогу одной попытки
