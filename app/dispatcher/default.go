@@ -437,7 +437,9 @@ func vupenSniffContentTwoPhase(
 	sniffer *Sniffer,
 	payload *buf.Buffer,
 ) (SniffResult, error) {
+	sniffStarted := time.Now()
 	result, err, timedOut := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase1Deadline, 1)
+	phase1Elapsed := time.Since(sniffStarted)
 	if err == nil && result != nil {
 		return result, nil
 	}
@@ -448,9 +450,11 @@ func vupenSniffContentTwoPhase(
 	if content != nil {
 		content.SetAttribute(vupenSniffSecondRoundAttr, "1")
 	}
+	phase2Started := time.Now()
 	result2, err2, timedOut2 := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase2Deadline, 2)
+	phase2Elapsed := time.Since(phase2Started)
 	if err2 == nil && result2 != nil {
-		vupenLogSniffSecondRoundOk(ctx)
+		vupenLogSniffSecondRoundOk(ctx, phase1Elapsed, phase2Elapsed, time.Since(sniffStarted))
 		return result2, nil
 	}
 	if timedOut2 || err2 == errSniffingTimeout {
