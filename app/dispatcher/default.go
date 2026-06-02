@@ -284,7 +284,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
-	if !sniffingRequest.Enabled {
+	if !sniffingRequest.Enabled || vupenShouldSkipSniff(destination) {
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
 		go func() {
@@ -342,7 +342,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	}
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
-	if !sniffingRequest.Enabled {
+	if !sniffingRequest.Enabled || vupenShouldSkipSniff(destination) {
 		d.routedDispatch(ctx, outbound, destination)
 	} else {
 		cReader := &cachedReader{
@@ -379,6 +379,87 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	return nil
 }
 
+// vupenSniffOnePhase — одна фаза sniff до исчерпания phaseBudget (без totalAttempt>=1).
+func vupenSniffOnePhase(
+	ctx context.Context,
+	cReader *cachedReader,
+	payload *buf.Buffer,
+	network net.Network,
+	sniffer *Sniffer,
+	phaseBudget time.Duration,
+	phase int,
+) (SniffResult, error, bool) {
+	cacheDeadline := phaseBudget
+	vupenDebugLogSniffOutcome(ctx, "start", phase, 0, 0, 0, cacheDeadline, nil)
+	totalAttempt := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err(), false
+		default:
+			cachingStartingTimeStamp := time.Now()
+			err := cReader.Cache(payload, cacheDeadline)
+			if err != nil {
+				return nil, err, false
+			}
+			cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
+			cacheDeadline -= cachingTimeElapsed
+
+			if !payload.IsEmpty() {
+				result, sniffErr := sniffer.Sniff(ctx, payload.Bytes(), network)
+				vupenRecordSniffDomainHint(ctx, result)
+				switch sniffErr {
+				case common.ErrNoClue:
+					totalAttempt++
+					vupenDebugLogSniffOutcome(ctx, "iter", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
+				case protocol.ErrProtoNeedMoreData:
+					vupenDebugLogSniffOutcome(ctx, "iter", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
+				default:
+					vupenDebugLogSniffOutcome(ctx, "success", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
+					return result, sniffErr, false
+				}
+			} else {
+				totalAttempt++
+				vupenDebugLogSniffOutcome(ctx, "iter", phase, totalAttempt, 0, cachingTimeElapsed, cacheDeadline, nil)
+			}
+			if cacheDeadline <= 0 {
+				vupenDebugLogSniffOutcome(ctx, "timeout", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, errSniffingTimeout)
+				return nil, errSniffingTimeout, true
+			}
+		}
+	}
+}
+
+func vupenSniffContentTwoPhase(
+	ctx context.Context,
+	cReader *cachedReader,
+	network net.Network,
+	sniffer *Sniffer,
+	payload *buf.Buffer,
+) (SniffResult, error) {
+	result, err, timedOut := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase1Deadline, 1)
+	if err == nil && result != nil {
+		return result, nil
+	}
+	if err != nil && !timedOut {
+		return result, err
+	}
+	content := session.ContentFromContext(ctx)
+	if content != nil {
+		content.SetAttribute(vupenSniffSecondRoundAttr, "1")
+	}
+	result2, err2, timedOut2 := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase2Deadline, 2)
+	if err2 == nil && result2 != nil {
+		vupenLogSniffSecondRoundOk(ctx)
+		return result2, nil
+	}
+	if timedOut2 || err2 == errSniffingTimeout {
+		vupenLogSniffSecondRoundTimeout(ctx)
+		return nil, errSniffingTimeout
+	}
+	return result2, err2
+}
+
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
 	payload := buf.NewWithSize(32767)
 	defer payload.Release()
@@ -392,52 +473,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 		return metaresult, metadataErr
 	}
 
-	contentResult, contentErr := func() (SniffResult, error) {
-		// Vupen: было захардкожено 200ms, теперь берём из VupenSniffCacheDeadline
-		// (см. tuning_vupen.go в этом пакете). Дефолт 800ms — компромисс между
-		// надёжностью sniff'а на медленных iOS NetworkExtension путях и worst-case
-		// latency на не-TLS трафике.
-		cacheDeadline := VupenSniffCacheDeadline
-		vupenDebugLogSniffOutcome(ctx, "start", 0, 0, 0, cacheDeadline, nil)
-		totalAttempt := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			default:
-				cachingStartingTimeStamp := time.Now()
-				err := cReader.Cache(payload, cacheDeadline)
-				if err != nil {
-					return nil, err
-				}
-				cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
-				cacheDeadline -= cachingTimeElapsed
-
-				if !payload.IsEmpty() {
-					result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
-					vupenRecordSniffDomainHint(ctx, result)
-					switch err {
-					case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
-						totalAttempt++
-						vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, err)
-					case protocol.ErrProtoNeedMoreData: // Protocol Need More Data: protocol matches, but need more data to complete sniffing
-						// in this case, do not add totalAttempt(allow to read until timeout)
-						vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, err)
-					default:
-						vupenDebugLogSniffOutcome(ctx, "success", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, err)
-						return result, err
-					}
-				} else {
-					totalAttempt++
-					vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, 0, cachingTimeElapsed, cacheDeadline, nil)
-				}
-				if totalAttempt >= 1 || cacheDeadline <= 0 {
-					vupenDebugLogSniffOutcome(ctx, "timeout", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, errSniffingTimeout)
-					return nil, errSniffingTimeout
-				}
-			}
-		}
-	}()
+	contentResult, contentErr := vupenSniffContentTwoPhase(ctx, cReader, network, sniffer, payload)
 	if contentErr != nil && metadataErr == nil {
 		vupenRecordSniffDomainHint(ctx, metaresult)
 		return metaresult, nil

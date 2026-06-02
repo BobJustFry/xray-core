@@ -2,8 +2,8 @@
 //
 // Этот файл — точка концентрации правок Vupen в форке BobJustFry/xray-core
 // (на базе remnawave/xray-core). Держим здесь:
-//   - VupenSniffCacheDeadline: переопределяемый дефолт таймаута sniff-цикла
-//     (используется в default.go::sniffer вместо upstream-овых 200ms).
+//   - VupenSniffPhase1Deadline (200ms) / VupenSniffPhase2Deadline (1500ms):
+//     двухфазный sniff; UDP:53 skip; лог second-round ok/timeout.
 //   - vupenDebugSniff: helper для debug-логов внутри sniff-цикла, чтобы можно
 //     было точечно (по vSupport-архивам) видеть на каком этапе и сколько
 //     миллисекунд теряется.
@@ -60,11 +60,25 @@ var (
 	vupenSniffMissLogPathCached string
 )
 
-// VupenSniffCacheDeadline — переопределяемый дефолт, который app/dispatcher.sniffer
-// использует вместо хардкоженных 200ms. Переменная, а не const — чтобы можно
-// было править ad-hoc (например через рантайм-эксперимент, A/B на стороне
-// libXray и пр.) без рекомпиляции этого пакета.
-var VupenSniffCacheDeadline = 1500 * time.Millisecond
+// VupenSniffPhase1Deadline / VupenSniffPhase2Deadline — двухфазный sniff (не-DNS).
+var (
+	VupenSniffPhase1Deadline = 200 * time.Millisecond
+	VupenSniffPhase2Deadline = 1500 * time.Millisecond
+)
+
+// vupenSniffSecondRoundOkMarker / TimeoutMarker — UI (синий / красный) во Flutter.
+const (
+	vupenSniffSecondRoundOkMarker      = "[Vupen sniff] second-round ok:"
+	vupenSniffSecondRoundTimeoutMarker = "[Vupen sniff] second-round timeout:"
+)
+
+// vupenSniffSecondRoundAttr — фаза 2 была запущена (успех или финальный timeout).
+const vupenSniffSecondRoundAttr = "vupen_sniff_second_round"
+
+// vupenShouldSkipSniff — UDP:53 не снифим (маршрут по IP резолвера без задержки).
+func vupenShouldSkipSniff(destination net.Destination) bool {
+	return destination.Network == net.Network_UDP && destination.Port == 53
+}
 
 // vupenDebugLogSniffOutcome — единая точка debug-лога по итогу одной попытки
 // sniff-чтения. Вызывается из sniffer() внутри цикла; loglevel: debug в
@@ -75,11 +89,12 @@ var VupenSniffCacheDeadline = 1500 * time.Millisecond
 //   attempt    — текущее значение totalAttempt
 //   payloadLen — сколько байт сейчас в буфере sniffer'а
 //   cacheUsed  — сколько ms потрачено на cReader.Cache() в этой итерации
-//   budgetMs   — сколько ms осталось от VupenSniffCacheDeadline после итерации
-//   sniffErr   — что вернул sniffer.Sniff (ErrNoClue / ErrProtoNeedMoreData / nil / др.)
+//   phase      — 1 | 2 (фаза sniff)
+//   budgetMs   — остаток budget фазы после итерации
 func vupenDebugLogSniffOutcome(
 	ctx context.Context,
 	stage string,
+	phase int,
 	attempt int,
 	payloadLen int32,
 	cacheUsed time.Duration,
@@ -88,12 +103,56 @@ func vupenDebugLogSniffOutcome(
 ) {
 	errors.LogDebug(ctx,
 		"[Vupen sniff] stage=", stage,
+		" phase=", phase,
 		" attempt=", attempt,
 		" payload=", payloadLen,
 		" cache_used_ms=", cacheUsed.Milliseconds(),
 		" budget_ms=", budget.Milliseconds(),
 		" sniff_err=", sniffErr,
 	)
+}
+
+func vupenSniffDestinationString(ctx context.Context) string {
+	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		return ""
+	}
+	dest := outbounds[len(outbounds)-1].OriginalTarget
+	if !dest.IsValid() {
+		return ""
+	}
+	return dest.String()
+}
+
+func vupenLogSniffSecondRoundOk(ctx context.Context) {
+	dest := vupenSniffDestinationString(ctx)
+	line := vupenSniffSecondRoundOkMarker + " успешный sniff на 2-й фазе (1500ms), " + dest
+	vupenAppendSniffRoutingInfoLog(line)
+	errors.LogInfo(ctx, line)
+}
+
+func vupenLogSniffSecondRoundTimeout(ctx context.Context) {
+	dest := vupenSniffDestinationString(ctx)
+	line := vupenSniffSecondRoundTimeoutMarker + " sniff timeout на 2-й фазе, " +
+		vupenSniffMissDomainForLog(ctx) + ", " + dest
+	vupenAppendSniffRoutingMissLog(line)
+	errors.LogError(ctx, line)
+}
+
+func vupenAppendSniffRoutingInfoLog(line string) {
+	path := vupenSniffMissLogFile()
+	if path == "" || line == "" {
+		return
+	}
+	vupenSniffMissLogMu.Lock()
+	defer vupenSniffMissLogMu.Unlock()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	ts := time.Now().Format("2006/01/02 15:04:05.000000")
+	_, _ = f.WriteString(ts + " " + line + "\n")
 }
 
 func vupenSniffResultDomain(result SniffResult) string {
