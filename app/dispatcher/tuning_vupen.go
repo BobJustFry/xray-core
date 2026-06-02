@@ -28,18 +28,30 @@ package dispatcher
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/session"
 )
 
 // vupenSniffMissAttr — в Content.Attributes после sniff без домена (маршрут по IP).
 const vupenSniffMissAttr = "vupen_sniff_miss"
 
-// vupenDirectMissLogMarker — парсится во Flutter (баннер + красная строка в «Ошибка Xray»).
+// vupenDirectMissLogMarker — парсится во Flutter (баннер + вкладка «Ошибки снифф»).
 const vupenDirectMissLogMarker = "[Vupen routing] direct-miss:"
+
+// vupenSniffRoutingMissLogName — App Group, рядом с xray/ (см. VupenXraySupport.sniffRoutingMissLogName).
+const vupenSniffRoutingMissLogName = "vupen_sniff_routing_miss.log"
+
+var (
+	vupenSniffMissLogMu         sync.Mutex
+	vupenSniffMissLogPathCached string
+)
 
 // VupenSniffCacheDeadline — переопределяемый дефолт, который app/dispatcher.sniffer
 // использует вместо хардкоженных 200ms. Переменная, а не const — чтобы можно
@@ -86,6 +98,34 @@ func vupenMarkSniffMissIfNoDomain(content *session.Content, destination net.Dest
 	}
 }
 
+func vupenSniffMissLogFile() string {
+	if vupenSniffMissLogPathCached != "" {
+		return vupenSniffMissLogPathCached
+	}
+	datDir := os.Getenv(platform.AssetLocation)
+	if datDir == "" {
+		return ""
+	}
+	vupenSniffMissLogPathCached = filepath.Clean(filepath.Join(datDir, "..", vupenSniffRoutingMissLogName))
+	return vupenSniffMissLogPathCached
+}
+
+func vupenAppendSniffRoutingMissLog(line string) {
+	path := vupenSniffMissLogFile()
+	if path == "" || line == "" {
+		return
+	}
+	vupenSniffMissLogMu.Lock()
+	defer vupenSniffMissLogMu.Unlock()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	ts := time.Now().Format("2006/01/02 15:04:05.000000")
+	_, _ = f.WriteString(ts + " [SniffError] " + line + "\n")
+}
+
 func vupenMaybeLogDirectMissToProxy(ctx context.Context, destination net.Destination, outTag string) {
 	content := session.ContentFromContext(ctx)
 	if content == nil || content.Attribute(vupenSniffMissAttr) != "1" {
@@ -97,12 +137,12 @@ func vupenMaybeLogDirectMissToProxy(ctx context.Context, destination net.Destina
 	if outTag != "proxy" {
 		return
 	}
+	detail := "sniff не распознал домен, " + destination.String() +
+		" → detour [" + outTag + "] (должен был direct по домену)"
+	vupenAppendSniffRoutingMissLog(vupenDirectMissLogMarker + " " + detail)
 	errors.LogError(ctx,
 		vupenDirectMissLogMarker,
-		" sniff не распознал домен, ",
-		destination,
-		" → detour [",
-		outTag,
-		"] (правила direct по домену не применены)",
+		" ",
+		detail,
 	)
 }
