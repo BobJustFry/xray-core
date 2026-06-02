@@ -162,10 +162,17 @@ func vupenSniffDestinationString(ctx context.Context) string {
 
 func vupenLogSniffSecondRoundOk(ctx context.Context, phase1Elapsed, phase2Elapsed, totalElapsed time.Duration) {
 	dest := vupenSniffDestinationString(ctx)
-	line := vupenSniffSecondRoundOkMarker + " успешный sniff на 2-й фазе, elapsed_ms=" +
-		strconv.FormatInt(totalElapsed.Milliseconds(), 10) +
-		", phase1_ms=" + strconv.FormatInt(phase1Elapsed.Milliseconds(), 10) +
-		", phase2_ms=" + strconv.FormatInt(phase2Elapsed.Milliseconds(), 10) + ", " + dest
+	totalMs := totalElapsed.Milliseconds()
+	line := vupenSniffSecondRoundOkMarker + " успешный sniff на 2-й фазе, выход за " +
+		strconv.FormatInt(totalMs, 10) + " ms (фаза 1: " +
+		strconv.FormatInt(phase1Elapsed.Milliseconds(), 10) + " ms, фаза 2: " +
+		strconv.FormatInt(phase2Elapsed.Milliseconds(), 10) + " ms)"
+	if hint := vupenSniffMissDomainForLog(ctx); hint != "domain=—" {
+		line += ", " + hint
+	}
+	if dest != "" {
+		line += ", " + dest
+	}
 	vupenAppendSniffRoutingInfoLog(line)
 	errors.LogInfo(ctx, line)
 }
