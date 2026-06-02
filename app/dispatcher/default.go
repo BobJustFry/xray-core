@@ -427,7 +427,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 					totalAttempt++
 					vupenDebugLogSniffOutcome(ctx, "iter", totalAttempt, 0, cachingTimeElapsed, cacheDeadline, nil)
 				}
-				if totalAttempt >= 2 || cacheDeadline <= 0 {
+				if totalAttempt >= 1 || cacheDeadline <= 0 {
 					vupenDebugLogSniffOutcome(ctx, "timeout", totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, errSniffingTimeout)
 					return nil, errSniffingTimeout
 				}
