@@ -292,7 +292,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				reader: outbound.Reader.(*pipe.Reader),
 			}
 			outbound.Reader = cReader
-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+			result, err := sniffer(ctx, cReader, sniffingRequest, destination)
 			vupenRecordSniffDomainHint(ctx, result)
 			if err == nil {
 				content.Protocol = result.Protocol()
@@ -349,7 +349,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			reader: outbound.Reader.(buf.TimeoutReader),
 		}
 		outbound.Reader = cReader
-		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		result, err := sniffer(ctx, cReader, sniffingRequest, destination)
 		vupenRecordSniffDomainHint(ctx, result)
 		if err == nil {
 			content.Protocol = result.Protocol()
@@ -379,7 +379,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	return nil
 }
 
-// vupenSniffOnePhase — одна фаза sniff до исчерпания phaseBudget (без totalAttempt>=1).
+// vupenSniffOnePhase — одна фаза sniff до исчерпания phaseBudget или hopeless early-exit.
 func vupenSniffOnePhase(
 	ctx context.Context,
 	cReader *cachedReader,
@@ -412,9 +412,19 @@ func vupenSniffOnePhase(
 				case common.ErrNoClue:
 					totalAttempt++
 					vupenDebugLogSniffOutcome(ctx, "iter", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
+					if totalAttempt >= 2 && !vupenSniffMayNeedMoreTLS(payload.Bytes()) {
+						vupenLogSniffEarlyExit(ctx, phase, "no_clue_exhausted", payload.Len(), sniffErr)
+						vupenDebugLogSniffOutcome(ctx, "early-exit", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, errSniffingHopeless)
+						return nil, errSniffingHopeless, false
+					}
 				case protocol.ErrProtoNeedMoreData:
 					vupenDebugLogSniffOutcome(ctx, "iter", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
 				default:
+					if sniffErr == errUnknownContent && !payload.IsEmpty() {
+						vupenLogSniffEarlyExit(ctx, phase, "unknown_content", payload.Len(), sniffErr)
+						vupenDebugLogSniffOutcome(ctx, "early-exit", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
+						return nil, errSniffingHopeless, false
+					}
 					vupenDebugLogSniffOutcome(ctx, "success", phase, totalAttempt, payload.Len(), cachingTimeElapsed, cacheDeadline, sniffErr)
 					return result, sniffErr, false
 				}
@@ -464,20 +474,20 @@ func vupenSniffContentTwoPhase(
 	return result2, err2
 }
 
-func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
+func sniffer(ctx context.Context, cReader *cachedReader, sniffingRequest session.SniffingRequest, destination net.Destination) (SniffResult, error) {
 	payload := buf.NewWithSize(32767)
 	defer payload.Release()
 
-	sniffer := NewSniffer(ctx)
+	sniffer := NewSniffer(ctx, sniffingRequest.OverrideDestinationForProtocol, destination.Port)
 
 	metaresult, metadataErr := sniffer.SniffMetadata(ctx)
 	vupenRecordSniffDomainHint(ctx, metaresult)
 
-	if metadataOnly {
+	if sniffingRequest.MetadataOnly {
 		return metaresult, metadataErr
 	}
 
-	contentResult, contentErr := vupenSniffContentTwoPhase(ctx, cReader, network, sniffer, payload)
+	contentResult, contentErr := vupenSniffContentTwoPhase(ctx, cReader, destination.Network, sniffer, payload)
 	if contentErr != nil && metadataErr == nil {
 		vupenRecordSniffDomainHint(ctx, metaresult)
 		return metaresult, nil
