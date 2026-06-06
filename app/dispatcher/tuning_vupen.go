@@ -28,6 +28,8 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	stdnet "net"
 	"os"
 	"path/filepath"
@@ -72,7 +74,11 @@ var (
 const (
 	vupenSniffSecondRoundOkMarker      = "[Vupen sniff] second-round ok:"
 	vupenSniffSecondRoundTimeoutMarker = "[Vupen sniff] second-round timeout:"
+	vupenSniffEarlyExitMarker          = "[Vupen sniff] early-exit:"
 )
+
+// errSniffingHopeless — домен извлечь нельзя, ждать фазу 2 бессмысленно.
+var errSniffingHopeless = errors.New("hopeless sniff: no domain extractable")
 
 // vupenSniffSecondRoundAttr — фаза 2 была запущена (успех или финальный timeout).
 const vupenSniffSecondRoundAttr = "vupen_sniff_second_round"
@@ -106,6 +112,24 @@ func vupenIsSniffSkipResolverIP(addr net.Address) bool {
 }
 
 // vupenShouldSkipSniff — DNS без sniff: UDP:53, TCP:853 (DoT), whitelist резолверов.
+// vupenSniffMayNeedMoreTLS — не делать hopeless exit, пока буфер похож на неполный TLS ClientHello.
+func vupenSniffMayNeedMoreTLS(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	if payload[0] != 0x16 {
+		return false
+	}
+	if len(payload) < 5 {
+		return true
+	}
+	if payload[1] != 0x03 {
+		return false
+	}
+	headerLen := int(binary.BigEndian.Uint16(payload[3:5]))
+	return 5+headerLen > len(payload)
+}
+
 func vupenShouldSkipSniff(destination net.Destination) bool {
 	if destination.Network == net.Network_UDP && destination.Port == 53 {
 		return true
@@ -158,6 +182,18 @@ func vupenSniffDestinationString(ctx context.Context) string {
 		return ""
 	}
 	return dest.String()
+}
+
+func vupenLogSniffEarlyExit(ctx context.Context, phase int, exitType string, payloadLen int32, sniffErr error) {
+	dest := vupenSniffDestinationString(ctx)
+	line := vupenSniffEarlyExitMarker + " type=" + exitType +
+		" phase=" + strconv.Itoa(phase) +
+		" payload=" + strconv.FormatInt(int64(payloadLen), 10) +
+		" sniff_err=" + fmt.Sprint(sniffErr)
+	if dest != "" {
+		line += ", " + dest
+	}
+	errors.LogInfo(ctx, line)
 }
 
 func vupenLogSniffSecondRoundOk(ctx context.Context, phase1Elapsed, phase2Elapsed, totalElapsed time.Duration) {
