@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"strings"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -33,22 +34,84 @@ type Sniffer struct {
 	sniffer []protocolSnifferWithMetadata
 }
 
-func NewSniffer(ctx context.Context) *Sniffer {
-	ret := &Sniffer{
-		sniffer: []protocolSnifferWithMetadata{
-			{func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) }, false, net.Network_TCP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) }, false, net.Network_TCP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, false, net.Network_TCP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) }, false, net.Network_UDP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) }, false, net.Network_UDP},
+func vupenDestOverrideAllows(destOverride []string, protocol string) bool {
+	if len(destOverride) == 0 {
+		return true
+	}
+	for _, p := range destOverride {
+		if strings.HasPrefix(protocol, p) || strings.HasPrefix(p, protocol) {
+			return true
+		}
+	}
+	return false
+}
+
+func vupenBuildTCPSniffers(destOverride []string, port net.Port) []protocolSnifferWithMetadata {
+	byProto := map[string]protocolSnifferWithMetadata{
+		"http": {
+			func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) },
+			false,
+			net.Network_TCP,
+		},
+		"tls": {
+			func(c context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) },
+			false,
+			net.Network_TCP,
+		},
+		"bittorrent": {
+			func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) },
+			false,
+			net.Network_TCP,
 		},
 	}
-	if sniffer, err := newFakeDNSSniffer(ctx); err == nil {
-		others := ret.sniffer
-		ret.sniffer = append(ret.sniffer, sniffer)
-		fakeDNSThenOthers, err := newFakeDNSThenOthers(ctx, sniffer, others)
-		if err == nil {
-			ret.sniffer = append([]protocolSnifferWithMetadata{fakeDNSThenOthers}, ret.sniffer...)
+
+	var order []string
+	switch port {
+	case net.Port(443):
+		order = []string{"tls", "http", "bittorrent"}
+	case net.Port(80):
+		order = []string{"http", "tls", "bittorrent"}
+	default:
+		order = []string{"http", "tls", "bittorrent"}
+	}
+
+	var out []protocolSnifferWithMetadata
+	for _, proto := range order {
+		if vupenDestOverrideAllows(destOverride, proto) {
+			out = append(out, byProto[proto])
+		}
+	}
+	return out
+}
+
+func NewSniffer(ctx context.Context, destOverride []string, port net.Port) *Sniffer {
+	quicS := protocolSnifferWithMetadata{
+		func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) },
+		false,
+		net.Network_UDP,
+	}
+	utpS := protocolSnifferWithMetadata{
+		func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) },
+		false,
+		net.Network_UDP,
+	}
+
+	ret := &Sniffer{sniffer: vupenBuildTCPSniffers(destOverride, port)}
+	if vupenDestOverrideAllows(destOverride, "quic") {
+		ret.sniffer = append(ret.sniffer, quicS)
+	}
+	if vupenDestOverrideAllows(destOverride, "bittorrent") {
+		ret.sniffer = append(ret.sniffer, utpS)
+	}
+
+	if vupenDestOverrideAllows(destOverride, "fakedns") {
+		if sniffer, err := newFakeDNSSniffer(ctx); err == nil {
+			others := ret.sniffer
+			ret.sniffer = append(ret.sniffer, sniffer)
+			fakeDNSThenOthers, err := newFakeDNSThenOthers(ctx, sniffer, others)
+			if err == nil {
+				ret.sniffer = append([]protocolSnifferWithMetadata{fakeDNSThenOthers}, ret.sniffer...)
+			}
 		}
 	}
 	return ret
