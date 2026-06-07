@@ -258,6 +258,37 @@ func vupenRecordSniffDomainHint(ctx context.Context, result SniffResult) {
 	}
 }
 
+// vupenAccessLogDestination — поле To для log.access: TUN handler фиксирует IP до sniff.
+func vupenAccessLogDestination(ctx context.Context, dest net.Destination) net.Destination {
+	if dest.IsValid() && dest.Address.Family().IsDomain() {
+		return dest
+	}
+	port := dest.Port
+	network := dest.Network
+	if content := session.ContentFromContext(ctx); content != nil {
+		if domain := content.Attribute(vupenSniffDomainAttr); domain != "" {
+			return net.Destination{
+				Network: network,
+				Address: net.ParseAddress(domain),
+				Port:    port,
+			}
+		}
+	}
+	if outbounds := session.OutboundsFromContext(ctx); len(outbounds) > 0 {
+		ob := outbounds[len(outbounds)-1]
+		for _, cand := range []net.Destination{ob.RouteTarget, ob.Target} {
+			if cand.IsValid() && cand.Address.Family().IsDomain() {
+				return net.Destination{
+					Network: network,
+					Address: cand.Address,
+					Port:    port,
+				}
+			}
+		}
+	}
+	return dest
+}
+
 // vupenSniffMissDomainForLog — строка для vupen_sniff_routing_miss.log и direct-miss.
 func vupenSniffMissDomainForLog(ctx context.Context) string {
 	domain := ""
