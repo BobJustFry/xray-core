@@ -216,3 +216,31 @@ func setUserAgent(conn *grpc.ClientConn, ua string) {
 		*(*string)(f.Addr().UnsafePointer()) = ua
 	}
 }
+
+// ResetTransportPool closes cached gRPC ClientConns (libXray iOS net-path recovery).
+func ResetTransportPool() int {
+	globalDialerAccess.Lock()
+	defer globalDialerAccess.Unlock()
+	if globalDialerMap == nil {
+		return 0
+	}
+	n := 0
+	for _, client := range globalDialerMap {
+		if client != nil {
+			_ = client.Close()
+			n++
+		}
+	}
+	globalDialerMap = nil
+	return n
+}
+
+// TransportPoolSize returns number of cached gRPC ClientConns.
+func TransportPoolSize() int {
+	globalDialerAccess.Lock()
+	defer globalDialerAccess.Unlock()
+	if globalDialerMap == nil {
+		return 0
+	}
+	return len(globalDialerMap)
+}
