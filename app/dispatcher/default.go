@@ -569,6 +569,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 				accessMessage.Detour = inTag + " >> " + tag
 			}
 		}
+		accessMessage.To = vupenAccessLogDestination(ctx, destination)
 		log.Record(accessMessage)
 	}
 
