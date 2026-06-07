@@ -111,7 +111,8 @@ func (t *stackGVisor) Start() error {
 		srcIP := net.IPAddress(id.RemoteAddress.AsSlice())
 		dstIP := net.IPAddress(id.LocalAddress.AsSlice())
 		if srcIP == nil || dstIP == nil {
-			panic(id)
+			errors.LogDebug(context.Background(), "drop udp with size ", len(data), " > invalid ip address ", id.RemoteAddress.AsSlice(), " ", id.LocalAddress.AsSlice())
+			return true
 		}
 		src := net.UDPDestination(srcIP, net.Port(id.RemotePort))
 		dst := net.UDPDestination(dstIP, net.Port(id.LocalPort))
