@@ -8,7 +8,6 @@ import (
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/geodata/strmatcher"
-	"github.com/xtls/xray-core/common/utils"
 )
 
 type DomainMatcher interface {
@@ -26,7 +25,7 @@ type DomainMatcherFactory interface {
 
 type MphDomainMatcherFactory struct {
 	sync.Mutex
-	shared *utils.WeakCacheMap[string, strmatcher.MphValueMatcher]
+	shared map[string]strmatcher.MatcherGroup // TODO: cleanup
 }
 
 func buildDomainRulesKey(rules []*DomainRule) string {
@@ -66,7 +65,7 @@ func (f *MphDomainMatcherFactory) BuildMatcher(rules []*DomainRule) (DomainMatch
 	if key != "" {
 		f.Lock()
 		defer f.Unlock()
-		if g, ok := f.shared.Load(key); ok {
+		if g := f.shared[key]; g != nil {
 			errors.LogDebug(context.Background(), "geodata mph domain matcher cache HIT for ", len(rules), " rules")
 			return g, nil
 		}
@@ -103,14 +102,14 @@ func (f *MphDomainMatcherFactory) BuildMatcher(rules []*DomainRule) (DomainMatch
 		return nil, err
 	}
 	if key != "" {
-		f.shared.Store(key, g)
+		f.shared[key] = g
 	}
 	return g, nil
 }
 
 type CompactDomainMatcherFactory struct {
 	sync.Mutex
-	shared *utils.WeakCacheMap[string, strmatcher.LinearAnyMatcher]
+	shared map[string]strmatcher.MatcherSet // TODO: cleanup
 }
 
 func (f *CompactDomainMatcherFactory) getOrCreateFrom(rule *GeoSiteRule) (strmatcher.MatcherSet, error) {
@@ -119,7 +118,7 @@ func (f *CompactDomainMatcherFactory) getOrCreateFrom(rule *GeoSiteRule) (strmat
 	f.Lock()
 	defer f.Unlock()
 
-	if s, ok := f.shared.Load(key); ok {
+	if s := f.shared[key]; s != nil {
 		errors.LogDebug(context.Background(), "geodata geosite matcher cache HIT ", key)
 		return s, nil
 	}
@@ -139,7 +138,7 @@ func (f *CompactDomainMatcherFactory) getOrCreateFrom(rule *GeoSiteRule) (strmat
 		}
 		s.Add(m)
 	}
-	f.shared.Store(key, s)
+	f.shared[key] = s
 	return s, err
 }
 
@@ -231,8 +230,8 @@ func parseDomain(d *Domain) (strmatcher.Matcher, error) {
 func newDomainMatcherFactory() DomainMatcherFactory {
 	switch runtime.GOOS {
 	case "ios", "android":
-		return &CompactDomainMatcherFactory{shared: utils.NewWeakCacheMap[string, strmatcher.LinearAnyMatcher]()}
+		return &CompactDomainMatcherFactory{shared: make(map[string]strmatcher.MatcherSet)}
 	default:
-		return &MphDomainMatcherFactory{shared: utils.NewWeakCacheMap[string, strmatcher.MphValueMatcher]()}
+		return &MphDomainMatcherFactory{shared: make(map[string]strmatcher.MatcherGroup)}
 	}
 }
