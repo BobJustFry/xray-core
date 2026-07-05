@@ -287,7 +287,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				if err != nil {
 					return nil, err
 				}
-				context.AfterFunc(conn.Context(), func() { pktConn.Close() })
+				context.AfterFunc(quicConn.Context(), func() { udpConn.Close() })
 
 				switch quicParams.Congestion {
 				case "force-brutal":
