@@ -6,6 +6,8 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/app/observatory"
 	"github.com/xtls/xray-core/common"
@@ -16,6 +18,16 @@ import (
 	"github.com/xtls/xray-core/features/extension"
 	"github.com/xtls/xray-core/features/outbound"
 	feature_stats "github.com/xtls/xray-core/features/stats"
+)
+
+// Vupen: expvar-переменные ("stats"/"observatory") — процесс-глобальные и не
+// допускают повторной публикации (иначе panic "Reuse of exported var name").
+// В in-process libXray (Windows/iOS/Android) ядро может стартовать несколько раз
+// в одном процессе (реконнект/смена сервера), поэтому публикуем один раз, а
+// колбэки читают активный обработчик через [activeMetricsHandler].
+var (
+	metricsPublishOnce   sync.Once
+	activeMetricsHandler atomic.Pointer[MetricsHandler]
 )
 
 type MetricsHandler struct {
@@ -37,46 +49,58 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
 		c.statsManager = sm
 		c.ohm = om
 	}))
-	expvar.Publish("stats", expvar.Func(func() interface{} {
-		resp := map[string]map[string]map[string]int64{
-			"inbound":  {},
-			"outbound": {},
-			"user":     {},
-		}
-		c.statsManager.VisitCounters(func(name string, counter feature_stats.Counter) bool {
-			nameSplit := strings.Split(name, ">>>")
-			typeName, tagOrUser, direction := nameSplit[0], nameSplit[1], nameSplit[3]
-			if item, found := resp[typeName][tagOrUser]; found {
-				item[direction] = counter.Value()
-			} else {
-				resp[typeName][tagOrUser] = map[string]int64{
-					direction: counter.Value(),
+	// Vupen: активный обработчик для expvar-колбэков (переживает рестарт ядра).
+	activeMetricsHandler.Store(c)
+	metricsPublishOnce.Do(func() {
+		expvar.Publish("stats", expvar.Func(func() interface{} {
+			resp := map[string]map[string]map[string]int64{
+				"inbound":  {},
+				"outbound": {},
+				"user":     {},
+			}
+			h := activeMetricsHandler.Load()
+			if h == nil || h.statsManager == nil {
+				return resp
+			}
+			h.statsManager.VisitCounters(func(name string, counter feature_stats.Counter) bool {
+				nameSplit := strings.Split(name, ">>>")
+				typeName, tagOrUser, direction := nameSplit[0], nameSplit[1], nameSplit[3]
+				if item, found := resp[typeName][tagOrUser]; found {
+					item[direction] = counter.Value()
+				} else {
+					resp[typeName][tagOrUser] = map[string]int64{
+						direction: counter.Value(),
+					}
+				}
+				return true
+			})
+			return resp
+		}))
+		expvar.Publish("observatory", expvar.Func(func() interface{} {
+			h := activeMetricsHandler.Load()
+			if h == nil {
+				return nil
+			}
+			if h.observatory == nil {
+				common.Must(core.RequireFeatures(ctx, func(observatory extension.Observatory) error {
+					h.observatory = observatory
+					return nil
+				}))
+				if h.observatory == nil {
+					return nil
 				}
 			}
-			return true
-		})
-		return resp
-	}))
-	expvar.Publish("observatory", expvar.Func(func() interface{} {
-		if c.observatory == nil {
-			common.Must(core.RequireFeatures(ctx, func(observatory extension.Observatory) error {
-				c.observatory = observatory
-				return nil
-			}))
-			if c.observatory == nil {
-				return nil
+			resp := map[string]*observatory.OutboundStatus{}
+			if o, err := h.observatory.GetObservation(context.Background()); err != nil {
+				return err
+			} else {
+				for _, x := range o.(*observatory.ObservationResult).GetStatus() {
+					resp[x.OutboundTag] = x
+				}
 			}
-		}
-		resp := map[string]*observatory.OutboundStatus{}
-		if o, err := c.observatory.GetObservation(context.Background()); err != nil {
-			return err
-		} else {
-			for _, x := range o.(*observatory.ObservationResult).GetStatus() {
-				resp[x.OutboundTag] = x
-			}
-		}
-		return resp
-	}))
+			return resp
+		}))
+	})
 	return c, nil
 }
 
@@ -124,6 +148,14 @@ func (p *MetricsHandler) Start() error {
 }
 
 func (p *MetricsHandler) Close() error {
+	// Vupen: освобождаем listen-порт при остановке ядра, иначе повторный старт
+	// в том же процессе (in-process libXray) падает с "bind: address already in use".
+	activeMetricsHandler.CompareAndSwap(p, nil)
+	if p.tcpListener != nil {
+		err := p.tcpListener.Close()
+		p.tcpListener = nil
+		return err
+	}
 	return nil
 }
 
