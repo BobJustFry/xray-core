@@ -281,21 +281,39 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		if keepAlivePeriod < 0 {
 			keepAlivePeriod = 0
 		}
-		transport = &http2.Transport{
-			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
-				return dialContext(ctxInner)
-			},
+		// Vupen (TRANS-1): x/net defaults are a 4 MiB receive window per stream, 1 GiB
+		// per connection and a 1 MiB frame read buffer that never shrinks. In stream-one
+		// mode one TUN TCP connection is one h2 stream, so a dozen stalled streams pin
+		// tens of MB inside a ~50 MB NE (audit 2026-09-03 §1). 256 KiB per stream still
+		// carries ~20 Mbit/s at 100 ms RTT.
+		//
+		// The per-stream / per-connection limits are not fields of http2.Transport:
+		// x/net reads them from net/http.HTTP2Config (Go 1.24+) on the http1 transport
+		// the h2 transport was configured from. So the h2 transport is created through
+		// ConfigureTransports to attach that config, then dialing is handed back to the
+		// h2 transport itself: ConfigureTransports installs a no-dial pool meant for ALPN
+		// upgrades from t1, and clearing ConnPool before first use restores the default
+		// pool, which dials through DialTLSContext exactly as the plain http2.Transport did.
+		h1 := &http.Transport{
 			IdleConnTimeout: net.ConnIdleTimeout,
-			ReadIdleTimeout: keepAlivePeriod,
-			// Vupen (TRANS-1): x/net defaults are a 4 MiB receive window per stream,
-			// 1 GiB per connection and a 1 MiB frame read buffer that never shrinks.
-			// In stream-one mode one TUN TCP connection is one h2 stream, so a dozen
-			// stalled streams pin tens of MB inside a ~50 MB NE (audit 2026-09-03 §1).
-			// 256 KiB per stream still carries ~20 Mbit/s at 100 ms RTT per stream.
-			MaxReceiveBufferPerStream:     256 << 10,
-			MaxReceiveBufferPerConnection: 4 << 20,
-			MaxReadFrameSize:              64 << 10,
+			HTTP2: &http.HTTP2Config{
+				MaxReceiveBufferPerStream:     256 << 10,
+				MaxReceiveBufferPerConnection: 4 << 20,
+				MaxReadFrameSize:              64 << 10,
+			},
 		}
+		h2t, err := http2.ConfigureTransports(h1)
+		if err != nil {
+			errors.LogError(context.Background(), "XHTTP h2: ConfigureTransports failed, receive windows stay at x/net defaults: ", err)
+			h2t = &http2.Transport{MaxReadFrameSize: 64 << 10}
+		}
+		h2t.ConnPool = nil
+		h2t.DialTLSContext = func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
+			return dialContext(ctxInner)
+		}
+		h2t.IdleConnTimeout = net.ConnIdleTimeout
+		h2t.ReadIdleTimeout = keepAlivePeriod
+		transport = h2t
 	} else {
 		httpDialContext := func(ctxInner context.Context, network string, addr string) (net.Conn, error) {
 			return dialContext(ctxInner)
