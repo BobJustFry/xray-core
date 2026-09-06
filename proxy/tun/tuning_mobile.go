@@ -7,6 +7,10 @@ var (
 	tcpBufMaxKB    int32 = 1024
 	tcpMaxInFlight int32 = 256
 	maxUDPConns    int32 = 128
+	// Per-session egress queue depth (packets). Was a literal 1024: even an empty
+	// channel is 1024 pointers (~8 KB) per session, and a stalled outbound could
+	// queue 1024 MTU-sized packets per session before dropping (TUN-1).
+	udpEgressDepth int32 = 128
 )
 
 // SetTCPBufMaxKB sets max TCP RX/TX buffer per connection in kilobytes.
@@ -51,6 +55,21 @@ func mobileTCPMaxInFlight() int {
 
 func mobileMaxUDPConns() int {
 	n := int(atomic.LoadInt32(&maxUDPConns))
+	if n <= 0 {
+		return 128
+	}
+	return n
+}
+
+// SetUDPEgressDepth sets the per-session UDP egress queue depth (packets).
+func SetUDPEgressDepth(n int) {
+	if n > 0 {
+		atomic.StoreInt32(&udpEgressDepth, int32(n))
+	}
+}
+
+func mobileUDPEgressDepth() int {
+	n := int(atomic.LoadInt32(&udpEgressDepth))
 	if n <= 0 {
 		return 128
 	}

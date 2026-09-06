@@ -248,9 +248,20 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	if bufMax < tcpRXBufMinSize {
 		bufMax = tcpRXBufMinSize
 	}
+	// gVisor rejects Default > Max (ErrInvalidOptionValue) and the stack would not
+	// start at all. The defaults are 1 MiB, so any tcpBufMaxKB below 1024 needs the
+	// default clamped along with it.
+	rxDef := tcpRXBufDefSize
+	if rxDef > bufMax {
+		rxDef = bufMax
+	}
+	txDef := tcpTXBufDefSize
+	if txDef > bufMax {
+		txDef = bufMax
+	}
 	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     tcpRXBufMinSize,
-		Default: tcpRXBufDefSize,
+		Default: rxDef,
 		Max:     bufMax,
 	}
 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt)
@@ -260,7 +271,7 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 
 	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
 		Min:     tcpTXBufMinSize,
-		Default: tcpTXBufDefSize,
+		Default: txDef,
 		Max:     bufMax,
 	}
 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt)

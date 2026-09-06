@@ -287,6 +287,14 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			},
 			IdleConnTimeout: net.ConnIdleTimeout,
 			ReadIdleTimeout: keepAlivePeriod,
+			// Vupen (TRANS-1): x/net defaults are a 4 MiB receive window per stream,
+			// 1 GiB per connection and a 1 MiB frame read buffer that never shrinks.
+			// In stream-one mode one TUN TCP connection is one h2 stream, so a dozen
+			// stalled streams pin tens of MB inside a ~50 MB NE (audit 2026-09-03 §1).
+			// 256 KiB per stream still carries ~20 Mbit/s at 100 ms RTT per stream.
+			MaxReceiveBufferPerStream:     256 << 10,
+			MaxReceiveBufferPerConnection: 4 << 20,
+			MaxReadFrameSize:              64 << 10,
 		}
 	} else {
 		httpDialContext := func(ctxInner context.Context, network string, addr string) (net.Conn, error) {
