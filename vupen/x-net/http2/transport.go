@@ -1457,7 +1457,10 @@ func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
 	// (heap profile 2026-09-07, 100% of live heap in writeRequestBody).
 	// 64 KiB only changes how the body is cut into DATA frames; throughput is
 	// governed by the peer's flow-control window, not by this buffer.
-	const max = 64 << 10
+	// The cap lives in an exported var (vupen.go) so libXray can read it: a
+	// build against stock x/net then fails to compile instead of silently
+	// shipping the 512 KiB buffer.
+	max := int64(VupenRequestBodyScratchMax)
 	n := int64(maxFrameSize)
 	if n > max {
 		n = max
