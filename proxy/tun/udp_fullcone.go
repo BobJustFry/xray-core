@@ -61,12 +61,17 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	conn, found = u.udpConns[src]
 	if !found {
 		if len(u.udpConns) >= mobileMaxUDPConns() {
-			errors.LogDebug(context.Background(), "drop udp: max sessions ", mobileMaxUDPConns())
+			// Vupen: было LogDebug — на рабочем уровне лога переполнение не видно.
+			n := tunStats.udpCapDrops.Add(1)
+			if logEvery(n) {
+				errors.LogWarning(context.Background(), "[tun] drop udp: max sessions ", mobileMaxUDPConns(), " (drops ", n, ")")
+			}
 			return
 		}
 		egress := make(chan *packet, mobileUDPEgressDepth())
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
+		tunStats.udpSessions.Store(int32(len(u.udpConns)))
 
 		go u.handleConnection(conn, dst)
 	}
@@ -88,6 +93,7 @@ func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
 	if found {
 		delete(u.udpConns, src)
 		close(conn.egress)
+		tunStats.udpSessions.Store(int32(len(u.udpConns)))
 	}
 	u.Unlock()
 }

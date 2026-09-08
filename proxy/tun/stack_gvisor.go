@@ -65,6 +65,7 @@ func (t *stackGVisor) Start() error {
 	if err != nil {
 		return err
 	}
+	setTunStack(ipStack)
 
 	tcpForwarder := tcp.NewForwarder(ipStack, 0, mobileTCPMaxInFlight(), func(r *tcp.ForwarderRequest) {
 		go func(r *tcp.ForwarderRequest) {
@@ -74,10 +75,21 @@ func (t *stackGVisor) Start() error {
 			// Perform a TCP three-way handshake.
 			ep, err := r.CreateEndpoint(&wq)
 			if err != nil {
+				tunStats.tcpHandshakeFail.Add(1)
 				errors.LogError(t.ctx, err.String())
 				r.Complete(true)
 				return
 			}
+			// Vupen: по документации gVisor maxInFlight — число НЕЗАВЕРШЁННЫХ
+			// рукопожатий, и Complete снимает запись из inFlight. Раньше Complete
+			// стоял после HandleConnection, то есть после конца всего соединения:
+			// лимит (96 на мобильном пресете) держал живые соединения, а 97-й SYN
+			// gVisor ронял молча — ForwardMaxInFlightDrop++ и ни строки в лог.
+			// Снаружи это «интернета нет, VPN зелёный, проба проходит».
+			r.Complete(false)
+			tunStats.tcpAccepted.Add(1)
+			tunStats.tcpLive.Add(1)
+			defer tunStats.tcpLive.Add(-1)
 
 			options := ep.SocketOptions()
 			options.SetKeepAlive(false)
@@ -92,8 +104,6 @@ func (t *stackGVisor) Start() error {
 
 			// close the socket
 			ep.Close()
-			// send connection complete upstream
-			r.Complete(false)
 		}(r)
 	})
 	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
@@ -196,6 +206,7 @@ func (t *stackGVisor) Close() error {
 	if t.stack == nil {
 		return nil
 	}
+	setTunStack(nil)
 	t.endpoint.Attach(nil)
 	t.stack.Close()
 	for _, endpoint := range t.stack.CleanupEndpoints() {

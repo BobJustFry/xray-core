@@ -20,7 +20,10 @@ func SetTCPBufMaxKB(kb int) {
 	}
 }
 
-// SetTCPMaxInFlight sets max concurrent TCP connections in gVisor forwarder.
+// SetTCPMaxInFlight sets gVisor's forwarder maxInFlight: the number of TCP
+// handshakes in progress at once (per gVisor docs), NOT of live connections.
+// Until core 47 Complete() was called after the whole connection had ended, so
+// this capped live connections and the 97th SYN was dropped silently.
 func SetTCPMaxInFlight(n int) {
 	if n > 0 {
 		atomic.StoreInt32(&tcpMaxInFlight, int32(n))

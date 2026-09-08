@@ -3,7 +3,13 @@ package tun
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"os"
+	"syscall"
+	"time"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -58,6 +64,7 @@ func (e *LinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 
 	if dispatcher != nil {
 		ctx, cancel := context.WithCancel(context.Background())
+		tunStats.readerAlive.Store(1)
 		go e.dispatchLoop(ctx, dispatcher)
 		e.dispatcherCancel = cancel
 	}
@@ -99,12 +106,26 @@ func (e *LinkEndpoint) WritePackets(packetBufferList stack.PacketBufferList) (in
 	for _, packetBuffer := range packetBufferList.AsSlice() {
 		err = e.device.WritePacket(packetBuffer)
 		if err != nil {
+			tunStats.writeDrops.Add(1)
 			return n, &tcpip.ErrAborted{}
 		}
+		tunStats.writePackets.Add(1)
 		n++
 	}
 
 	return n, nil
+}
+
+// isTunReadFatal — дескриптор закрыт или EOF: повторять нечего.
+func isTunReadFatal(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EBADF
+	}
+	return false
 }
 
 func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.NetworkDispatcher) {
@@ -112,10 +133,12 @@ func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.Networ
 	var version byte
 	var packet *stack.PacketBuffer
 	var err error
+	var backoff time.Duration
 
 	for {
 		select {
 		case <-ctx.Done():
+			tunStats.readerAlive.Store(0)
 			return
 		default:
 			version, packet, err = e.device.ReadPacket()
@@ -124,11 +147,34 @@ func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.Networ
 				e.device.Wait()
 				continue
 			}
-			// stop dispatcher loop on any other interface failure
+			// Vupen: раньше любая ошибка чтения молча завершала цикл — TUN мёртв,
+			// ядро живо, в логе пусто. Теперь: ошибка пишется в лог (первая и каждая
+			// сотая), временная — повтор с паузой до 250 мс, и только закрытый
+			// дескриптор останавливает цикл. Счётчик readerAlive виден в heartbeat.
 			if err != nil {
-				e.Attach(nil)
-				return
+				n := tunStats.readErrors.Add(1)
+				fatal := isTunReadFatal(err)
+				if fatal || logEvery(n) {
+					suffix := " — retry"
+					if fatal {
+						suffix = " — reader stops"
+					}
+					xerrors.LogError(ctx, "[tun] read failed (", n, "): ", err.Error(), suffix)
+				}
+				if fatal {
+					tunStats.readerAlive.Store(0)
+					e.Attach(nil)
+					return
+				}
+				backoff = backoff*2 + 5*time.Millisecond
+				if backoff > 250*time.Millisecond {
+					backoff = 250 * time.Millisecond
+				}
+				time.Sleep(backoff)
+				continue
 			}
+			backoff = 0
+			tunStats.readPackets.Add(1)
 
 			// extract network protocol number from the packet first byte
 			// (which is returned separately, since it is so incredibly hard to extract one byte from
