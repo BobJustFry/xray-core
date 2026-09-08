@@ -68,15 +68,32 @@ func NewTun(options *Config) (Tun, error) {
 			return nil, err
 		}
 
-		if err = unix.SetNonblock(fd, true); err != nil {
+		// Vupen: каждый экземпляр получает СВОЙ дубликат дескриптора.
+		//
+		// os.NewFile по документации забирает дескриптор во владение и вешает
+		// финализатор, который закрывает его при сборке мусора. При hot reload
+		// (softRestart) новое ядро открывало os.NewFile на тот же номер fd, а старый
+		// *os.File оставался жив в заблокированном цикле чтения; когда тот наконец
+		// просыпался и выходил, GC закрывал fd под новым ядром: Swift-насосы
+		// получали EOF/EPIPE, новый цикл чтения вис навсегда, tx уходил в txDrop —
+		// «интернета нет, VPN зелёный» на 91 минуту (iOS 586, 2026-09-08 19:51).
+		// С dup закрытие любого экземпляра трогает только его собственный
+		// дескриптор; socketpair расширения живёт, пока живёт мост.
+		dupFd, err := unix.Dup(fd)
+		if err != nil {
+			return nil, err
+		}
+
+		if err = unix.SetNonblock(dupFd, true); err != nil {
+			_ = unix.Close(dupFd)
 			return nil, err
 		}
 
 		return &DarwinTun{
-			tunFile: os.NewFile(uintptr(fd), "utun"),
+			tunFile: os.NewFile(uintptr(dupFd), "utun"),
 			options: options,
-			tunFd:   fd,
-			ownsFd:  false,
+			tunFd:   dupFd,
+			ownsFd:  true,
 		}, nil
 	}
 
@@ -135,10 +152,12 @@ func (t *DarwinTun) Close() error {
 		}
 	})
 	routeErr := t.unsetSystemRoutes()
+	// Закрытие нашего дескриптора (на iOS — дубликата) будит цикл чтения,
+	// застрявший в Read: он получает os.ErrClosed и выходит с записью в лог,
+	// вместо того чтобы читать один сокет наперегонки с новым экземпляром.
 	if t.ownsFd {
 		return xerrors.Combine(routeErr, t.tunFile.Close())
 	}
-	// iOS: don't close the fd, it's owned by NetworkExtension
 	return routeErr
 }
 

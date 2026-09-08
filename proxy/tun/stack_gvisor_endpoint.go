@@ -64,7 +64,6 @@ func (e *LinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 
 	if dispatcher != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		tunStats.readerAlive.Store(1)
 		go e.dispatchLoop(ctx, dispatcher)
 		e.dispatcherCancel = cancel
 	}
@@ -134,11 +133,14 @@ func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.Networ
 	var packet *stack.PacketBuffer
 	var err error
 	var backoff time.Duration
+	// Счётчик, а не флаг: после hot reload старый цикл ещё может сидеть в Read,
+	// и heartbeat должен показать 2 — это утечка, а не норма.
+	tunStats.readerAlive.Add(1)
+	defer tunStats.readerAlive.Add(-1)
 
 	for {
 		select {
 		case <-ctx.Done():
-			tunStats.readerAlive.Store(0)
 			return
 		default:
 			version, packet, err = e.device.ReadPacket()
@@ -162,7 +164,6 @@ func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.Networ
 					xerrors.LogError(ctx, "[tun] read failed (", n, "): ", err.Error(), suffix)
 				}
 				if fatal {
-					tunStats.readerAlive.Store(0)
 					e.Attach(nil)
 					return
 				}

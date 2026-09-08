@@ -16,7 +16,7 @@ import (
 // а в TUN 28 минут не входило ни одного пакета (iOS, 2026-09-08 16:15–16:43).
 // Цифры ниже печатаются в heartbeat — по ним видно, какое звено умерло.
 var tunStats struct {
-	readerAlive      atomic.Int32 // 1 — цикл чтения из TUN работает
+	readerAlive      atomic.Int32 // число живых циклов чтения: 1 норма, 0 мёртв, 2 утечка
 	readPackets      atomic.Uint64
 	readErrors       atomic.Uint64
 	writePackets     atomic.Uint64
