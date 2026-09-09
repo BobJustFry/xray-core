@@ -36,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -65,10 +66,75 @@ var (
 )
 
 // VupenSniffPhase1Deadline / VupenSniffPhase2Deadline — двухфазный sniff (не-DNS).
+//
+// Фаза 2 отключена (ядро 50): за четыре vSupport iOS 587–589 «second-round ok» —
+// 0 из ~730, а маршрутизация ждёт sniff, так что каждый такой поток (QUIC к
+// Google/Apple/Fastly, часть TCP 443/80/8080) держался 200 + 1500 мс перед первым
+// пакетом (access-лог: `accepted` в ту же миллисекунду, что и таймаут). Ручка
+// оставлена для экспериментов: > 0 включает фазу 2 обратно.
 var (
 	VupenSniffPhase1Deadline = 200 * time.Millisecond
-	VupenSniffPhase2Deadline = 1500 * time.Millisecond
+	VupenSniffPhase2Deadline = 0 * time.Millisecond
 )
+
+// vupenSniffTrace — что видел sniff перед тем, как сдаться. Раньше строка таймаута
+// не говорила ни последнего вердикта сниффера, ни сколько данных накопилось —
+// нельзя было отличить «ClientHello режется на два Initial» от «это середина
+// живого соединения».
+type vupenSniffTrace struct {
+	lastErr error
+	reads   int   // сколько раз буфер вырос (≈ датаграмм/сегментов)
+	bytes   int32 // накоплено байт
+}
+
+// vupenSniffStats — исходы sniff для heartbeat NE (через libXray TunStats).
+var vupenSniffStats struct {
+	p1Ok      atomic.Uint64
+	p2Ok      atomic.Uint64
+	timeout   atomic.Uint64
+	earlyExit atomic.Uint64
+}
+
+// VupenSniffStats — одна строка для heartbeat: `p1ok= p2ok= timeout= early=`.
+func VupenSniffStats() string {
+	return fmt.Sprintf("p1ok=%d p2ok=%d timeout=%d early=%d",
+		vupenSniffStats.p1Ok.Load(), vupenSniffStats.p2Ok.Load(),
+		vupenSniffStats.timeout.Load(), vupenSniffStats.earlyExit.Load())
+}
+
+// vupenSniffPayloadHint — первый пакет глазами человека: для UDP — QUIC long/short
+// header и версия (v1 / v2 / draft29), для TCP — TLS record и его длина.
+func vupenSniffPayloadHint(network net.Network, payload []byte) string {
+	if len(payload) == 0 {
+		return "empty"
+	}
+	b0 := payload[0]
+	if network == net.Network_UDP {
+		if b0&0x80 == 0 {
+			return "quic:short-header"
+		}
+		if len(payload) < 5 {
+			return "quic:long(trunc)"
+		}
+		ver := binary.BigEndian.Uint32(payload[1:5])
+		name := fmt.Sprintf("0x%08x", ver)
+		switch ver {
+		case 0x1:
+			name = "v1"
+		case 0x6b3343cf:
+			name = "v2"
+		case 0xff00001d:
+			name = "draft29"
+		case 0:
+			name = "vneg"
+		}
+		return fmt.Sprintf("quic:long %s type=%d", name, (b0>>4)&0x3)
+	}
+	if b0 == 0x16 && len(payload) >= 5 {
+		return fmt.Sprintf("tls:hs rec=%d", binary.BigEndian.Uint16(payload[3:5]))
+	}
+	return fmt.Sprintf("b0=0x%02x", b0)
+}
 
 // vupenSniffSecondRoundOkMarker / TimeoutMarker — UI (синий / красный) во Flutter.
 const (
@@ -213,10 +279,25 @@ func vupenLogSniffSecondRoundOk(ctx context.Context, phase1Elapsed, phase2Elapse
 	errors.LogInfo(ctx, line)
 }
 
-func vupenLogSniffSecondRoundTimeout(ctx context.Context) {
+// vupenLogSniffSecondRoundTimeout — таймаут sniff. Маркер оставлен прежним:
+// экран «Логи» красит по нему; текст теперь несёт улики (см. vupenSniffTrace).
+func vupenLogSniffSecondRoundTimeout(ctx context.Context, phase int, budget time.Duration, network net.Network, payload []byte, trace *vupenSniffTrace) {
 	dest := vupenSniffDestinationString(ctx)
-	line := vupenSniffSecondRoundTimeoutMarker + " sniff timeout на 2-й фазе, " +
-		vupenSniffMissDomainForLog(ctx) + ", " + dest
+	last := "nil"
+	if trace != nil && trace.lastErr != nil {
+		last = trace.lastErr.Error()
+	}
+	reads, bytes := 0, int32(0)
+	if trace != nil {
+		reads, bytes = trace.reads, trace.bytes
+	}
+	line := vupenSniffSecondRoundTimeoutMarker + " sniff timeout: phase=" + strconv.Itoa(phase) +
+		" budget=" + strconv.FormatInt(budget.Milliseconds(), 10) + "ms" +
+		" last=" + last +
+		" reads=" + strconv.Itoa(reads) +
+		" bytes=" + strconv.FormatInt(int64(bytes), 10) +
+		" first=" + vupenSniffPayloadHint(network, payload) +
+		", " + vupenSniffMissDomainForLog(ctx) + ", " + dest
 	vupenAppendSniffRoutingMissLog(line)
 	errors.LogError(ctx, line)
 }

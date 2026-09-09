@@ -388,10 +388,12 @@ func vupenSniffOnePhase(
 	sniffer *Sniffer,
 	phaseBudget time.Duration,
 	phase int,
+	trace *vupenSniffTrace,
 ) (SniffResult, error, bool) {
 	cacheDeadline := phaseBudget
 	vupenDebugLogSniffOutcome(ctx, "start", phase, 0, 0, 0, cacheDeadline, nil)
 	totalAttempt := 0
+	prevLen := payload.Len()
 	for {
 		select {
 		case <-ctx.Done():
@@ -404,10 +406,20 @@ func vupenSniffOnePhase(
 			}
 			cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
 			cacheDeadline -= cachingTimeElapsed
+			if trace != nil {
+				if payload.Len() > prevLen {
+					trace.reads++
+					prevLen = payload.Len()
+				}
+				trace.bytes = payload.Len()
+			}
 
 			if !payload.IsEmpty() {
 				result, sniffErr := sniffer.Sniff(ctx, payload.Bytes(), network)
 				vupenRecordSniffDomainHint(ctx, result)
+				if trace != nil {
+					trace.lastErr = sniffErr
+				}
 				switch sniffErr {
 				case common.ErrNoClue:
 					totalAttempt++
@@ -448,29 +460,42 @@ func vupenSniffContentTwoPhase(
 	payload *buf.Buffer,
 ) (SniffResult, error) {
 	sniffStarted := time.Now()
-	result, err, timedOut := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase1Deadline, 1)
+	trace := &vupenSniffTrace{}
+	result, err, timedOut := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase1Deadline, 1, trace)
 	phase1Elapsed := time.Since(sniffStarted)
 	if err == nil && result != nil {
+		vupenSniffStats.p1Ok.Add(1)
 		return result, nil
 	}
 	if err != nil && !timedOut {
+		vupenSniffStats.earlyExit.Add(1)
 		return result, err
+	}
+	// Фаза 2 отключена по умолчанию (ядро 50): ноль успехов за ~730 попыток,
+	// а маршрутизация ждёт sniff — см. комментарий у VupenSniffPhase2Deadline.
+	if VupenSniffPhase2Deadline <= 0 {
+		vupenSniffStats.timeout.Add(1)
+		vupenLogSniffSecondRoundTimeout(ctx, 1, VupenSniffPhase1Deadline, network, payload.Bytes(), trace)
+		return nil, errSniffingTimeout
 	}
 	content := session.ContentFromContext(ctx)
 	if content != nil {
 		content.SetAttribute(vupenSniffSecondRoundAttr, "1")
 	}
 	phase2Started := time.Now()
-	result2, err2, timedOut2 := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase2Deadline, 2)
+	result2, err2, timedOut2 := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase2Deadline, 2, trace)
 	phase2Elapsed := time.Since(phase2Started)
 	if err2 == nil && result2 != nil {
+		vupenSniffStats.p2Ok.Add(1)
 		vupenLogSniffSecondRoundOk(ctx, phase1Elapsed, phase2Elapsed, time.Since(sniffStarted))
 		return result2, nil
 	}
 	if timedOut2 || err2 == errSniffingTimeout {
-		vupenLogSniffSecondRoundTimeout(ctx)
+		vupenSniffStats.timeout.Add(1)
+		vupenLogSniffSecondRoundTimeout(ctx, 2, VupenSniffPhase2Deadline, network, payload.Bytes(), trace)
 		return nil, errSniffingTimeout
 	}
+	vupenSniffStats.earlyExit.Add(1)
 	return result2, err2
 }
 
