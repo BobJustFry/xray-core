@@ -74,3 +74,28 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// Тихое окно: TCP-проба уступает UDP-хендшейку не дольше VupenObservatoryUDPQuiet.
+func TestVupenTCPYieldsToUDPHandshake(t *testing.T) {
+	old := VupenObservatoryUDPQuiet
+	VupenObservatoryUDPQuiet = 60 * time.Millisecond
+	defer func() { VupenObservatoryUDPQuiet = old }()
+	l := newVupenLanes()
+	start := time.Now()
+	l.vupenTCPYield(context.Background())
+	if time.Since(start) > 20*time.Millisecond {
+		t.Fatal("no udp in flight: must not wait")
+	}
+	l.vupenUDPBegin()
+	start = time.Now()
+	l.vupenTCPYield(context.Background())
+	if d := time.Since(start); d < 40*time.Millisecond || d > 200*time.Millisecond {
+		t.Fatalf("waited %v, want ~60ms", d)
+	}
+	l.vupenUDPEnd()
+	start = time.Now()
+	l.vupenTCPYield(context.Background())
+	if time.Since(start) > 20*time.Millisecond {
+		t.Fatal("after udp end: must not wait")
+	}
+}

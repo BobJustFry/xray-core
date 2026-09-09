@@ -120,6 +120,9 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 			return
 		}
 		errors.LogWarning(h.ctx, "[observatory] retry after initial failures: ", failed)
+		if vupenRetryHook != nil {
+			vupenRetryHook(failed)
+		}
 		h.doCheck(h.ctx, failed, 0, 1)
 	}()
 
@@ -215,6 +218,12 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 					return
 				}
 				defer vupenRelease(sem)
+				if lane == vupenLaneUDP {
+					h.lanes.vupenUDPBegin()
+					defer h.lanes.vupenUDPEnd()
+				} else {
+					h.lanes.vupenTCPYield(ctx)
+				}
 				errors.LogDebug(h.ctx, "checking ", handler)
 				delay, err := client.MeasureDelay(h.Settings.HttpMethod)
 				if err == nil {

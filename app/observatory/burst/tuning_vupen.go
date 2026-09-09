@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,12 +43,19 @@ var (
 	VupenObservatoryRetryDelay   = 20 * time.Second
 	VupenObservatoryTCPLane      = 3
 	VupenObservatoryUDPLane      = 1
+	// Пока идёт QUIC-хендшейк UDP-пробы, TCP-пробы ждут не дольше этого:
+	// в vSupport 2026-09-10 00:14 hysteria в observatory 536/618 мс при
+	// параллельной TCP-полосе против 296–369 мс в одиночном пинге списка.
+	VupenObservatoryUDPQuiet = 1500 * time.Millisecond
 )
 
 const (
 	vupenLaneTCP = "tcp"
 	vupenLaneUDP = "udp"
 )
+
+// vupenRetryHook — только для тестов: вызывается перед повторным раундом.
+var vupenRetryHook func(tags []string)
 
 // vupenLaneFor — полоса по имени транспорта (streamSettings.protocolName) и
 // типу прокси (TypedMessage.Type outbound'а, напр. "xray.proxy.hysteria.Config").
@@ -68,7 +76,33 @@ func vupenLaneFor(streamProtocol string, proxyType string) string {
 type vupenLanes struct {
 	tcp chan struct{}
 	udp chan struct{}
+	// unix-наносекунды, до которых TCP-пробы уступают UDP-хендшейку; 0 — свободно.
+	udpQuietUntil atomic.Int64
 }
+
+// vupenTCPYield — TCP-проба ждёт, пока UDP-хендшейк в тихом окне (не дольше
+// VupenObservatoryUDPQuiet), либо до отмены раунда.
+func (l *vupenLanes) vupenTCPYield(ctx context.Context) {
+	until := l.udpQuietUntil.Load()
+	if until == 0 {
+		return
+	}
+	wait := time.Until(time.Unix(0, until))
+	if wait <= 0 {
+		return
+	}
+	if wait > VupenObservatoryUDPQuiet {
+		wait = VupenObservatoryUDPQuiet
+	}
+	vupenSleep(ctx, wait)
+}
+
+// vupenUDPBegin/End — тихое окно на время хендшейка UDP-пробы.
+func (l *vupenLanes) vupenUDPBegin() {
+	l.udpQuietUntil.Store(time.Now().Add(VupenObservatoryUDPQuiet).UnixNano())
+}
+
+func (l *vupenLanes) vupenUDPEnd() { l.udpQuietUntil.Store(0) }
 
 func newVupenLanes() *vupenLanes {
 	return &vupenLanes{
