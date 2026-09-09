@@ -193,6 +193,14 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 	}
 	ch := make(chan *rtt, count)
 	timers := make([]*time.Timer, 0, count)
+	// Vupen (ядро 54): апстрим разбрасывает таймеры по всему окну до следующего
+	// тика, и следующий тик отменяет ещё идущие пробы — последние выборки
+	// каждого окна терялись (за 12 минут ни одного завершённого планового
+	// раунда). Оставляем запас на таймаут и очередь полос.
+	spread := duration
+	if s := duration - 2*h.Settings.Timeout; duration > 0 && s > 0 {
+		spread = s
+	}
 	for _, tag := range tags {
 		handler := tag
 		client := newPingClient(
@@ -204,8 +212,8 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 		)
 		for i := 0; i < rounds; i++ {
 			delay := time.Duration(0)
-			if duration > 0 {
-				delay = time.Duration(dice.RollInt63n(int64(duration)))
+			if spread > 0 {
+				delay = time.Duration(dice.RollInt63n(int64(spread)))
 			}
 			timers = append(timers, time.AfterFunc(delay, func() {
 				// Vupen: слот полосы (TCP ×N / UDP ×1) — стартовая пачка становится очередью.
@@ -264,6 +272,10 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 		case <-ctx.Done():
 			for _, timer := range timers {
 				timer.Stop()
+			}
+			// Vupen: отменённый плановый раунд тоже отчитывается — тем, что успел.
+			if duration > 0 && h.ctx.Err() == nil {
+				errors.LogWarning(h.ctx, h.vupenRoundSummary("scheduled(cancelled)", tags))
 			}
 			return
 		}
