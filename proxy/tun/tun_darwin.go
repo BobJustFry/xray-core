@@ -57,6 +57,13 @@ type DarwinTun struct {
 	// comment for why this is a dedicated type rather than a bare fd.
 	waitKq *waitKqueue
 
+	// Vupen (ядро 51): fd расширения — socketpair(SOCK_STREAM), а не utun, и
+	// границ пакетов в нём нет. Не nil, когда SO_TYPE дескриптора — SOCK_STREAM;
+	// тогда ReadPacket режет поток на кадры сам (stream_framer.go).
+	framer *streamFramer
+	// кадров выдано после последнего Read — для счётчика rxCoalesced.
+	framesSinceRead int
+
 	routeMonitor     *os.File
 	routeMonitorOnce sync.Once
 	systemRoutes     []netip.Prefix
@@ -181,15 +188,22 @@ func NewTun(options *Config) (Tun, error) {
 			return nil, err
 		}
 
-		return &DarwinTun{
+		t := &DarwinTun{
 			tunFile: os.NewFile(uintptr(dupFd), "utun"),
 			options: options,
 			tunFd:   dupFd,
 			ownsFd:  true,
 			// kqueue апстрима (#6580) на нашем дубликате: описание сокета общее,
 			// readiness видна через любой из дескрипторов.
-			waitKq:  newWaitKqueue(dupFd),
-		}, nil
+			waitKq: newWaitKqueue(dupFd),
+		}
+		// Потоковый сокет (socketpair расширения) — включаем фреймер. Настоящий
+		// utun или датаграммный сокет отвечают ENOTSOCK / SOCK_DGRAM — читаем как раньше.
+		if soType, err := unix.GetsockoptInt(dupFd, unix.SOL_SOCKET, unix.SO_TYPE); err == nil && soType == unix.SOCK_STREAM {
+			t.framer = newStreamFramer()
+			xerrors.LogWarning(context.Background(), "[tun] fd ", fd, " is a stream socket: frame parsing on")
+		}
+		return t, nil
 	}
 
 	// macOS: create our own utun interface
@@ -328,6 +342,9 @@ func (t *DarwinTun) WritePacket(packet *stack.PacketBuffer) tcpip.Error {
 // It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
 // which will make the stack call Wait which should implement desired push-back
 func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
+	if t.framer != nil {
+		return t.readFramedPacket()
+	}
 	// request memory to write from reusable buffer pool
 	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
 
@@ -358,6 +375,57 @@ func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
 			b.Release()
 		},
 	}), nil
+}
+
+// readFramedPacket — ReadPacket для потокового сокета расширения: один Read
+// может принести несколько кадров или кусок кадра; целые кадры отдаются по
+// одному, неполный ждёт следующего Read (ErrQueueEmpty → Wait на kqueue).
+// Почему это нужно — см. stream_framer.go.
+func (t *DarwinTun) readFramedPacket() (byte, *stack.PacketBuffer, error) {
+	f := t.framer
+	for {
+		frame, err := f.frameLen()
+		if err != nil {
+			n := tunStats.rxDesync.Add(1)
+			dropped := f.resync()
+			if logEvery(n) {
+				xerrors.LogError(context.Background(), "[tun] stream desync (", n, "): ", err.Error(), " — dropped ", dropped, " bytes")
+			}
+			continue
+		}
+		if frame > 0 {
+			if t.framesSinceRead > 0 {
+				tunStats.rxCoalesced.Add(1)
+			}
+			t.framesSinceRead++
+			size := int32(frame - streamHeaderSize)
+			b := buf.NewWithSize(size)
+			f.pop(frame, b.Extend(size))
+			version := b.Byte(0) >> 4
+			return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload:           buffer.MakeWithData(b.Bytes()),
+				IsForwardedPacket: true,
+				OnRelease: func() {
+					b.Release()
+				},
+			}), nil
+		}
+		free := f.free()
+		if len(free) == 0 {
+			// Недостижимо: кадр длиннее накопителя отбраковывает complete().
+			f.n = 0
+			continue
+		}
+		t.framesSinceRead = 0
+		n, err := t.tunFile.Read(free)
+		f.commit(n)
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
+			return 0, nil, ErrQueueEmpty
+		}
+		if err != nil {
+			return 0, nil, err
+		}
+	}
 }
 
 // Wait blocks until tunFd is readable (or a short timeout elapses), rather

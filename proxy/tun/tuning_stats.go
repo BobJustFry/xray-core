@@ -19,6 +19,8 @@ var tunStats struct {
 	readerAlive      atomic.Int32 // число живых циклов чтения: 1 норма, 0 мёртв, 2 утечка
 	readPackets      atomic.Uint64
 	readErrors       atomic.Uint64
+	rxCoalesced      atomic.Uint64 // кадров, вырезанных из одного Read сверх первого (ядро 51)
+	rxDesync         atomic.Uint64 // битых заголовков потока (resync)
 	writePackets     atomic.Uint64
 	writeDrops       atomic.Uint64 // запись в TUN не удалась (EAGAIN и прочее)
 	tcpLive          atomic.Int32  // соединений в HandleConnection прямо сейчас
@@ -50,10 +52,12 @@ func Stats() string {
 	}
 	tunStackMu.Unlock()
 	return fmt.Sprintf(
-		"reader=%d rx=%d rxErr=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d",
+		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d",
 		tunStats.readerAlive.Load(),
 		tunStats.readPackets.Load(),
 		tunStats.readErrors.Load(),
+		tunStats.rxCoalesced.Load(),
+		tunStats.rxDesync.Load(),
 		tunStats.writePackets.Load(),
 		tunStats.writeDrops.Load(),
 		tunStats.tcpLive.Load(),
