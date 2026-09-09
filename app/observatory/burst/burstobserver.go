@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/app/observatory"
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/signal/done"
@@ -68,6 +69,26 @@ func (o *Observer) Type() interface{} {
 func (o *Observer) Start() error {
 	if o.config != nil && len(o.config.SubjectSelector) != 0 {
 		o.finished = done.New()
+		// Vupen (ядро 52): полоса пробы по транспорту/протоколу outbound'а.
+		o.hp.laneOf = func(tag string) string {
+			h := o.ohm.GetHandler(tag)
+			if h == nil {
+				return vupenLaneTCP
+			}
+			stream := ""
+			if ss := h.SenderSettings(); ss != nil {
+				if inst, err := ss.GetInstance(); err == nil {
+					if sc, ok := inst.(*proxyman.SenderConfig); ok && sc.StreamSettings != nil {
+						stream = sc.StreamSettings.ProtocolName
+					}
+				}
+			}
+			proxyType := ""
+			if ps := h.ProxySettings(); ps != nil {
+				proxyType = ps.Type
+			}
+			return vupenLaneFor(stream, proxyType)
+		}
 		o.hp.StartScheduler(func() ([]string, error) {
 			hs, ok := o.ohm.(outbound.HandlerSelector)
 			if !ok {

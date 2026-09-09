@@ -34,6 +34,9 @@ type HealthPing struct {
 
 	Settings *HealthPingSettings
 	Results  map[string]*HealthPingRTTS
+	// Vupen (ядро 52): полосы проб и определение полосы по outbound'у.
+	lanes  *vupenLanes
+	laneOf func(tag string) string
 }
 
 // NewHealthPing creates a new HealthPing with settings
@@ -84,6 +87,7 @@ func NewHealthPing(ctx context.Context, dispatcher routing.Dispatcher, config *H
 		dispatcher: dispatcher,
 		Settings:   settings,
 		Results:    nil,
+		lanes:      newVupenLanes(),
 	}
 }
 
@@ -98,15 +102,32 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 
 	// init run to get a fast check result
 	go func() {
+		// Vupen: не в ту же миллисекунду, что старт ядра (см. tuning_vupen.go).
+		if !vupenSleep(h.ctx, VupenObservatoryInitialDelay) {
+			return
+		}
 		tags, err := selector()
 		if err != nil {
 			errors.LogWarning(h.ctx, "error select outbounds for initial health check: ", err)
 			return
 		}
 		h.Check(tags)
+		failed := h.vupenFailedTags(tags)
+		if len(failed) == 0 {
+			return
+		}
+		if !vupenSleep(h.ctx, VupenObservatoryRetryDelay) {
+			return
+		}
+		errors.LogWarning(h.ctx, "[observatory] retry after initial failures: ", failed)
+		h.doCheck(h.ctx, failed, 0, 1)
 	}()
 
 	go func() {
+		// Vupen: первый распределённый раунд тоже не должен попадать в старт ядра.
+		if !vupenSleep(h.ctx, VupenObservatoryInitialDelay) {
+			return
+		}
 		for {
 			go func() {
 				tags, err := selector()
@@ -184,6 +205,16 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 				delay = time.Duration(dice.RollInt63n(int64(duration)))
 			}
 			timers = append(timers, time.AfterFunc(delay, func() {
+				// Vupen: слот полосы (TCP ×N / UDP ×1) — стартовая пачка становится очередью.
+				lane := vupenLaneTCP
+				if h.laneOf != nil {
+					lane = h.laneOf(handler)
+				}
+				sem := h.lanes.sem(lane)
+				if !vupenAcquire(ctx, sem) {
+					return
+				}
+				defer vupenRelease(sem)
 				errors.LogDebug(h.ctx, "checking ", handler)
 				delay, err := client.MeasureDelay(h.Settings.HttpMethod)
 				if err == nil {
@@ -228,6 +259,12 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 			return
 		}
 	}
+	// Vupen: что видит leastPing после этого раунда — одной строкой.
+	kind := "scheduled"
+	if duration == 0 {
+		kind = "burst"
+	}
+	errors.LogWarning(h.ctx, h.vupenRoundSummary(kind, tags))
 }
 
 // PutResult put a ping rtt to results
