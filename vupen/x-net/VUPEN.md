@@ -1,6 +1,6 @@
 # golang.org/x/net — Vupen copy
 
-Base: golang.org/x/net **v0.57.0** (the version `ios/Vendor/xray-core/go.mod` pins),
+Base: golang.org/x/net **v0.58.0** (the version `ios/Vendor/xray-core/go.mod` pins),
 copied verbatim from the Go module cache minus `*_test.go` and `testdata/`.
 
 Wired in with a directory `replace` (no go.sum entries needed):
