@@ -61,27 +61,14 @@ func (l *LeastPingStrategy) PickOutbound(strings []string) string {
 	}
 	outboundsList := outboundList(strings)
 	if result, ok := observeReport.(*observatory.ObservationResult); ok {
-		status := result.Status
-		leastPing := int64(99999999)
-		selectedOutboundName := ""
-		alive, total := 0, 0
-		for _, v := range status {
-			if !outboundsList.contains(v.OutboundTag) {
-				continue
-			}
-			total++
-			if v.Alive {
-				alive++
-			}
-			if v.Alive && v.Delay < leastPing {
-				selectedOutboundName = v.OutboundTag
-				leastPing = v.Delay
-			}
+		l.pickMu.Lock()
+		last := l.lastPick
+		l.pickMu.Unlock()
+		pick := vupenLeastPingChoose(last, outboundsList, result.Status, len(strings))
+		if pick.tag != "" {
+			l.vupenLogPickChange(pick.tag, pick.delay, pick.alive, pick.total)
 		}
-		if selectedOutboundName != "" {
-			l.vupenLogPickChange(selectedOutboundName, leastPing, alive, total)
-		}
-		return selectedOutboundName
+		return pick.tag
 	}
 
 	// No way to understand observeReport

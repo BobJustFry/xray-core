@@ -37,6 +37,8 @@ type HealthPing struct {
 	// Vupen (ядро 52): полосы проб и определение полосы по outbound'у.
 	lanes  *vupenLanes
 	laneOf func(tag string) string
+	// Ядро 55: счётчик пропусков для мёртвых узлов (vupenSkipDead).
+	deadSkip map[string]int
 }
 
 // NewHealthPing creates a new HealthPing with settings
@@ -187,6 +189,22 @@ type rtt struct {
 // sure all tags are valid for current balancer
 // cancel ctx will stop all pending checks
 func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.Duration, rounds int) {
+	// Ядро 55: в плановых раундах мёртвые узлы опрашиваются реже.
+	if duration > 0 {
+		kept := make([]string, 0, len(tags))
+		var skipped []string
+		for _, tag := range tags {
+			if h.vupenSkipDead(tag) {
+				skipped = append(skipped, tag)
+				continue
+			}
+			kept = append(kept, tag)
+		}
+		if len(skipped) > 0 {
+			errors.LogWarning(h.ctx, "[observatory] dead nodes skipped this round: ", skipped)
+		}
+		tags = kept
+	}
 	count := len(tags) * rounds
 	if count == 0 {
 		return

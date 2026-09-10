@@ -456,6 +456,7 @@ func vupenSniffContentTwoPhase(
 	ctx context.Context,
 	cReader *cachedReader,
 	network net.Network,
+	port net.Port,
 	sniffer *Sniffer,
 	payload *buf.Buffer,
 ) (SniffResult, error) {
@@ -474,6 +475,24 @@ func vupenSniffContentTwoPhase(
 	// Фаза 2 отключена по умолчанию (ядро 50): ноль успехов за ~730 попыток,
 	// а маршрутизация ждёт sniff — см. комментарий у VupenSniffPhase2Deadline.
 	if VupenSniffPhase2Deadline <= 0 {
+		// Ядро 55: пустой TCP — ждём ещё VupenSniffEmptyTCPWait (см. tuning_vupen.go).
+		if vupenSniffEmptyWaitAllowed(network, port, trace) {
+			extraStarted := time.Now()
+			result2, err2, timedOut2 := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffEmptyTCPWait, 2, trace)
+			if err2 == nil && result2 != nil {
+				vupenSniffStats.emptyOk.Add(1)
+				vupenLogSniffSecondRoundOk(ctx, phase1Elapsed, time.Since(extraStarted), time.Since(sniffStarted))
+				return result2, nil
+			}
+			if !timedOut2 && err2 != errSniffingTimeout {
+				vupenSniffStats.earlyExit.Add(1)
+				return result2, err2
+			}
+			vupenSniffStats.emptyTo.Add(1)
+			vupenSniffStats.timeout.Add(1)
+			vupenLogSniffSecondRoundTimeout(ctx, 2, VupenSniffPhase1Deadline+VupenSniffEmptyTCPWait, network, payload.Bytes(), trace)
+			return nil, errSniffingTimeout
+		}
 		vupenSniffStats.timeout.Add(1)
 		vupenLogSniffSecondRoundTimeout(ctx, 1, VupenSniffPhase1Deadline, network, payload.Bytes(), trace)
 		return nil, errSniffingTimeout
@@ -512,7 +531,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, sniffingRequest session
 		return metaresult, metadataErr
 	}
 
-	contentResult, contentErr := vupenSniffContentTwoPhase(ctx, cReader, destination.Network, sniffer, payload)
+	contentResult, contentErr := vupenSniffContentTwoPhase(ctx, cReader, destination.Network, destination.Port, sniffer, payload)
 	if contentErr != nil && metadataErr == nil {
 		vupenRecordSniffDomainHint(ctx, metaresult)
 		return metaresult, nil

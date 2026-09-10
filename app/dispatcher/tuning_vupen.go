@@ -93,13 +93,39 @@ var vupenSniffStats struct {
 	p2Ok      atomic.Uint64
 	timeout   atomic.Uint64
 	earlyExit atomic.Uint64
+	emptyOk   atomic.Uint64 // домен пришёл в добавочном ожидании пустого TCP
+	emptyTo   atomic.Uint64 // добавочное ожидание тоже вышло пустым
+}
+
+// VupenSniffEmptyTCPWait — ядро 55: если к концу фазы 1 по TCP не пришло ни байта,
+// ждать ещё столько. Задерживать нечего — пакетов нет; а за ночь 2026-09-10 241
+// такое соединение (гоночные TCP Apple, Telegram) ушло по IP через прокси вместо
+// direct. Порты, где первым говорит сервер, исключены (vupenSniffServerFirstPorts).
+var VupenSniffEmptyTCPWait = 1300 * time.Millisecond
+
+var vupenSniffServerFirstPorts = map[net.Port]bool{
+	21: true, 22: true, 23: true, 25: true, 110: true, 143: true,
+	465: true, 587: true, 993: true, 995: true, 3306: true, 5432: true,
+}
+
+// vupenSniffEmptyWaitAllowed — добавочное ожидание только для TCP без единого
+// байта и не к server-first портам.
+func vupenSniffEmptyWaitAllowed(network net.Network, port net.Port, trace *vupenSniffTrace) bool {
+	if VupenSniffEmptyTCPWait <= 0 || network != net.Network_TCP {
+		return false
+	}
+	if trace == nil || trace.bytes != 0 {
+		return false
+	}
+	return !vupenSniffServerFirstPorts[port]
 }
 
 // VupenSniffStats — одна строка для heartbeat: `p1ok= p2ok= timeout= early=`.
 func VupenSniffStats() string {
-	return fmt.Sprintf("p1ok=%d p2ok=%d timeout=%d early=%d",
+	return fmt.Sprintf("p1ok=%d p2ok=%d timeout=%d early=%d emptyOk=%d emptyTo=%d",
 		vupenSniffStats.p1Ok.Load(), vupenSniffStats.p2Ok.Load(),
-		vupenSniffStats.timeout.Load(), vupenSniffStats.earlyExit.Load())
+		vupenSniffStats.timeout.Load(), vupenSniffStats.earlyExit.Load(),
+		vupenSniffStats.emptyOk.Load(), vupenSniffStats.emptyTo.Load())
 }
 
 // vupenSniffPayloadHint — первый пакет глазами человека: для UDP — QUIC long/short

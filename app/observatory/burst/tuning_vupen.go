@@ -47,6 +47,12 @@ var (
 	// в vSupport 2026-09-10 00:14 hysteria в observatory 536/618 мс при
 	// параллельной TCP-полосе против 296–369 мс в одиночном пинге списка.
 	VupenObservatoryUDPQuiet = 1500 * time.Millisecond
+	// Ядро 55: узел без единой удачной пробы VupenObservatoryDeadStreak раундов
+	// подряд опрашивается в VupenObservatoryDeadBackoff раз реже (proxy-2 с
+	// домашней сети владельца: 56 таймаутов по 5 с за ночь — треть всех отказов).
+	// Сбрасывается первой же удачной пробой и при старте ядра.
+	VupenObservatoryDeadStreak  = 3
+	VupenObservatoryDeadBackoff = 10
 )
 
 const (
@@ -143,6 +149,27 @@ func vupenSleep(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// vupenSkipDead — true, если узел мёртв VupenObservatoryDeadStreak подряд и его
+// очередь опроса ещё не подошла (каждый VupenObservatoryDeadBackoff-й раунд).
+func (h *HealthPing) vupenSkipDead(tag string) bool {
+	h.access.Lock()
+	defer h.access.Unlock()
+	r, ok := h.Results[tag]
+	if !ok {
+		return false
+	}
+	s := r.getStatistics()
+	if s.Fail < VupenObservatoryDeadStreak || s.All != s.Fail {
+		delete(h.deadSkip, tag)
+		return false
+	}
+	if h.deadSkip == nil {
+		h.deadSkip = make(map[string]int)
+	}
+	h.deadSkip[tag]++
+	return h.deadSkip[tag]%VupenObservatoryDeadBackoff != 0
 }
 
 // vupenFailedTags — узлы, у которых после раунда нет ни одной удачной пробы.
