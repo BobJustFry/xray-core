@@ -35,13 +35,33 @@ func TestVupenLeastPingHysteresis(t *testing.T) {
 }
 
 func TestVupenLeastPingMinObserved(t *testing.T) {
-	cands := outboundList{"a", "b", "c", "d", "e", "f"}
-	p := vupenLeastPingChoose("", cands, []*observatory.OutboundStatus{st("a", true, 200), st("b", true, 180)}, 6)
-	if p.tag != "" || p.total != 2 {
-		t.Fatalf("2 of 6 observed must not pick: %+v", p)
+	cands := outboundList{"a", "b", "c", "d", "e", "f", "g", "h"}
+	// 1 из 8 (12 %) и один живой — рано.
+	p := vupenLeastPingChoose("", cands, []*observatory.OutboundStatus{st("a", true, 200)}, 8)
+	if p.tag != "" || p.total != 1 {
+		t.Fatalf("1 of 8 observed must not pick: %+v", p)
 	}
-	p = vupenLeastPingChoose("", cands, []*observatory.OutboundStatus{st("a", true, 200), st("b", true, 180), st("c", false, 0)}, 6)
+	// 2 из 8 (25 %) — порог покрытия достигнут, выбираем.
+	p = vupenLeastPingChoose("", cands, []*observatory.OutboundStatus{st("a", true, 200), st("b", true, 180)}, 8)
 	if p.tag != "b" {
-		t.Fatalf("3 of 6 observed must pick: %+v", p)
+		t.Fatalf("2 of 8 observed must pick by coverage: %+v", p)
+	}
+}
+
+func TestVupenLeastPingMinAlive(t *testing.T) {
+	// 27 кандидатов, как у балансировщика панели: три живых замера из 27 (11 %)
+	// ниже доли покрытия, но три живых узла — уже выбор, а не fallback.
+	cands := make(outboundList, 0, 27)
+	for i := 0; i < 27; i++ {
+		cands = append(cands, string(rune('a'+i)))
+	}
+	p := vupenLeastPingChoose("", cands, []*observatory.OutboundStatus{st("a", true, 300), st("b", true, 180), st("c", true, 250)}, 27)
+	if p.tag != "b" || p.alive != 3 {
+		t.Fatalf("3 alive of 27 must pick: %+v", p)
+	}
+	// Два живых и один мёртвый — живых меньше порога, покрытие 11 % — рано.
+	p = vupenLeastPingChoose("", cands, []*observatory.OutboundStatus{st("a", true, 300), st("b", true, 180), st("c", false, 0)}, 27)
+	if p.tag != "" {
+		t.Fatalf("2 alive of 27 must wait: %+v", p)
 	}
 }

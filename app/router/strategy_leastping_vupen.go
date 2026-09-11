@@ -15,7 +15,15 @@ var (
 	VupenLeastPingHysteresis = 0.20
 	// VupenLeastPingMinObserved — не выбирать, пока observatory не покрыла хотя бы
 	// эту долю кандидатов (пустая строка → fallbackTag балансировщика).
-	VupenLeastPingMinObserved = 0.5
+	//
+	// Ядро 56: было 0.5. На 27 кандидатах половина набиралась 8 с после старта
+	// (бандл 2026-09-11 10:16), и все эти секунды трафик шёл в fallbackTag, то
+	// есть в первый узел списка, который у пользователя не поднимался. Четверть
+	// плюс VupenLeastPingMinAlive режут окно до 2–3 с.
+	VupenLeastPingMinObserved = 0.25
+	// VupenLeastPingMinAlive — если живых замеров уже столько, выбираем сразу,
+	// не дожидаясь доли покрытия: три живых узла лучше любого fallback.
+	VupenLeastPingMinAlive = 3
 )
 
 type vupenLeastPingPick struct {
@@ -48,7 +56,9 @@ func vupenLeastPingChoose(last string, candidates outboundList, status []*observ
 	if best.tag == "" {
 		return best
 	}
-	if nCandidates > 1 && float64(best.total) < float64(nCandidates)*VupenLeastPingMinObserved {
+	if nCandidates > 1 &&
+		best.alive < VupenLeastPingMinAlive &&
+		float64(best.total) < float64(nCandidates)*VupenLeastPingMinObserved {
 		// Мало наблюдений — рано выбирать; балансировщик уйдёт в fallbackTag.
 		return vupenLeastPingPick{alive: best.alive, total: best.total}
 	}
