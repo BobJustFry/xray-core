@@ -8,7 +8,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
-// Vupen (ядро 60): пробы балансировщика не идут, пока устройство спит или нет сети.
+// Vupen (ядро 61): пробы балансировщика не идут, пока устройство спит или нет сети.
 //
 // Провалившаяся проба пишется в окно результатов как rttFailed и живёт
 // `interval × sampling × 2` (у панели 10 минут). Во сне сети нет, и каждый плановый
@@ -25,6 +25,8 @@ import (
 //     сразу, не дожидаясь тика (через полосы TCP×N / UDP×1, а не залпом);
 //   - первые VupenObservatoryWakeGrace после пробуждения провалы не записываются:
 //     радио ещё поднимается, а записанный провал живёт 10 минут;
+//   - если пачка не нашла ни одного живого узла (ушла в неподнятое радио), она
+//     повторяется через VupenObservatoryRetryDelay, а не через тик;
 //   - тик, пришедший много позже ожидаемого, сам считается пробуждением — процесс
 //     замораживали (Windows: сигнала сна у нас там нет).
 //
@@ -59,6 +61,9 @@ func VupenObservatoryPause(reason string) {
 	errors.LogWarning(context.Background(),
 		"[observatory] pause (", reason, ") balancers=", len(pings), " wasActive=", was)
 	for _, h := range pings {
+		if vupenObsDropIfDone(h) {
+			continue
+		}
 		h.vupenCancelRound()
 	}
 }
@@ -74,6 +79,9 @@ func VupenObservatoryResume(reason string) {
 	errors.LogWarning(context.Background(),
 		"[observatory] resume (", reason, ") balancers=", len(pings), " wasActive=", was)
 	for _, h := range pings {
+		if vupenObsDropIfDone(h) {
+			continue
+		}
 		h.vupenAfterWake(reason)
 	}
 }
@@ -104,6 +112,16 @@ func vupenObsRegister(h *HealthPing) {
 	}
 }
 
+// vupenObsDropIfDone — ядро этого балансировщика уже остановлено: чистим реестр
+// сами, чтобы забытый StopScheduler не копил в нём мёртвые записи.
+func vupenObsDropIfDone(h *HealthPing) bool {
+	if h.ctx.Err() == nil {
+		return false
+	}
+	vupenObsUnregister(h)
+	return true
+}
+
 func vupenObsUnregister(h *HealthPing) {
 	vupenObs.mu.Lock()
 	delete(vupenObs.pings, h)
@@ -132,6 +150,24 @@ func (h *HealthPing) vupenAfterWake(reason string) {
 	default:
 	}
 	errors.LogWarning(h.ctx, "[observatory] wake round (", reason, ")")
+}
+
+// vupenNoLiveResults — ни у одного узла раунда нет живого замера. В окне после
+// пробуждения провалы не записываются, поэтому «мёртвых» тут не будет: у неудачного
+// узла просто нет результата (`All == 0`), и отличить его от живого может только это.
+func (h *HealthPing) vupenNoLiveResults(tags []string) bool {
+	h.access.Lock()
+	defer h.access.Unlock()
+	for _, tag := range tags {
+		r, ok := h.Results[tag]
+		if !ok {
+			continue
+		}
+		if s := r.getStatistics(); s.All > s.Fail {
+			return false
+		}
+	}
+	return true
 }
 
 // vupenFailIgnored — провал сразу после пробуждения: не записываем.

@@ -128,6 +128,25 @@ func TestVupenTimeGapCountsAsWake(t *testing.T) {
 	}
 }
 
+// Пачка после пробуждения могла уйти в неподнятое радио: живых замеров нет, и
+// раунд нужно повторить, не дожидаясь тика. В окне без записи провалов «мёртвых»
+// не бывает — у неудачного узла просто нет результата.
+func TestVupenNoLiveResults(t *testing.T) {
+	h := newSleepTestPing()
+	tags := []string{"a", "b"}
+	if !h.vupenNoLiveResults(tags) {
+		t.Fatal("пустые результаты приняты за живые")
+	}
+	h.PutResult("a", rttFailed)
+	if !h.vupenNoLiveResults(tags) {
+		t.Fatal("один провал принят за живой замер")
+	}
+	h.PutResult("b", 120*time.Millisecond)
+	if h.vupenNoLiveResults(tags) {
+		t.Fatal("живой замер не увиден")
+	}
+}
+
 // Окно после пробуждения истекает само: дальше провалы снова записываются.
 func TestVupenWakeGraceExpires(t *testing.T) {
 	h := newSleepTestPing()

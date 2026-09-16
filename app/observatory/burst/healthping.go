@@ -39,7 +39,7 @@ type HealthPing struct {
 	laneOf func(tag string) string
 	// Ядро 55: счётчик пропусков для мёртвых узлов (vupenSkipDead).
 	deadSkip map[string]int
-	// Ядро 60: сон и пробуждение — tuning_vupen_sleep.go.
+	// Ядро 61: сон и пробуждение — tuning_vupen_sleep.go.
 	wakeSignal     chan struct{}
 	wakeBurst      atomic.Bool
 	wakeGraceUntil atomic.Int64
@@ -107,7 +107,7 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 	interval := h.Settings.Interval * time.Duration(h.Settings.SamplingCount)
 	ticker := time.NewTicker(interval)
 	h.ticker = ticker
-	// Ядро 60: вентиль сна/сети должен видеть этот балансировщик.
+	// Ядро 61: вентиль сна/сети должен видеть этот балансировщик.
 	vupenObsRegister(h)
 
 	// init run to get a fast check result
@@ -116,7 +116,7 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 		if !vupenSleep(h.ctx, VupenObservatoryInitialDelay) {
 			return
 		}
-		// Ядро 60: ядро подняли во сне или без сети — стартовую пачку сделает пробуждение.
+		// Ядро 61: ядро подняли во сне или без сети — стартовую пачку сделает пробуждение.
 		if !VupenObservatoryActive() {
 			return
 		}
@@ -149,7 +149,7 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 			return
 		}
 		for {
-			// Ядро 60: тик мог прийти много позже ожидаемого — значит нас морозили.
+			// Ядро 61: тик мог прийти много позже ожидаемого — значит нас морозили.
 			h.vupenNoteRoundStart(interval)
 			if VupenObservatoryActive() {
 				// Пробуждение: раунд идёт пачкой (duration=0), а не размазанным по окну —
@@ -170,6 +170,15 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 					}
 					if burst {
 						h.doCheck(subCtx, tags, 0, 1)
+						// Пачка могла уйти в ещё не поднятое радио: тогда живых замеров нет,
+						// а следующий тик — через interval×sampling (у панели 5 минут).
+						// Один повтор после окна без записи провалов закрывает эту дыру.
+						if h.vupenNoLiveResults(tags) &&
+							vupenSleep(subCtx, VupenObservatoryRetryDelay) &&
+							VupenObservatoryActive() {
+							errors.LogWarning(h.ctx, "[observatory] wake round found nothing alive, retrying")
+							h.doCheck(subCtx, tags, 0, 1)
+						}
 					} else {
 						h.doCheck(subCtx, tags, interval, h.Settings.SamplingCount)
 					}
@@ -297,7 +306,7 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 					}
 					return
 				}
-				// Ядро 60: провал в первые секунды после пробуждения не записываем —
+				// Ядро 61: провал в первые секунды после пробуждения не записываем —
 				// радио ещё поднимается, а записанный провал живёт interval×sampling×2.
 				value := time.Duration(rttFailed)
 				note := ""
