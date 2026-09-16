@@ -39,6 +39,11 @@ type HealthPing struct {
 	laneOf func(tag string) string
 	// Ядро 55: счётчик пропусков для мёртвых узлов (vupenSkipDead).
 	deadSkip map[string]int
+	// Ядро 60: сон и пробуждение — tuning_vupen_sleep.go.
+	wakeSignal     chan struct{}
+	wakeBurst      atomic.Bool
+	wakeGraceUntil atomic.Int64
+	lastRoundAt    atomic.Int64
 }
 
 // NewHealthPing creates a new HealthPing with settings
@@ -90,6 +95,7 @@ func NewHealthPing(ctx context.Context, dispatcher routing.Dispatcher, config *H
 		Settings:   settings,
 		Results:    nil,
 		lanes:      newVupenLanes(),
+		wakeSignal: make(chan struct{}, 1),
 	}
 }
 
@@ -101,11 +107,17 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 	interval := h.Settings.Interval * time.Duration(h.Settings.SamplingCount)
 	ticker := time.NewTicker(interval)
 	h.ticker = ticker
+	// Ядро 60: вентиль сна/сети должен видеть этот балансировщик.
+	vupenObsRegister(h)
 
 	// init run to get a fast check result
 	go func() {
 		// Vupen: не в ту же миллисекунду, что старт ядра (см. tuning_vupen.go).
 		if !vupenSleep(h.ctx, VupenObservatoryInitialDelay) {
+			return
+		}
+		// Ядро 60: ядро подняли во сне или без сети — стартовую пачку сделает пробуждение.
+		if !VupenObservatoryActive() {
 			return
 		}
 		tags, err := selector()
@@ -121,6 +133,9 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 		if !vupenSleep(h.ctx, VupenObservatoryRetryDelay) {
 			return
 		}
+		if !VupenObservatoryActive() {
+			return
+		}
 		errors.LogWarning(h.ctx, "[observatory] retry after initial failures: ", failed)
 		if vupenRetryHook != nil {
 			vupenRetryHook(failed)
@@ -134,24 +149,38 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 			return
 		}
 		for {
-			go func() {
-				tags, err := selector()
-				if err != nil {
-					errors.LogWarning(h.ctx, "error select outbounds for scheduled health check: ", err)
-					return
-				}
-				subCtx, cancel := context.WithCancel(h.ctx)
-				old := h.cancelPending.Swap(&cancel)
-				if old != nil {
-					errors.LogDebug(h.ctx, "scheduled health check not finished before next round, canceling previous one")
-					(*old)()
-				}
-				h.doCheck(subCtx, tags, interval, h.Settings.SamplingCount)
-				h.cancelPending.CompareAndSwap(&cancel, nil)
-				h.Cleanup(tags)
-			}()
+			// Ядро 60: тик мог прийти много позже ожидаемого — значит нас морозили.
+			h.vupenNoteRoundStart(interval)
+			if VupenObservatoryActive() {
+				// Пробуждение: раунд идёт пачкой (duration=0), а не размазанным по окну —
+				// после сна результаты нужны сейчас. Полосы не дают ему стать залпом.
+				burst := h.wakeBurst.Swap(false)
+				h.vupenTakeWakeSignal()
+				go func() {
+					tags, err := selector()
+					if err != nil {
+						errors.LogWarning(h.ctx, "error select outbounds for scheduled health check: ", err)
+						return
+					}
+					subCtx, cancel := context.WithCancel(h.ctx)
+					old := h.cancelPending.Swap(&cancel)
+					if old != nil {
+						errors.LogDebug(h.ctx, "scheduled health check not finished before next round, canceling previous one")
+						(*old)()
+					}
+					if burst {
+						h.doCheck(subCtx, tags, 0, 1)
+					} else {
+						h.doCheck(subCtx, tags, interval, h.Settings.SamplingCount)
+					}
+					h.cancelPending.CompareAndSwap(&cancel, nil)
+					h.Cleanup(tags)
+				}()
+			}
 			select {
 			case <-ticker.C:
+				continue
+			case <-h.wakeSignal:
 				continue
 			case <-h.ctx.Done():
 				return
@@ -167,6 +196,7 @@ func (h *HealthPing) StopScheduler() {
 	}
 	h.ticker.Stop()
 	h.ticker = nil
+	vupenObsUnregister(h)
 	h.cancelCtx()
 }
 
@@ -267,15 +297,24 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 					}
 					return
 				}
+				// Ядро 60: провал в первые секунды после пробуждения не записываем —
+				// радио ещё поднимается, а записанный провал живёт interval×sampling×2.
+				value := time.Duration(rttFailed)
+				note := ""
+				if h.vupenFailIgnored() {
+					value = 0
+					note = " (wake grace, not recorded)"
+				}
 				errors.LogWarning(h.ctx, fmt.Sprintf(
-					"error ping %s with %s: %s",
+					"error ping %s with %s: %s%s",
 					h.Settings.Destination,
 					handler,
 					err,
+					note,
 				))
 				ch <- &rtt{
 					handler: handler,
-					value:   rttFailed,
+					value:   value,
 				}
 			}))
 		}
