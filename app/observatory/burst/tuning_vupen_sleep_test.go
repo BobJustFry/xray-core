@@ -12,6 +12,25 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tagged"
 )
 
+// vupenObsResetForTest — вентиль глобальный: без сброса тесты видят следы соседа.
+func vupenObsResetForTest(t *testing.T, shortSleep, burstGap time.Duration) {
+	oldShort, oldGap := VupenObservatoryShortSleep, VupenObservatoryWakeBurstMinGap
+	VupenObservatoryShortSleep, VupenObservatoryWakeBurstMinGap = shortSleep, burstGap
+	vupenObs.mu.Lock()
+	vupenObs.active = true
+	vupenObs.pausedAt = time.Time{}
+	vupenObs.lastBurstAt = time.Time{}
+	vupenObs.mu.Unlock()
+	t.Cleanup(func() {
+		VupenObservatoryShortSleep, VupenObservatoryWakeBurstMinGap = oldShort, oldGap
+		vupenObs.mu.Lock()
+		vupenObs.active = true
+		vupenObs.pausedAt = time.Time{}
+		vupenObs.lastBurstAt = time.Time{}
+		vupenObs.mu.Unlock()
+	})
+}
+
 func newSleepTestPing() *HealthPing {
 	return NewHealthPing(context.Background(), nil, &HealthPingConfig{
 		Interval:      int64(10 * time.Second),
@@ -23,6 +42,7 @@ func newSleepTestPing() *HealthPing {
 
 // Во сне стартовая пачка не уходит: ядро могли поднять при спящем устройстве.
 func TestVupenObservatoryPauseSkipsInitialBurst(t *testing.T) {
+	vupenObsResetForTest(t, 10*time.Millisecond, time.Millisecond)
 	var dials atomic.Int64
 	oldDialer := tagged.Dialer
 	tagged.Dialer = func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
@@ -51,6 +71,7 @@ func TestVupenObservatoryPauseSkipsInitialBurst(t *testing.T) {
 // Пробуждение: мёртвые снова опрашиваются, окно без записи провалов взведено,
 // раунд просится сразу — и именно пачкой.
 func TestVupenObservatoryResumeArmsWakeRound(t *testing.T) {
+	vupenObsResetForTest(t, 10*time.Millisecond, time.Millisecond)
 	h := newSleepTestPing()
 	vupenObsRegister(h)
 	defer vupenObsUnregister(h)
@@ -63,6 +84,7 @@ func TestVupenObservatoryResumeArmsWakeRound(t *testing.T) {
 	if VupenObservatoryActive() {
 		t.Fatal("после паузы вентиль остался открытым")
 	}
+	time.Sleep(30 * time.Millisecond) // сон должен стать «настоящим»
 	VupenObservatoryResume("test wake")
 	if !VupenObservatoryActive() {
 		t.Fatal("после пробуждения вентиль не открылся")
@@ -87,7 +109,8 @@ func TestVupenObservatoryResumeArmsWakeRound(t *testing.T) {
 }
 
 // Пауза отменяет идущий раунд: его результаты не должны попасть в статистику.
-func TestVupenPauseCancelsRunningRound(t *testing.T) {
+func TestVupenLongPauseCancelsRunningRound(t *testing.T) {
+	vupenObsResetForTest(t, 10*time.Millisecond, time.Millisecond)
 	h := newSleepTestPing()
 	vupenObsRegister(h)
 	defer vupenObsUnregister(h)
@@ -100,17 +123,87 @@ func TestVupenPauseCancelsRunningRound(t *testing.T) {
 	VupenObservatoryPause("test")
 	defer VupenObservatoryResume("test cleanup")
 
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && roundCtx.Err() == nil {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if roundCtx.Err() == nil {
-		t.Fatal("идущий раунд не отменён")
+		t.Fatal("затянувшаяся пауза не отменила идущий раунд")
 	}
 	if h.cancelPending.Load() != nil {
 		t.Fatal("отменённый раунд остался висеть в cancelPending")
 	}
 }
 
+// Главная защита от разряда батареи: iOS дёргает sleep/wake каждые несколько
+// секунд, и такой цикл не должен ни гонять пачку, ни убивать идущий раунд.
+func TestVupenShortSleepIsNotASleep(t *testing.T) {
+	vupenObsResetForTest(t, time.Second, time.Millisecond)
+	h := newSleepTestPing()
+	vupenObsRegister(h)
+	defer vupenObsUnregister(h)
+
+	roundCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stored := context.CancelFunc(cancel)
+	h.cancelPending.Store(&stored)
+	h.access.Lock()
+	h.deadSkip = map[string]int{"proxy-2": 5}
+	h.access.Unlock()
+
+	for i := 0; i < 5; i++ {
+		VupenObservatoryPause("system sleep")
+		time.Sleep(5 * time.Millisecond)
+		VupenObservatoryResume("wake")
+	}
+
+	if !VupenObservatoryActive() {
+		t.Fatal("вентиль остался закрытым")
+	}
+	if h.wakeBurst.Load() {
+		t.Fatal("короткий цикл энергосбережения погнал пачку проб")
+	}
+	if roundCtx.Err() != nil {
+		t.Fatal("короткая пауза отменила идущий раунд")
+	}
+	if h.vupenFailIgnored() {
+		t.Fatal("короткая пауза взвела окно без записи провалов")
+	}
+	h.access.Lock()
+	dead := len(h.deadSkip)
+	h.access.Unlock()
+	if dead == 0 {
+		t.Fatal("короткая пауза сбросила счётчики мёртвых узлов")
+	}
+}
+
+// Даже настоящие пробуждения подряд не должны давать пачку чаще, чем раз в окно.
+func TestVupenWakeBurstRateLimited(t *testing.T) {
+	vupenObsResetForTest(t, 10*time.Millisecond, time.Minute)
+	h := newSleepTestPing()
+	vupenObsRegister(h)
+	defer vupenObsUnregister(h)
+
+	VupenObservatoryPause("system sleep")
+	time.Sleep(30 * time.Millisecond)
+	VupenObservatoryResume("wake")
+	if !h.wakeBurst.Load() {
+		t.Fatal("первое пробуждение не дало пачку")
+	}
+	h.wakeBurst.Store(false)
+
+	VupenObservatoryPause("system sleep")
+	time.Sleep(30 * time.Millisecond)
+	VupenObservatoryResume("wake")
+	if h.wakeBurst.Load() {
+		t.Fatal("вторая пачка ушла внутри окна ограничения")
+	}
+}
+
 // Провал во времени = процесс морозили. Сигнала сна на Windows нет, поэтому
 // пробуждение ядро должно распознать само.
 func TestVupenTimeGapCountsAsWake(t *testing.T) {
+	vupenObsResetForTest(t, 10*time.Millisecond, time.Millisecond)
 	h := newSleepTestPing()
 	h.vupenNoteRoundStart(time.Minute)
 	h.wakeBurst.Store(false)

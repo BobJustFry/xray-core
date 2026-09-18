@@ -38,6 +38,18 @@ var (
 	VupenObservatoryWakeGrace = 20 * time.Second
 	// VupenObservatoryGapFactor — тик позже ожидаемого во столько раз = мы спали.
 	VupenObservatoryGapFactor = 2.0
+	// VupenObservatoryShortSleep — сон короче этого сном не считается.
+	//
+	// iOS 26 дёргает `sleep`/`wake` у расширения постоянно: бандл 2026-09-18 —
+	// 160 циклов за 22 минуты, медиана 3,5 с. Каждый такой «сон» гнал пачку проб
+	// по всем узлам и отменял идущий раунд: за 22 минуты завершились 15 раундов,
+	// радио не простаивало ни секунды, телефон сел за ночь. Поэтому короткая
+	// пауза только закрывает вентиль — без пачки, без сброса мёртвых и без
+	// отмены идущего раунда.
+	VupenObservatoryShortSleep = 60 * time.Second
+	// VupenObservatoryWakeBurstMinGap — чаще этого пачку на пробуждение не гоняем,
+	// каким бы ни был повод (сон, возврат сети, провал во времени).
+	VupenObservatoryWakeBurstMinGap = 2 * time.Minute
 )
 
 // vupenObs — вентиль на все балансировщики процесса разом: их может быть
@@ -46,20 +58,51 @@ var vupenObs = struct {
 	mu     sync.Mutex
 	active bool
 	pings  map[*HealthPing]struct{}
+	// Стенные часы: когда закрыли вентиль и когда последний раз гоняли пачку.
+	pausedAt    time.Time
+	lastBurstAt time.Time
+	// Поколение паузы: отложенная отмена раунда не должна сработать после того,
+	// как вентиль успели открыть и закрыть снова.
+	pauseGen int64
 }{
 	active: true,
 	pings:  make(map[*HealthPing]struct{}),
 }
 
 // VupenObservatoryPause — устройство уснуло или пропала сеть.
+//
+// Тихая операция: новые раунды не начинаются, но идущий живёт ещё
+// VupenObservatoryShortSleep. Если к тому времени вентиль всё ещё закрыт — сон
+// настоящий, раунд отменяется, и только тогда это попадает в лог.
 func VupenObservatoryPause(reason string) {
 	vupenObs.mu.Lock()
-	was := vupenObs.active
+	if !vupenObs.active {
+		vupenObs.mu.Unlock()
+		return
+	}
 	vupenObs.active = false
+	vupenObs.pausedAt = time.Now().Round(0)
+	vupenObs.pauseGen++
+	gen := vupenObs.pauseGen
+	vupenObs.mu.Unlock()
+
+	time.AfterFunc(VupenObservatoryShortSleep, func() {
+		vupenObsCancelRoundsIfStillPaused(gen, reason)
+	})
+}
+
+// vupenObsCancelRoundsIfStillPaused — пауза затянулась: это настоящий сон или
+// долгая пропажа сети, идущий раунд можно отменять.
+func vupenObsCancelRoundsIfStillPaused(gen int64, reason string) {
+	vupenObs.mu.Lock()
+	stale := vupenObs.active || vupenObs.pauseGen != gen
 	pings := vupenObsPingsLocked()
 	vupenObs.mu.Unlock()
+	if stale {
+		return
+	}
 	errors.LogWarning(context.Background(),
-		"[observatory] pause (", reason, ") balancers=", len(pings), " wasActive=", was)
+		"[observatory] paused (", reason, ") balancers=", len(pings))
 	for _, h := range pings {
 		if vupenObsDropIfDone(h) {
 			continue
@@ -68,22 +111,58 @@ func VupenObservatoryPause(reason string) {
 	}
 }
 
-// VupenObservatoryResume — проснулись или вернулась сеть. Пачка уходит всегда, даже
-// если паузы не было: после сна свежие замеры нужны сейчас, а не через тик.
+// VupenObservatoryResume — проснулись или вернулась сеть.
+//
+// Пачка уходит, только если пауза была настоящей (дольше
+// VupenObservatoryShortSleep) и с прошлой пачки прошло больше
+// VupenObservatoryWakeBurstMinGap. Короткий цикл энергосбережения просто
+// открывает вентиль: свежие замеры от него не появятся, а радио он будит.
 func VupenObservatoryResume(reason string) {
 	vupenObs.mu.Lock()
 	was := vupenObs.active
+	slept := time.Duration(0)
+	if !was && !vupenObs.pausedAt.IsZero() {
+		slept = time.Now().Round(0).Sub(vupenObs.pausedAt)
+	}
 	vupenObs.active = true
 	pings := vupenObsPingsLocked()
 	vupenObs.mu.Unlock()
+
+	if !vupenObsTakeWakeBurstSlot(slept) {
+		return
+	}
 	errors.LogWarning(context.Background(),
-		"[observatory] resume (", reason, ") balancers=", len(pings), " wasActive=", was)
+		"[observatory] resume (", reason, ") slept=", slept.Truncate(time.Second).String(),
+		" balancers=", len(pings))
 	for _, h := range pings {
 		if vupenObsDropIfDone(h) {
 			continue
 		}
 		h.vupenAfterWake(reason)
 	}
+}
+
+// vupenObsTakeWakeBurstSlot — можно ли гнать пачку прямо сейчас. Отмеряет и сон,
+// и промежуток с прошлой пачки; при разрешении сразу занимает слот.
+func vupenObsTakeWakeBurstSlot(slept time.Duration) bool {
+	if slept < VupenObservatoryShortSleep {
+		return false
+	}
+	return vupenObsTakeWakeBurstSlotForced()
+}
+
+// vupenObsTakeWakeBurstSlotForced — то же, но без проверки длительности сна: для
+// детектора провала во времени, где сна как события не было вовсе.
+func vupenObsTakeWakeBurstSlotForced() bool {
+	now := time.Now().Round(0)
+	vupenObs.mu.Lock()
+	defer vupenObs.mu.Unlock()
+	if !vupenObs.lastBurstAt.IsZero() &&
+		now.Sub(vupenObs.lastBurstAt) < VupenObservatoryWakeBurstMinGap {
+		return false
+	}
+	vupenObs.lastBurstAt = now
+	return true
 }
 
 // VupenObservatoryActive — идут ли сейчас пробы (для лога и тестов).
@@ -186,9 +265,13 @@ func (h *HealthPing) vupenNoteRoundStart(window time.Duration) {
 		return
 	}
 	gap := now.Sub(time.Unix(0, prev))
-	if gap > time.Duration(float64(window)*VupenObservatoryGapFactor) {
-		h.vupenAfterWake("time gap " + gap.Truncate(time.Second).String())
+	if gap <= time.Duration(float64(window)*VupenObservatoryGapFactor) {
+		return
 	}
+	if !vupenObsTakeWakeBurstSlotForced() {
+		return
+	}
+	h.vupenAfterWake("time gap " + gap.Truncate(time.Second).String())
 }
 
 // vupenTakeWakeSignal — съесть отложенный сигнал пробуждения: раунд всё равно
