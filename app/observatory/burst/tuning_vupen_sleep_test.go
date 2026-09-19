@@ -150,6 +150,8 @@ func TestVupenShortSleepIsNotASleep(t *testing.T) {
 	h.access.Lock()
 	h.deadSkip = map[string]int{"proxy-2": 5}
 	h.access.Unlock()
+	// Раунд только что прошёл: данные свежие, гонять пачку незачем.
+	h.lastRoundAt.Store(time.Now().UnixNano())
 
 	for i := 0; i < 5; i++ {
 		VupenObservatoryPause("system sleep")
@@ -177,6 +179,30 @@ func TestVupenShortSleepIsNotASleep(t *testing.T) {
 	}
 }
 
+// Обратная сторона: если раунда давно не было, пачка нужна даже после короткого
+// цикла. Иначе тики теряются, результаты истекают, и у балансировщика не остаётся
+// ни одного живого узла — весь трафик уходит в fallbackTag (бандл 2026-09-19).
+func TestVupenStaleDataWakesRoundEvenAfterShortSleep(t *testing.T) {
+	vupenObsResetForTest(t, time.Minute, time.Millisecond)
+	h := newSleepTestPing()
+	vupenObsRegister(h)
+	defer vupenObsUnregister(h)
+
+	window := h.Settings.Interval * time.Duration(h.Settings.SamplingCount)
+	h.lastRoundAt.Store(time.Now().Add(-2 * window).UnixNano())
+	if !h.vupenRoundDataStale() {
+		t.Fatal("раунд был давно, а данные не считаются протухающими")
+	}
+
+	VupenObservatoryPause("system sleep")
+	time.Sleep(5 * time.Millisecond)
+	VupenObservatoryResume("wake")
+
+	if !h.wakeBurst.Load() {
+		t.Fatal("протухшие данные не подняли раунд")
+	}
+}
+
 // Даже настоящие пробуждения подряд не должны давать пачку чаще, чем раз в окно.
 func TestVupenWakeBurstRateLimited(t *testing.T) {
 	vupenObsResetForTest(t, 10*time.Millisecond, time.Minute)
@@ -184,6 +210,7 @@ func TestVupenWakeBurstRateLimited(t *testing.T) {
 	vupenObsRegister(h)
 	defer vupenObsUnregister(h)
 
+	h.lastRoundAt.Store(time.Now().Add(-time.Hour).UnixNano())
 	VupenObservatoryPause("system sleep")
 	time.Sleep(30 * time.Millisecond)
 	VupenObservatoryResume("wake")

@@ -38,6 +38,11 @@ var (
 	VupenObservatoryWakeGrace = 20 * time.Second
 	// VupenObservatoryGapFactor — тик позже ожидаемого во столько раз = мы спали.
 	VupenObservatoryGapFactor = 2.0
+	// VupenObservatoryStaleRounds — данные считаются протухающими, когда с прошлого
+	// раунда прошло столько же, сколько длится окно раунда (`interval × sampling`).
+	// Результаты живут вдвое дольше окна, так что раунд «в долг» успевает закрыть
+	// дыру до того, как у балансировщика не останется ни одного живого узла.
+	VupenObservatoryStaleRounds = 1.0
 	// VupenObservatoryShortSleep — сон короче этого сном не считается.
 	//
 	// iOS 26 дёргает `sleep`/`wake` у расширения постоянно: бандл 2026-09-18 —
@@ -128,31 +133,51 @@ func VupenObservatoryResume(reason string) {
 	pings := vupenObsPingsLocked()
 	vupenObs.mu.Unlock()
 
-	if !vupenObsTakeWakeBurstSlot(slept) {
-		return
-	}
-	errors.LogWarning(context.Background(),
-		"[observatory] resume (", reason, ") slept=", slept.Truncate(time.Second).String(),
-		" balancers=", len(pings))
 	for _, h := range pings {
 		if vupenObsDropIfDone(h) {
 			continue
 		}
+		// Пачка нужна не потому, что мы «проснулись», а потому, что данные вот-вот
+		// протухнут. Пока правилом была длина сна, короткие циклы энергосбережения
+		// съедали плановые тики: бандл 2026-09-19 — раунды через 11 и 20 минут при
+		// окне 5, результаты успевали истечь, leastLoad не видел ни одного живого
+		// узла и весь трафик уходил в fallbackTag (самый медленный узел списка).
+		if !h.vupenRoundDataStale() && slept < VupenObservatoryShortSleep {
+			continue
+		}
+		if !vupenObsTakeWakeBurstSlotForced() {
+			continue
+		}
+		errors.LogWarning(context.Background(),
+			"[observatory] resume (", reason, ") slept=", slept.Truncate(time.Second).String(),
+			" sinceRound=", h.vupenSinceLastRound().Truncate(time.Second).String())
 		h.vupenAfterWake(reason)
 	}
 }
 
-// vupenObsTakeWakeBurstSlot — можно ли гнать пачку прямо сейчас. Отмеряет и сон,
-// и промежуток с прошлой пачки; при разрешении сразу занимает слот.
-func vupenObsTakeWakeBurstSlot(slept time.Duration) bool {
-	if slept < VupenObservatoryShortSleep {
-		return false
+// vupenSinceLastRound — сколько прошло с начала последнего реального раунда.
+// Пока раунда не было ни одного — целая вечность, лишь бы не «только что».
+func (h *HealthPing) vupenSinceLastRound() time.Duration {
+	prev := h.lastRoundAt.Load()
+	if prev <= 0 {
+		return time.Duration(1<<62 - 1)
 	}
-	return vupenObsTakeWakeBurstSlotForced()
+	return time.Now().Round(0).Sub(time.Unix(0, prev))
 }
 
-// vupenObsTakeWakeBurstSlotForced — то же, но без проверки длительности сна: для
-// детектора провала во времени, где сна как события не было вовсе.
+// vupenRoundDataStale — с прошлого раунда прошло не меньше окна раунда: следующий
+// плановый тик придёт слишком поздно, и результаты успеют истечь.
+func (h *HealthPing) vupenRoundDataStale() bool {
+	window := h.Settings.Interval * time.Duration(h.Settings.SamplingCount)
+	if window <= 0 {
+		return true
+	}
+	return h.vupenSinceLastRound() >= time.Duration(float64(window)*VupenObservatoryStaleRounds)
+}
+
+// vupenObsTakeWakeBurstSlotForced — свободен ли слот пачки; при разрешении сразу
+// занимает его. Это единственный предохранитель от шторма: чаще, чем раз в
+// VupenObservatoryWakeBurstMinGap, пачка не уходит ни по какому поводу.
 func vupenObsTakeWakeBurstSlotForced() bool {
 	now := time.Now().Round(0)
 	vupenObs.mu.Lock()

@@ -23,6 +23,9 @@ type LeastLoadStrategy struct {
 	observer extension.Observatory
 
 	ctx context.Context
+
+	// Vupen (ядро 63): текущий выбор — для инерции и лога смены узла.
+	vupen vupenLeastLoadState
 }
 
 func (l *LeastLoadStrategy) GetPrincipleTarget(strings []string) []string {
@@ -68,13 +71,27 @@ func (s *LeastLoadStrategy) InjectContext(ctx context.Context) {
 }
 
 func (s *LeastLoadStrategy) PickOutbound(candidates []string) string {
-	selects := s.pickOutbounds(candidates)
-	count := len(selects)
-	if count == 0 {
+	qualified := s.getNodes(candidates)
+	selects := s.selectLeastLoad(qualified)
+	if len(selects) == 0 {
 		// goes to fallbackTag
+		errors.LogWarning(s.ctx, "[balancer] leastLoad → fallbackTag: no qualified outbound of ",
+			len(candidates), " (no fresh probe results?)")
+		s.vupen.set("")
 		return ""
 	}
-	return selects[dice.Roll(count)].Tag
+	// Vupen (ядро 63): инерция. Апстрим менял узел от любого шевеления замеров, а
+	// смена узла — это смена IP на выходе и разорванные сессии у приложений.
+	pick := vupenLeastLoadChoose(s.vupen.get(), qualified, selects)
+	if pick == nil {
+		pick = selects[dice.Roll(len(selects))]
+	}
+	if s.vupen.set(pick.Tag) {
+		errors.LogWarning(s.ctx, "[balancer] leastLoad → ", pick.Tag,
+			" avg=", pick.RTTAverage.Milliseconds(), "ms fail=", pick.CountFail,
+			"/", pick.CountAll, " qualified=", len(qualified), "/", len(candidates))
+	}
+	return pick.Tag
 }
 
 func (s *LeastLoadStrategy) pickOutbounds(candidates []string) []*node {

@@ -149,9 +149,12 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 			return
 		}
 		for {
-			// Ядро 61: тик мог прийти много позже ожидаемого — значит нас морозили.
-			h.vupenNoteRoundStart(interval)
+			// Ядро 63: отметку о раунде ставим, только когда раунд действительно идёт.
+			// Пока она стояла и на пропущенных тиках, «давно не опрашивали» никто не
+			// видел: вентиль пропускал тик, результаты протухали за validity, и у
+			// балансировщика не оставалось ни одного живого узла.
 			if VupenObservatoryActive() {
+				h.vupenNoteRoundStart(interval)
 				// Пробуждение: раунд идёт пачкой (duration=0), а не размазанным по окну —
 				// после сна результаты нужны сейчас. Полосы не дают ему стать залпом.
 				burst := h.wakeBurst.Swap(false)
@@ -238,6 +241,13 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 				continue
 			}
 			kept = append(kept, tag)
+		}
+		// Ядро 63: бэкофф мёртвых не должен оставлять балансировщик без кандидатов.
+		// Пока живых мало, опрашиваем всех: лучше лишние пробы, чем пустой пул и
+		// весь трафик в fallbackTag.
+		if len(kept)*3 < len(tags) {
+			kept = tags
+			skipped = nil
 		}
 		if len(skipped) > 0 {
 			errors.LogWarning(h.ctx, "[observatory] dead nodes skipped this round: ", skipped)
