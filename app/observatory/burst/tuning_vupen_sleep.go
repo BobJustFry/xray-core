@@ -150,7 +150,7 @@ func VupenObservatoryResume(reason string) {
 		}
 		errors.LogWarning(context.Background(),
 			"[observatory] resume (", reason, ") slept=", slept.Truncate(time.Second).String(),
-			" sinceRound=", h.vupenSinceLastRound().Truncate(time.Second).String())
+			" sinceRound=", h.vupenSinceLastRoundText())
 		h.vupenAfterWake(reason)
 	}
 }
@@ -163,6 +163,14 @@ func (h *HealthPing) vupenSinceLastRound() time.Duration {
 		return time.Duration(1<<62 - 1)
 	}
 	return time.Now().Round(0).Sub(time.Unix(0, prev))
+}
+
+// vupenSinceLastRoundText — то же для лога: «никогда» вместо 2562047h47m16s.
+func (h *HealthPing) vupenSinceLastRoundText() string {
+	if h.lastRoundAt.Load() <= 0 {
+		return "never"
+	}
+	return h.vupenSinceLastRound().Truncate(time.Second).String()
 }
 
 // vupenRoundDataStale — с прошлого раунда прошло не меньше окна раунда: следующий

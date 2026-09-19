@@ -282,3 +282,48 @@ func TestVupenWakeGraceExpires(t *testing.T) {
 		t.Fatal("окно не истекло")
 	}
 }
+
+// Сценарий бандла 2026-09-19 целиком: пауза съела плановый тик, данные протухли.
+// Раунд обязан уйти на возобновлении, не дожидаясь следующего тика — иначе
+// результаты истекут, у балансировщика не останется живых узлов и весь трафик
+// уедет в fallbackTag.
+func TestVupenStaleResumeRunsRoundWithoutWaitingForTick(t *testing.T) {
+	// Сон заведомо «короткий»: проверяем именно протухание данных, а не длину паузы.
+	vupenObsResetForTest(t, time.Hour, time.Millisecond)
+
+	var dials atomic.Int64
+	oldDialer := tagged.Dialer
+	tagged.Dialer = func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, errors.New("down")
+	}
+	defer func() { tagged.Dialer = oldDialer }()
+
+	oldInit := VupenObservatoryInitialDelay
+	VupenObservatoryInitialDelay = 10 * time.Millisecond
+	defer func() { VupenObservatoryInitialDelay = oldInit }()
+
+	h := newSleepTestPing() // interval 10s × sampling 1 → окно и тик 10 с
+	h.StartScheduler(func() ([]string, error) { return []string{"a", "b"}, nil })
+	defer h.StopScheduler()
+	time.Sleep(200 * time.Millisecond) // стартовая пачка отработала
+
+	base := dials.Load()
+	if base == 0 {
+		t.Fatal("стартовая пачка не ушла — тест бессмысленный")
+	}
+
+	VupenObservatoryPause("system sleep")
+	// Так выглядит пропущенный тик: последний раунд был давно.
+	h.lastRoundAt.Store(time.Now().Add(-time.Minute).UnixNano())
+	time.Sleep(20 * time.Millisecond)
+	VupenObservatoryResume("wake")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && dials.Load() == base {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := dials.Load(); got == base {
+		t.Fatal("на протухших данных раунд не ушёл: балансировщик остался бы без замеров до тика")
+	}
+}

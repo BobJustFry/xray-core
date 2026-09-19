@@ -75,9 +75,10 @@ func (s *LeastLoadStrategy) PickOutbound(candidates []string) string {
 	selects := s.selectLeastLoad(qualified)
 	if len(selects) == 0 {
 		// goes to fallbackTag
-		errors.LogWarning(s.ctx, "[balancer] leastLoad → fallbackTag: no qualified outbound of ",
-			len(candidates), " (no fresh probe results?)")
-		s.vupen.set("")
+		if s.vupen.set("") {
+			errors.LogWarning(s.ctx, "[balancer] leastLoad → fallbackTag: no qualified outbound of ",
+				len(candidates), " (no fresh probe results?)")
+		}
 		return ""
 	}
 	// Vupen (ядро 63): инерция. Апстрим менял узел от любого шевеления замеров, а
