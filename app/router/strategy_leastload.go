@@ -72,6 +72,11 @@ func (s *LeastLoadStrategy) InjectContext(ctx context.Context) {
 
 func (s *LeastLoadStrategy) PickOutbound(candidates []string) string {
 	qualified := s.getNodes(candidates)
+	// Vupen (ядро 64): отсев заведомо медленных. Свой порог панели не перебиваем —
+	// если `maxRTT` задан в профиле, отбор уже сделан по нему.
+	if s.settings.MaxRTT == 0 {
+		qualified = vupenLeastLoadDropSlow(qualified)
+	}
 	selects := s.selectLeastLoad(qualified)
 	if len(selects) == 0 {
 		// goes to fallbackTag

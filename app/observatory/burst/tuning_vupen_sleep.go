@@ -55,6 +55,18 @@ var (
 	// VupenObservatoryWakeBurstMinGap — чаще этого пачку на пробуждение не гоняем,
 	// каким бы ни был повод (сон, возврат сети, провал во времени).
 	VupenObservatoryWakeBurstMinGap = 2 * time.Minute
+	// VupenObservatoryNetChangeGrace — окно после смены пути, в котором провалы проб
+	// не записываются.
+	//
+	// Проба, упавшая вместе со старым маршрутом, ничего не говорит об узле, а стоит
+	// дорого: `Alive = All != Fail` при окне в три замера, и пара таких провалов
+	// хоронит живой узел. Он выпадает из кандидатов, балансировщик обязан сменить
+	// узел — то есть сменить IP на выходе, и у приложений рвутся сессии. Бандл
+	// 2026-09-20: 15-секундные окна после смен интерфейса занимают **5 %** времени
+	// журнала, а провалов проб в них **28 %** — концентрация в 5,6 раза.
+	//
+	// Короче, чем окно после пробуждения: радио здесь уже поднято, ждать нечего.
+	VupenObservatoryNetChangeGrace = 10 * time.Second
 )
 
 // vupenObs — вентиль на все балансировщики процесса разом: их может быть
@@ -195,6 +207,42 @@ func vupenObsTakeWakeBurstSlotForced() bool {
 		return false
 	}
 	vupenObs.lastBurstAt = now
+	return true
+}
+
+// VupenObservatoryNetworkChanged — путь сменился (wifi↔cellular, пропала или
+// вернулась сеть). Вентиль не трогаем и пачку не гоним: единственное, что делаем —
+// перестаём записывать провалы на VupenObservatoryNetChangeGrace.
+//
+// Уже взведённое окно не продлеваем: при пачке миганий оно иначе висело бы
+// постоянно, и мы перестали бы замечать настоящие отказы.
+func VupenObservatoryNetworkChanged(reason string) {
+	vupenObs.mu.Lock()
+	pings := vupenObsPingsLocked()
+	vupenObs.mu.Unlock()
+	armed := 0
+	for _, h := range pings {
+		if vupenObsDropIfDone(h) {
+			continue
+		}
+		if h.vupenArmNetChangeGrace() {
+			armed++
+		}
+	}
+	if armed > 0 {
+		errors.LogDebug(context.Background(),
+			"[observatory] net change (", reason, ") grace armed for ", armed, " balancer(s)")
+	}
+}
+
+// vupenArmNetChangeGrace — взвести окно, если оно не взведено. false — уже идёт.
+func (h *HealthPing) vupenArmNetChangeGrace() bool {
+	now := time.Now()
+	until := h.wakeGraceUntil.Load()
+	if until > 0 && now.UnixNano() < until {
+		return false
+	}
+	h.wakeGraceUntil.Store(now.Add(VupenObservatoryNetChangeGrace).UnixNano())
 	return true
 }
 

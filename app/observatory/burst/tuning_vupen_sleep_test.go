@@ -327,3 +327,50 @@ func TestVupenStaleResumeRunsRoundWithoutWaitingForTick(t *testing.T) {
 		t.Fatal("на протухших данных раунд не ушёл: балансировщик остался бы без замеров до тика")
 	}
 }
+
+// Проба, упавшая вместе со старым маршрутом, не должна хоронить узел.
+func TestVupenNetChangeArmsGrace(t *testing.T) {
+	vupenObsResetForTest(t, time.Hour, time.Hour)
+	h := newSleepTestPing()
+	vupenObsRegister(h)
+	defer vupenObsUnregister(h)
+
+	if h.vupenFailIgnored() {
+		t.Fatal("окно взведено без повода")
+	}
+	VupenObservatoryNetworkChanged("wifi→cellular")
+	if !h.vupenFailIgnored() {
+		t.Fatal("смена пути не взвела окно")
+	}
+	// Вентиль не трогаем, пачку не просим, счётчики мёртвых не сбрасываем.
+	if !VupenObservatoryActive() {
+		t.Fatal("смена пути закрыла вентиль")
+	}
+	if h.wakeBurst.Load() {
+		t.Fatal("смена пути запросила пачку проб")
+	}
+}
+
+// Пачка миганий не должна держать окно открытым бесконечно.
+func TestVupenNetChangeGraceNotExtended(t *testing.T) {
+	vupenObsResetForTest(t, time.Hour, time.Hour)
+	old := VupenObservatoryNetChangeGrace
+	VupenObservatoryNetChangeGrace = 120 * time.Millisecond
+	defer func() { VupenObservatoryNetChangeGrace = old }()
+
+	h := newSleepTestPing()
+	vupenObsRegister(h)
+	defer vupenObsUnregister(h)
+
+	VupenObservatoryNetworkChanged("1")
+	until := h.wakeGraceUntil.Load()
+	time.Sleep(40 * time.Millisecond)
+	VupenObservatoryNetworkChanged("2")
+	if h.wakeGraceUntil.Load() != until {
+		t.Fatal("повторная смена продлила окно")
+	}
+	time.Sleep(120 * time.Millisecond)
+	if h.vupenFailIgnored() {
+		t.Fatal("окно не истекло")
+	}
+}

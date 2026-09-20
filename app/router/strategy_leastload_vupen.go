@@ -22,6 +22,18 @@ var (
 	// VupenLeastLoadHysteresis — менять узел, только если новый быстрее текущего
 	// больше чем на эту долю (0.25 = на четверть).
 	VupenLeastLoadHysteresis = 0.25
+	// VupenLeastLoadMaxRatio — во сколько раз кандидат может быть медленнее самого
+	// быстрого живого узла. Медленнее — не кандидат.
+	//
+	// leastLoad сортирует по РАЗБРОСУ задержки, а не по её величине: стабильный
+	// узел на 900 мс обгоняет дёрганый на 300. Бандл 2026-09-20: балансировщик
+	// выбирал узлы на 727, 607 и 579 мс, когда в том же раунде были 300 и 325.
+	// Порог относительный — на равномерно медленной сети лучший тоже медленный, и
+	// не отсеивается никто; абсолютный в такой ситуации выкосил бы весь пул.
+	VupenLeastLoadMaxRatio = 2.0
+	// VupenLeastLoadMinKeep — ниже этого числа кандидатов отсев не применяется
+	// вовсе: пустой или почти пустой пул хуже медленного узла.
+	VupenLeastLoadMinKeep = 3
 )
 
 // vupenLeastLoadState — текущий выбор стратегии; живёт рядом с ней.
@@ -85,6 +97,41 @@ func vupenLeastLoadChoose(last string, qualified []*node, selects []*node) *node
 		return best
 	}
 	return cur
+}
+
+// vupenLeastLoadDropSlow — убрать кандидатов, которые медленнее самого быстрого
+// живого больше чем в VupenLeastLoadMaxRatio раз.
+//
+// Узлы без замера (RTTAverage = 0) не трогаем: судить о них нечем. Если после
+// отсева осталось меньше VupenLeastLoadMinKeep, возвращаем исходный список.
+func vupenLeastLoadDropSlow(nodes []*node) []*node {
+	if len(nodes) <= VupenLeastLoadMinKeep {
+		return nodes
+	}
+	best := time.Duration(0)
+	for _, n := range nodes {
+		if n.RTTAverage <= 0 {
+			continue
+		}
+		if best == 0 || n.RTTAverage < best {
+			best = n.RTTAverage
+		}
+	}
+	if best <= 0 {
+		return nodes
+	}
+	limit := time.Duration(float64(best) * VupenLeastLoadMaxRatio)
+	kept := make([]*node, 0, len(nodes))
+	for _, n := range nodes {
+		if n.RTTAverage > limit {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	if len(kept) < VupenLeastLoadMinKeep {
+		return nodes
+	}
+	return kept
 }
 
 // vupenRttBetterBy — [best] быстрее [cur] больше чем на долю [margin].
