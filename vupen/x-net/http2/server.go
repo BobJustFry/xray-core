@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !(go1.27 && !http2legacy)
+// Vupen: upstream builds this file only as "!(go1.27 && !http2legacy)".
+// Our copy always builds it — see vupen/x-net/VUPEN.md.
 
 // TODO: turn off the serve goroutine when idle, so
 // an idle conn only has the readFrames goroutine active. (which could

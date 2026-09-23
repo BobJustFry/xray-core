@@ -2,7 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.27 && !http2legacy
+// Vupen: upstream builds this file as "go1.27 && !http2legacy";
+// our copy never does — see vupen/x-net/VUPEN.md.
+//go:build ignore
 
 // Server wrapping a net/http.Server.
 
