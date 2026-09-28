@@ -42,7 +42,8 @@ func (o *Observer) createResult() []*observatory.OutboundStatus {
 	defer o.hp.access.Unlock()
 	for name, value := range o.hp.Results {
 		status := observatory.OutboundStatus{
-			Alive:           value.getStatistics().All != value.getStatistics().Fail,
+			// Ядро 71: замороженный ТСПУ узел для всех стратегий — мёртвый.
+			Alive:           value.getStatistics().All != value.getStatistics().Fail && !o.hp.vupenTspuFrozen(name),
 			Delay:           value.getStatistics().Average.Milliseconds(),
 			LastErrorReason: "",
 			OutboundTag:     name,

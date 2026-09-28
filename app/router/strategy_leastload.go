@@ -88,9 +88,29 @@ func (s *LeastLoadStrategy) PickOutbound(candidates []string) string {
 	}
 	// Vupen (ядро 63): инерция. Апстрим менял узел от любого шевеления замеров, а
 	// смена узла — это смена IP на выходе и разорванные сессии у приложений.
-	pick := vupenLeastLoadChoose(s.vupen.get(), qualified, selects)
+	last := s.vupen.get()
+	pick := vupenLeastLoadChoose(last, qualified, selects)
 	if pick == nil {
 		pick = selects[dice.Roll(len(selects))]
+	}
+	// Vupen (ядро 71): переходить только на проверенный на заморозку ТСПУ узел.
+	if oracle, ok := s.observer.(vupenTspuOracle); ok {
+		lastAlive := false
+		ordered := make([]string, 0, len(qualified))
+		for _, n := range qualified {
+			ordered = append(ordered, n.Tag)
+			if n.Tag == last {
+				lastAlive = true
+			}
+		}
+		tag := vupenVerifiedSwitch(last, lastAlive, pick.Tag, ordered,
+			oracle.VupenTspuVerified, oracle.VupenTspuRequestVerify)
+		for _, n := range qualified {
+			if n.Tag == tag {
+				pick = n
+				break
+			}
+		}
 	}
 	if s.vupen.set(pick.Tag) {
 		errors.LogWarning(s.ctx, "[balancer] leastLoad → ", pick.Tag,

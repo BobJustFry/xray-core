@@ -1,6 +1,8 @@
 package router
 
 import (
+	"sort"
+
 	"github.com/xtls/xray-core/app/observatory"
 )
 
@@ -70,4 +72,39 @@ func vupenLeastPingChoose(last string, candidates outboundList, status []*observ
 		}
 	}
 	return best
+}
+
+// vupenLeastPingVerified — выбор leastPing с правилом ядра 71 (strategy_vupen_tspu.go):
+// живые кандидаты по возрастанию задержки, переход — только на проверенный.
+func vupenLeastPingVerified(last string, pick vupenLeastPingPick, candidates outboundList,
+	status []*observatory.OutboundStatus, oracle vupenTspuOracle) vupenLeastPingPick {
+	alive := make([]*observatory.OutboundStatus, 0, len(status))
+	lastAlive := false
+	for _, v := range status {
+		if !v.Alive || !candidates.contains(v.OutboundTag) {
+			continue
+		}
+		alive = append(alive, v)
+		if v.OutboundTag == last {
+			lastAlive = true
+		}
+	}
+	sort.SliceStable(alive, func(i, j int) bool { return alive[i].Delay < alive[j].Delay })
+	ordered := make([]string, 0, len(alive))
+	for _, v := range alive {
+		ordered = append(ordered, v.OutboundTag)
+	}
+	tag := vupenVerifiedSwitch(last, lastAlive, pick.tag, ordered,
+		oracle.VupenTspuVerified, oracle.VupenTspuRequestVerify)
+	if tag == pick.tag {
+		return pick
+	}
+	for _, v := range alive {
+		if v.OutboundTag == tag {
+			pick.tag = tag
+			pick.delay = v.Delay
+			break
+		}
+	}
+	return pick
 }

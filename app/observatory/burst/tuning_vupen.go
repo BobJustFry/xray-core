@@ -210,6 +210,11 @@ func (h *HealthPing) vupenRoundSummary(kind string, tags []string) string {
 			fmt.Fprintf(&b, " %s=dead(%d)", tag, s.Fail)
 			continue
 		}
+		// Ядро 71: пробы проходят, но узел заморожен ТСПУ — не выбирается.
+		if h.vupenTspuFrozenLockedAccess(tag) {
+			fmt.Fprintf(&b, " %s=frozen(tspu)", tag)
+			continue
+		}
 		alive++
 		fmt.Fprintf(&b, " %s=%d/%d/%d", tag, s.Average.Milliseconds(), s.Fail, s.All)
 	}

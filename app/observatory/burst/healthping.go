@@ -10,6 +10,7 @@ import (
 
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
 )
 
@@ -44,6 +45,12 @@ type HealthPing struct {
 	wakeBurst      atomic.Bool
 	wakeGraceUntil atomic.Int64
 	lastRoundAt    atomic.Int64
+	// Ядро 71: проверка на заморозку ТСПУ — tuning_vupen_tspu.go. inst — ядро,
+	// которому принадлежит обсерватория: сторож соединений ищет её по нему.
+	inst      *core.Instance
+	tspu      vupenTspuState
+	tspuSem   chan struct{}
+	tspuProbe func(ctx context.Context, tag string, stall time.Duration) (vupenTspuVerdict, string)
 }
 
 // NewHealthPing creates a new HealthPing with settings
@@ -96,6 +103,8 @@ func NewHealthPing(ctx context.Context, dispatcher routing.Dispatcher, config *H
 		Results:    nil,
 		lanes:      newVupenLanes(),
 		wakeSignal: make(chan struct{}, 1),
+		inst:       core.FromContext(ctx),
+		tspuSem:    make(chan struct{}, 1),
 	}
 }
 
@@ -362,6 +371,8 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 		kind = "burst"
 	}
 	errors.LogWarning(h.ctx, h.vupenRoundSummary(kind, tags))
+	// Ядро 71: лучших кандидатов — проверить на заморозку ТСПУ.
+	h.vupenTspuAfterRound(tags)
 }
 
 // PutResult put a ping rtt to results

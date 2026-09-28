@@ -223,7 +223,19 @@ func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt
 }
 
 // DialSystem calls system dialer to create a network connection.
+// DialSystem calls system dialer to create a network connection.
+//
+// Vupen (ядро 71): TCP-соединения к узлам, которые наблюдает обсерватория,
+// идут через сторожа заморозки ТСПУ (tuning_vupen_freeze.go).
 func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
+	conn, err := dialSystem(ctx, dest, sockopt)
+	if err != nil {
+		return conn, err
+	}
+	return vupenFreezeWrap(ctx, conn, dest), nil
+}
+
+func dialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 	var src net.Address
 	outbounds := session.OutboundsFromContext(ctx)
 	var outboundName string

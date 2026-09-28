@@ -65,6 +65,10 @@ func (l *LeastPingStrategy) PickOutbound(strings []string) string {
 		last := l.lastPick
 		l.pickMu.Unlock()
 		pick := vupenLeastPingChoose(last, outboundsList, result.Status, len(strings))
+		// Vupen (ядро 71): переходить только на проверенный на заморозку ТСПУ узел.
+		if oracle, ok := l.observatory.(vupenTspuOracle); ok && pick.tag != "" {
+			pick = vupenLeastPingVerified(last, pick, outboundsList, result.Status, oracle)
+		}
 		if pick.tag != "" {
 			l.vupenLogPickChange(pick.tag, pick.delay, pick.alive, pick.total)
 		}
