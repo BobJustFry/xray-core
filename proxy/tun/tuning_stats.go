@@ -28,6 +28,8 @@ var tunStats struct {
 	tcpHandshakeFail atomic.Uint64 // CreateEndpoint вернул ошибку (таймаут ACK и т.п.)
 	udpSessions      atomic.Int32
 	udpCapDrops      atomic.Uint64 // пакетов отброшено по лимиту UDP-сессий
+	udpEvicted       atomic.Uint64 // сессий вытеснено при полной таблице (ядро 72)
+	udpDNSReaped     atomic.Uint64 // DNS-сессий закрыто через udpDNSIdle (ядро 72)
 }
 
 var (
@@ -52,7 +54,7 @@ func Stats() string {
 	}
 	tunStackMu.Unlock()
 	return fmt.Sprintf(
-		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d",
+		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d udpEvict=%d dnsReap=%d",
 		tunStats.readerAlive.Load(),
 		tunStats.readPackets.Load(),
 		tunStats.readErrors.Load(),
@@ -66,6 +68,8 @@ func Stats() string {
 		synDrop,
 		tunStats.udpSessions.Load(),
 		tunStats.udpCapDrops.Load(),
+		tunStats.udpEvicted.Load(),
+		tunStats.udpDNSReaped.Load(),
 	)
 }
 

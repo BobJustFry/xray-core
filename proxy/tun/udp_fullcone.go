@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -21,6 +22,9 @@ type udpConnectionHandler struct {
 	sync.RWMutex
 
 	udpConns map[net.Destination]*udpConn
+
+	// Vupen: сборщик коротких DNS-сессий работает, только пока они есть.
+	dnsReaperRunning bool
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -42,6 +46,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	u.RLock()
 	conn, found := u.udpConns[src]
 	if found {
+		conn.touch()
 		select {
 		case conn.egress <- &packet{
 			data: data,
@@ -60,7 +65,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	conn, found = u.udpConns[src]
 	if !found {
-		if len(u.udpConns) >= mobileMaxUDPConns() {
+		if len(u.udpConns) >= mobileMaxUDPConns() && !u.evictIdlestLocked() {
 			// Vupen: было LogDebug — на рабочем уровне лога переполнение не видно.
 			n := tunStats.udpCapDrops.Add(1)
 			if logEvery(n) {
@@ -69,9 +74,14 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 			return
 		}
 		egress := make(chan *packet, mobileUDPEgressDepth())
-		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
+		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst, dns: dst.Port == 53}
+		conn.touch()
 		u.udpConns[src] = conn
 		tunStats.udpSessions.Store(int32(len(u.udpConns)))
+		if conn.dns && !u.dnsReaperRunning {
+			u.dnsReaperRunning = true
+			go u.reapDNSSessions()
+		}
 
 		go u.handleConnection(conn, dst)
 	}
@@ -87,15 +97,104 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
-func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
+func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
 	u.Lock()
-	conn, found := u.udpConns[src]
-	if found {
-		delete(u.udpConns, src)
-		close(conn.egress)
-		tunStats.udpSessions.Store(int32(len(u.udpConns)))
+	// Vupen: сессию могли уже вытеснить, и под тем же адресом источника теперь
+	// живёт новая — её не трогаем.
+	if conn, found := u.udpConns[c.src]; found && conn == c {
+		u.removeLocked(conn)
 	}
 	u.Unlock()
+}
+
+// removeLocked убирает сессию из таблицы и закрывает её очередь: чтение отдаёт
+// io.EOF, outbound доделывает своё и выходит. Вызывать под u.Lock().
+func (u *udpConnectionHandler) removeLocked(conn *udpConn) {
+	delete(u.udpConns, conn.src)
+	close(conn.egress)
+	tunStats.udpSessions.Store(int32(len(u.udpConns)))
+}
+
+// Vupen: сроки жизни UDP-сессий в таблице TUN (ядро 72).
+//
+// Сессия держит место, пока outbound не закроет её по connIdle (300 с). iOS шлёт
+// каждый DNS-запрос с нового порта, поэтому каждый запрос — отдельная сессия на
+// 5 минут: таблица на 192 места выдерживала ~38 новых UDP-потоков в минуту,
+// дальше новые потоки (и DNS) молча отбрасывались, и интернет пропадал до
+// переподключения (vSupport iPhone 646, 2026-10-05: udp=192 из 192 с 11:09,
+// 3500 отбросов за 20 минут, 77% сессий — порт 53).
+const (
+	// udpDNSIdle — сколько живёт сессия на порт 53 после последнего пакета.
+	// С запасом на медленный ответ: Яндекс через балансировщик — до ~0,7 с,
+	// таймаут одного сервера в ядре — 4 с.
+	udpDNSIdle = 10 * time.Second
+	// udpDNSReapEvery — как часто сборщик смотрит DNS-сессии. Пока их нет,
+	// сборщика нет и лишних пробуждений во сне тоже.
+	udpDNSReapEvery = 2 * time.Second
+	// udpEvictMinIdle — при полной таблице новую сессию пускаем, вытеснив самую
+	// давно молчащую, если она молчит хотя бы столько. Если все места заняты
+	// живым трафиком, новый поток, как раньше, отбрасывается.
+	udpEvictMinIdle = 5 * time.Second
+)
+
+// evictIdlestLocked освобождает место под новую сессию. Вызывать под u.Lock().
+func (u *udpConnectionHandler) evictIdlestLocked() bool {
+	var victim *udpConn
+	var oldest int64
+	for _, c := range u.udpConns {
+		if t := c.lastActive.Load(); victim == nil || t < oldest {
+			victim, oldest = c, t
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	idle := time.Since(time.Unix(0, oldest))
+	if idle < udpEvictMinIdle {
+		return false
+	}
+	u.removeLocked(victim)
+	n := tunStats.udpEvicted.Add(1)
+	if logEvery(n) {
+		errors.LogWarning(context.Background(), "[tun] udp table full (", mobileMaxUDPConns(), "): evicted session to ", victim.dst.NetAddr(), " idle ", idle.Round(time.Second), " (evictions ", n, ")")
+	}
+	return true
+}
+
+// reapDNSSessions закрывает DNS-сессии, молчащие дольше udpDNSIdle, и выходит,
+// когда DNS-сессий не осталось.
+func (u *udpConnectionHandler) reapDNSSessions() {
+	ticker := time.NewTicker(udpDNSReapEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !u.reapDNSOnce(time.Now()) {
+			return
+		}
+	}
+}
+
+// reapDNSOnce — один проход сборщика. Возвращает false, если DNS-сессий больше
+// нет и сборщик остановлен.
+func (u *udpConnectionHandler) reapDNSOnce(now time.Time) bool {
+	u.Lock()
+	defer u.Unlock()
+	left := 0
+	for _, c := range u.udpConns {
+		if !c.dns {
+			continue
+		}
+		if now.Sub(time.Unix(0, c.lastActive.Load())) >= udpDNSIdle {
+			u.removeLocked(c)
+			tunStats.udpDNSReaped.Add(1)
+			continue
+		}
+		left++
+	}
+	if left == 0 {
+		u.dnsReaperRunning = false
+		return false
+	}
+	return true
 }
 
 // udp connection abstraction
@@ -105,6 +204,15 @@ type udpConn struct {
 	egress chan *packet
 	src    net.Destination
 	dst    net.Destination
+
+	// Vupen: dns — сессия на порт 53, у неё короткий срок жизни; lastActive —
+	// время последнего пакета в любую сторону, UnixNano.
+	dns        bool
+	lastActive atomic.Int64
+}
+
+func (c *udpConn) touch() {
+	c.lastActive.Store(time.Now().UnixNano())
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -149,6 +257,7 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				dst = *b.UDP
 			}
 		}
+		c.touch()
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
@@ -162,6 +271,7 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 // Write returning packets back
 func (c *udpConn) Write(p []byte) (int, error) {
 	// sending packets back mean sending payload with source/destination reversed
+	c.touch()
 	err := c.handler.writePacket(p, c.dst, c.src)
 	if err != nil {
 		return 0, nil
@@ -171,7 +281,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	c.handler.connectionFinished(c.src)
+	c.handler.connectionFinished(c)
 
 	return nil
 }
