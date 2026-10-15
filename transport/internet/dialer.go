@@ -227,12 +227,19 @@ func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt
 //
 // Vupen (ядро 71): TCP-соединения к узлам, которые наблюдает обсерватория,
 // идут через сторожа заморозки ТСПУ (tuning_vupen_freeze.go).
+// Vupen (ядро 74): в ядре с АВТО 4.1 соединение запоминает сеть, под которой
+// открыто (tuning_vupen_netepoch.go); без вызова VupenSetUplink — как было.
 func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
+	netSnap := vupenNetEpochBeforeDial(ctx)
 	conn, err := dialSystem(ctx, dest, sockopt)
 	if err != nil {
 		return conn, err
 	}
-	return vupenFreezeWrap(ctx, conn, dest), nil
+	conn = vupenFreezeWrap(ctx, conn, dest)
+	if err := vupenNetEpochTrack(conn, netSnap); err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 func dialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {

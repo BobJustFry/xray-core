@@ -123,6 +123,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			gctx = c.ContextWithID(gctx, c.IDFromContext(ctx))
 			gctx = session.ContextWithOutbounds(gctx, session.OutboundsFromContext(ctx))
 			gctx = session.ContextWithTimeoutOnly(gctx, true)
+			gctx = internet.VupenNetEpochCarry(gctx, ctx) // Vupen (ядро 74): эпохи сети АВТО 4.1
 
 			c, err := internet.DialSystem(gctx, net.TCPDestination(address, port), sockopt)
 			if err == nil {

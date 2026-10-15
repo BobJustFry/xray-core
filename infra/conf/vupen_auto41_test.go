@@ -116,6 +116,12 @@ const vupenAuto41NewJSON = `{
 // vupenAuto41LegacyGolden is sha256 of the deterministic wire encoding of the
 // core config built from vupenAuto41LegacyJSON by the fork BEFORE step 2.1
 // (fork HEAD 9b9df02b8dc6, branch vupen/full-26.9.9, core 72).
+//
+// If this test fails, first find the cause. Recapture the hash (run the test,
+// copy "got") ONLY after confirming the change comes from an upstream merge
+// (e.g. a new default field in an upstream config) and not from Vupen code:
+// a Vupen change that alters a config without vupen* fields is a regression.
+// Note the upstream commit next to the new hash.
 const vupenAuto41LegacyGolden = "0a317ab6de604d61f65f2afb5ea3c2f5dc00d084e550251e06c0591b55e93089"
 
 const vupenAuto41Ping = `"pingConfig":{"destination":"d","interval":"100s","sampling":3,"timeout":"5s"}`
@@ -377,6 +383,30 @@ func TestVupenAuto41RoundTrip(t *testing.T) {
 	}
 	if !proto.Equal(bc, backC) {
 		t.Fatalf("round-trip: got %v want %v", backC, bc)
+	}
+
+	// Empty objects {} are "present": they stay non-nil through JSON and the
+	// wire (a set empty sub-message is encoded as a zero-length field).
+	empty, err := vupenAuto41ParseRouter(`{"balancers":[{"tag":"b","selector":["p"],"vupenSpill":{},"vupenSticky":{}}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eb := empty.BalancingRule[0]; eb.VupenSpill == nil || eb.VupenSticky == nil {
+		t.Fatalf("{} must parse to non-nil messages: %v", eb)
+	}
+	b, err = proto.Marshal(empty.BalancingRule[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	backE := new(router.BalancingRule)
+	if err := proto.Unmarshal(b, backE); err != nil {
+		t.Fatal(err)
+	}
+	if backE.VupenSpill == nil || backE.VupenSticky == nil {
+		t.Fatalf("{} must stay non-nil after a wire round-trip: %v", backE)
+	}
+	if !proto.Equal(empty.BalancingRule[0], backE) {
+		t.Fatalf("round-trip of {}: got %v want %v", backE, empty.BalancingRule[0])
 	}
 
 	cfg := vupenAuto41Build(t, vupenAuto41NewJSON).(*core.Config)

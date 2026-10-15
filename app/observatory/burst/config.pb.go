@@ -26,7 +26,7 @@ type Config struct {
 	// @Document The selectors for outbound under observation
 	SubjectSelector []string          `protobuf:"bytes,2,rep,name=subject_selector,json=subjectSelector,proto3" json:"subject_selector,omitempty"`
 	PingConfig      *HealthPingConfig `protobuf:"bytes,3,opt,name=ping_config,json=pingConfig,proto3" json:"ping_config,omitempty"`
-	// Vupen fork, 4.1 AUTO (ADR-0001 sections 4.4): no scheduled probe rounds, probes
+	// Vupen fork, 4.1 AUTO (ADR-0001 section 4.4): no scheduled probe rounds, probes
 	// only on demand. Field number >= 100 so it never collides with upstream.
 	// false (unset) = observatory behaves as before.
 	VupenOnDemand bool `protobuf:"varint,100,opt,name=vupen_on_demand,json=vupenOnDemand,proto3" json:"vupen_on_demand,omitempty"`

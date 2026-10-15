@@ -27,6 +27,9 @@ type Router struct {
 	ohm        outbound.Manager
 	dispatcher routing.Dispatcher
 	mu         sync.Mutex
+
+	// Vupen (ядро 74): в конфиге есть поля АВТО 4.1 (tuning_vupen_netepoch.go).
+	vupenAuto41 atomic.Bool
 }
 
 // Route is an implementation of routing.Route.
@@ -47,6 +50,7 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 
 	r.rules.Store(new([]*Rule))
 	r.balancers.Store(&map[string]*Balancer{})
+	r.vupenAuto41.Store(vupenAuto41Fields(config))
 	return r.ReloadRules(config, false)
 }
 

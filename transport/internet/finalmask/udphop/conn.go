@@ -108,7 +108,8 @@ func (c *udpHopConn) hop(addr *net.UDPAddr) {
 		}
 	}
 	if c.local {
-		raw, err := internet.DialSystem(context.Background(), net.UDPDestination(net.IPAddress(newAddr.IP), net.Port(newAddr.Port)), c.sockopt)
+		// Vupen (ядро 74): новый сокет отслеживается эпохами сети, если отслеживается исходный.
+		raw, err := internet.DialSystem(internet.VupenNetEpochContextFor(c.conn), net.UDPDestination(net.IPAddress(newAddr.IP), net.Port(newAddr.Port)), c.sockopt)
 		if err != nil {
 			errors.LogErrorInner(context.Background(), err, "hop err")
 			return
