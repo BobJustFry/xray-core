@@ -372,8 +372,12 @@ type BalancingRule struct {
 	Strategy         string                 `protobuf:"bytes,3,opt,name=strategy,proto3" json:"strategy,omitempty"`
 	StrategySettings *serial.TypedMessage   `protobuf:"bytes,4,opt,name=strategy_settings,json=strategySettings,proto3" json:"strategy_settings,omitempty"`
 	FallbackTag      string                 `protobuf:"bytes,5,opt,name=fallback_tag,json=fallbackTag,proto3" json:"fallback_tag,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Vupen fork, 4.1 AUTO (ADR-0001 sections 4.3, 4.4). Field numbers >= 100 so they
+	// never collide with upstream. Unset = the balancer behaves as before.
+	VupenSpill    *VupenSpill  `protobuf:"bytes,100,opt,name=vupen_spill,json=vupenSpill,proto3" json:"vupen_spill,omitempty"`
+	VupenSticky   *VupenSticky `protobuf:"bytes,101,opt,name=vupen_sticky,json=vupenSticky,proto3" json:"vupen_sticky,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BalancingRule) Reset() {
@@ -439,6 +443,20 @@ func (x *BalancingRule) GetFallbackTag() string {
 		return x.FallbackTag
 	}
 	return ""
+}
+
+func (x *BalancingRule) GetVupenSpill() *VupenSpill {
+	if x != nil {
+		return x.VupenSpill
+	}
+	return nil
+}
+
+func (x *BalancingRule) GetVupenSticky() *VupenSticky {
+	if x != nil {
+		return x.VupenSticky
+	}
+	return nil
 }
 
 type StrategyWeight struct {
@@ -642,6 +660,106 @@ func (x *Config) GetBalancingRule() []*BalancingRule {
 	return nil
 }
 
+// Vupen: hand the pick over to another balancer (e.g. "LTE") when the device
+// uplink is one of `uplink` and this balancer's pool is confirmed dead.
+type VupenSpill struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BalancerTag   string                 `protobuf:"bytes,1,opt,name=balancer_tag,json=balancerTag,proto3" json:"balancer_tag,omitempty"`
+	Uplink        []string               `protobuf:"bytes,2,rep,name=uplink,proto3" json:"uplink,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VupenSpill) Reset() {
+	*x = VupenSpill{}
+	mi := &file_app_router_config_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VupenSpill) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VupenSpill) ProtoMessage() {}
+
+func (x *VupenSpill) ProtoReflect() protoreflect.Message {
+	mi := &file_app_router_config_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VupenSpill.ProtoReflect.Descriptor instead.
+func (*VupenSpill) Descriptor() ([]byte, []int) {
+	return file_app_router_config_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *VupenSpill) GetBalancerTag() string {
+	if x != nil {
+		return x.BalancerTag
+	}
+	return ""
+}
+
+func (x *VupenSpill) GetUplink() []string {
+	if x != nil {
+		return x.Uplink
+	}
+	return nil
+}
+
+// Vupen: keep the current outbound while it works; `initial` is the last
+// working one passed in by the app.
+type VupenSticky struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Initial       string                 `protobuf:"bytes,1,opt,name=initial,proto3" json:"initial,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VupenSticky) Reset() {
+	*x = VupenSticky{}
+	mi := &file_app_router_config_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VupenSticky) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VupenSticky) ProtoMessage() {}
+
+func (x *VupenSticky) ProtoReflect() protoreflect.Message {
+	mi := &file_app_router_config_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VupenSticky.ProtoReflect.Descriptor instead.
+func (*VupenSticky) Descriptor() ([]byte, []int) {
+	return file_app_router_config_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *VupenSticky) GetInitial() string {
+	if x != nil {
+		return x.Initial
+	}
+	return ""
+}
+
 var File_app_router_config_proto protoreflect.FileDescriptor
 
 const file_app_router_config_proto_rawDesc = "" +
@@ -683,13 +801,16 @@ const file_app_router_config_proto_rawDesc = "" +
 	"\aheaders\x18\x03 \x03(\v2+.xray.app.router.WebhookConfig.HeadersEntryR\aheaders\x1a:\n" +
 	"\fHeadersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xdc\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xdb\x02\n" +
 	"\rBalancingRule\x12\x10\n" +
 	"\x03tag\x18\x01 \x01(\tR\x03tag\x12+\n" +
 	"\x11outbound_selector\x18\x02 \x03(\tR\x10outboundSelector\x12\x1a\n" +
 	"\bstrategy\x18\x03 \x01(\tR\bstrategy\x12M\n" +
 	"\x11strategy_settings\x18\x04 \x01(\v2 .xray.common.serial.TypedMessageR\x10strategySettings\x12!\n" +
-	"\ffallback_tag\x18\x05 \x01(\tR\vfallbackTag\"T\n" +
+	"\ffallback_tag\x18\x05 \x01(\tR\vfallbackTag\x12<\n" +
+	"\vvupen_spill\x18d \x01(\v2\x1b.xray.app.router.VupenSpillR\n" +
+	"vupenSpill\x12?\n" +
+	"\fvupen_sticky\x18e \x01(\v2\x1c.xray.app.router.VupenStickyR\vvupenSticky\"T\n" +
 	"\x0eStrategyWeight\x12\x16\n" +
 	"\x06regexp\x18\x01 \x01(\bR\x06regexp\x12\x14\n" +
 	"\x05match\x18\x02 \x01(\tR\x05match\x12\x14\n" +
@@ -708,7 +829,13 @@ const file_app_router_config_proto_rawDesc = "" +
 	"\x04AsIs\x10\x00\x12\x10\n" +
 	"\fIpIfNonMatch\x10\x02\x12\x0e\n" +
 	"\n" +
-	"IpOnDemand\x10\x03\"\x04\b\x01\x10\x01BO\n" +
+	"IpOnDemand\x10\x03\"\x04\b\x01\x10\x01\"G\n" +
+	"\n" +
+	"VupenSpill\x12!\n" +
+	"\fbalancer_tag\x18\x01 \x01(\tR\vbalancerTag\x12\x16\n" +
+	"\x06uplink\x18\x02 \x03(\tR\x06uplink\"'\n" +
+	"\vVupenSticky\x12\x18\n" +
+	"\ainitial\x18\x01 \x01(\tR\ainitialBO\n" +
 	"\x13com.xray.app.routerP\x01Z$github.com/xtls/xray-core/app/router\xaa\x02\x0fXray.App.Routerb\x06proto3"
 
 var (
@@ -724,7 +851,7 @@ func file_app_router_config_proto_rawDescGZIP() []byte {
 }
 
 var file_app_router_config_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_app_router_config_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_app_router_config_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_app_router_config_proto_goTypes = []any{
 	(Config_DomainStrategy)(0),      // 0: xray.app.router.Config.DomainStrategy
 	(*RoutingRule)(nil),             // 1: xray.app.router.RoutingRule
@@ -733,37 +860,41 @@ var file_app_router_config_proto_goTypes = []any{
 	(*StrategyWeight)(nil),          // 4: xray.app.router.StrategyWeight
 	(*StrategyLeastLoadConfig)(nil), // 5: xray.app.router.StrategyLeastLoadConfig
 	(*Config)(nil),                  // 6: xray.app.router.Config
-	nil,                             // 7: xray.app.router.RoutingRule.AttributesEntry
-	nil,                             // 8: xray.app.router.WebhookConfig.HeadersEntry
-	(*geodata.DomainRule)(nil),      // 9: xray.common.geodata.DomainRule
-	(*geodata.IPRule)(nil),          // 10: xray.common.geodata.IPRule
-	(*net.PortList)(nil),            // 11: xray.common.net.PortList
-	(net.Network)(0),                // 12: xray.common.net.Network
-	(*serial.TypedMessage)(nil),     // 13: xray.common.serial.TypedMessage
+	(*VupenSpill)(nil),              // 7: xray.app.router.VupenSpill
+	(*VupenSticky)(nil),             // 8: xray.app.router.VupenSticky
+	nil,                             // 9: xray.app.router.RoutingRule.AttributesEntry
+	nil,                             // 10: xray.app.router.WebhookConfig.HeadersEntry
+	(*geodata.DomainRule)(nil),      // 11: xray.common.geodata.DomainRule
+	(*geodata.IPRule)(nil),          // 12: xray.common.geodata.IPRule
+	(*net.PortList)(nil),            // 13: xray.common.net.PortList
+	(net.Network)(0),                // 14: xray.common.net.Network
+	(*serial.TypedMessage)(nil),     // 15: xray.common.serial.TypedMessage
 }
 var file_app_router_config_proto_depIdxs = []int32{
-	9,  // 0: xray.app.router.RoutingRule.domain:type_name -> xray.common.geodata.DomainRule
-	10, // 1: xray.app.router.RoutingRule.ip:type_name -> xray.common.geodata.IPRule
-	11, // 2: xray.app.router.RoutingRule.port_list:type_name -> xray.common.net.PortList
-	12, // 3: xray.app.router.RoutingRule.networks:type_name -> xray.common.net.Network
-	10, // 4: xray.app.router.RoutingRule.source_ip:type_name -> xray.common.geodata.IPRule
-	11, // 5: xray.app.router.RoutingRule.source_port_list:type_name -> xray.common.net.PortList
-	7,  // 6: xray.app.router.RoutingRule.attributes:type_name -> xray.app.router.RoutingRule.AttributesEntry
-	10, // 7: xray.app.router.RoutingRule.local_ip:type_name -> xray.common.geodata.IPRule
-	11, // 8: xray.app.router.RoutingRule.local_port_list:type_name -> xray.common.net.PortList
-	11, // 9: xray.app.router.RoutingRule.vless_route_list:type_name -> xray.common.net.PortList
+	11, // 0: xray.app.router.RoutingRule.domain:type_name -> xray.common.geodata.DomainRule
+	12, // 1: xray.app.router.RoutingRule.ip:type_name -> xray.common.geodata.IPRule
+	13, // 2: xray.app.router.RoutingRule.port_list:type_name -> xray.common.net.PortList
+	14, // 3: xray.app.router.RoutingRule.networks:type_name -> xray.common.net.Network
+	12, // 4: xray.app.router.RoutingRule.source_ip:type_name -> xray.common.geodata.IPRule
+	13, // 5: xray.app.router.RoutingRule.source_port_list:type_name -> xray.common.net.PortList
+	9,  // 6: xray.app.router.RoutingRule.attributes:type_name -> xray.app.router.RoutingRule.AttributesEntry
+	12, // 7: xray.app.router.RoutingRule.local_ip:type_name -> xray.common.geodata.IPRule
+	13, // 8: xray.app.router.RoutingRule.local_port_list:type_name -> xray.common.net.PortList
+	13, // 9: xray.app.router.RoutingRule.vless_route_list:type_name -> xray.common.net.PortList
 	2,  // 10: xray.app.router.RoutingRule.webhook:type_name -> xray.app.router.WebhookConfig
-	8,  // 11: xray.app.router.WebhookConfig.headers:type_name -> xray.app.router.WebhookConfig.HeadersEntry
-	13, // 12: xray.app.router.BalancingRule.strategy_settings:type_name -> xray.common.serial.TypedMessage
-	4,  // 13: xray.app.router.StrategyLeastLoadConfig.costs:type_name -> xray.app.router.StrategyWeight
-	0,  // 14: xray.app.router.Config.domain_strategy:type_name -> xray.app.router.Config.DomainStrategy
-	1,  // 15: xray.app.router.Config.rule:type_name -> xray.app.router.RoutingRule
-	3,  // 16: xray.app.router.Config.balancing_rule:type_name -> xray.app.router.BalancingRule
-	17, // [17:17] is the sub-list for method output_type
-	17, // [17:17] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	10, // 11: xray.app.router.WebhookConfig.headers:type_name -> xray.app.router.WebhookConfig.HeadersEntry
+	15, // 12: xray.app.router.BalancingRule.strategy_settings:type_name -> xray.common.serial.TypedMessage
+	7,  // 13: xray.app.router.BalancingRule.vupen_spill:type_name -> xray.app.router.VupenSpill
+	8,  // 14: xray.app.router.BalancingRule.vupen_sticky:type_name -> xray.app.router.VupenSticky
+	4,  // 15: xray.app.router.StrategyLeastLoadConfig.costs:type_name -> xray.app.router.StrategyWeight
+	0,  // 16: xray.app.router.Config.domain_strategy:type_name -> xray.app.router.Config.DomainStrategy
+	1,  // 17: xray.app.router.Config.rule:type_name -> xray.app.router.RoutingRule
+	3,  // 18: xray.app.router.Config.balancing_rule:type_name -> xray.app.router.BalancingRule
+	19, // [19:19] is the sub-list for method output_type
+	19, // [19:19] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_app_router_config_proto_init() }
@@ -781,7 +912,7 @@ func file_app_router_config_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_app_router_config_proto_rawDesc), len(file_app_router_config_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

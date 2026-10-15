@@ -12,6 +12,11 @@ message Config {
   repeated string subject_selector = 2;
 
   HealthPingConfig ping_config = 3;
+
+  // Vupen fork, 4.1 AUTO (ADR-0001 sections 4.4): no scheduled probe rounds, probes
+  // only on demand. Field number >= 100 so it never collides with upstream.
+  // false (unset) = observatory behaves as before.
+  bool vupen_on_demand = 100;
 }
 
 message HealthPingConfig {

@@ -24,6 +24,8 @@ type BurstObservatoryConfig struct {
 	SubjectSelector []string `json:"subjectSelector"`
 	// health check settings
 	HealthCheck *HealthCheckSettings `json:"pingConfig,omitempty"`
+	// Vupen fork, 4.1 AUTO (ADR-0001 sections 4.4, 13): probes on demand only. Absent = false = as before.
+	VupenOnDemand bool `json:"vupenOnDemand"`
 }
 
 func (b BurstObservatoryConfig) Build() (proto.Message, error) {
@@ -31,7 +33,7 @@ func (b BurstObservatoryConfig) Build() (proto.Message, error) {
 		return nil, errors.New("BurstObservatory requires a valid pingConfig")
 	}
 	if result, err := b.HealthCheck.Build(); err == nil {
-		return &burst.Config{SubjectSelector: b.SubjectSelector, PingConfig: result.(*burst.HealthPingConfig)}, nil
+		return &burst.Config{SubjectSelector: b.SubjectSelector, PingConfig: result.(*burst.HealthPingConfig), VupenOnDemand: b.VupenOnDemand}, nil
 	} else {
 		return nil, err
 	}

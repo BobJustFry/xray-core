@@ -26,8 +26,12 @@ type Config struct {
 	// @Document The selectors for outbound under observation
 	SubjectSelector []string          `protobuf:"bytes,2,rep,name=subject_selector,json=subjectSelector,proto3" json:"subject_selector,omitempty"`
 	PingConfig      *HealthPingConfig `protobuf:"bytes,3,opt,name=ping_config,json=pingConfig,proto3" json:"ping_config,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Vupen fork, 4.1 AUTO (ADR-0001 sections 4.4): no scheduled probe rounds, probes
+	// only on demand. Field number >= 100 so it never collides with upstream.
+	// false (unset) = observatory behaves as before.
+	VupenOnDemand bool `protobuf:"varint,100,opt,name=vupen_on_demand,json=vupenOnDemand,proto3" json:"vupen_on_demand,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Config) Reset() {
@@ -72,6 +76,13 @@ func (x *Config) GetPingConfig() *HealthPingConfig {
 		return x.PingConfig
 	}
 	return nil
+}
+
+func (x *Config) GetVupenOnDemand() bool {
+	if x != nil {
+		return x.VupenOnDemand
+	}
+	return false
 }
 
 type HealthPingConfig struct {
@@ -169,11 +180,12 @@ var File_app_observatory_burst_config_proto protoreflect.FileDescriptor
 
 const file_app_observatory_burst_config_proto_rawDesc = "" +
 	"\n" +
-	"\"app/observatory/burst/config.proto\x12\x1fxray.core.app.observatory.burst\"\x87\x01\n" +
+	"\"app/observatory/burst/config.proto\x12\x1fxray.core.app.observatory.burst\"\xaf\x01\n" +
 	"\x06Config\x12)\n" +
 	"\x10subject_selector\x18\x02 \x03(\tR\x0fsubjectSelector\x12R\n" +
 	"\vping_config\x18\x03 \x01(\v21.xray.core.app.observatory.burst.HealthPingConfigR\n" +
-	"pingConfig\"\xd4\x01\n" +
+	"pingConfig\x12&\n" +
+	"\x0fvupen_on_demand\x18d \x01(\bR\rvupenOnDemand\"\xd4\x01\n" +
 	"\x10HealthPingConfig\x12 \n" +
 	"\vdestination\x18\x01 \x01(\tR\vdestination\x12\"\n" +
 	"\fconnectivity\x18\x02 \x01(\tR\fconnectivity\x12\x1a\n" +

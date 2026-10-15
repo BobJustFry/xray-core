@@ -23,6 +23,22 @@ type BalancingRule struct {
 	Selectors   StringList     `json:"selector"`
 	Strategy    StrategyConfig `json:"strategy"`
 	FallbackTag string         `json:"fallbackTag"`
+
+	// Vupen fork, 4.1 AUTO (ADR-0001 sections 4.3, 4.4, 13). Absent = as before.
+	VupenSpill  *VupenSpillConfig  `json:"vupenSpill"`
+	VupenSticky *VupenStickyConfig `json:"vupenSticky"`
+}
+
+// VupenSpillConfig is routing.balancers[].vupenSpill:
+// {"balancerTag":"LTE","uplink":["cellular"]}.
+type VupenSpillConfig struct {
+	BalancerTag string   `json:"balancerTag"`
+	Uplink      []string `json:"uplink"`
+}
+
+// VupenStickyConfig is routing.balancers[].vupenSticky: {"initial":"proxy-7"}.
+type VupenStickyConfig struct {
+	Initial string `json:"initial"`
 }
 
 // Build builds the balancing rule
@@ -59,13 +75,25 @@ func (r *BalancingRule) Build() (*router.BalancingRule, error) {
 		}
 	}
 
-	return &router.BalancingRule{
+	rule := &router.BalancingRule{
 		Strategy:         r.Strategy.Type,
 		StrategySettings: serial.ToTypedMessage(ts),
 		FallbackTag:      r.FallbackTag,
 		OutboundSelector: r.Selectors,
 		Tag:              r.Tag,
-	}, nil
+	}
+	if r.VupenSpill != nil {
+		rule.VupenSpill = &router.VupenSpill{
+			BalancerTag: r.VupenSpill.BalancerTag,
+			Uplink:      r.VupenSpill.Uplink,
+		}
+	}
+	if r.VupenSticky != nil {
+		rule.VupenSticky = &router.VupenSticky{
+			Initial: r.VupenSticky.Initial,
+		}
+	}
+	return rule, nil
 }
 
 type RouterConfig struct {
