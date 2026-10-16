@@ -23,6 +23,16 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
+// vupenProbeRTT — сколько отвечает тестовый сервер на пробу обсерватории.
+//
+// Проба меряется time.Since, а монотонные часы Go на Windows идут шагами
+// системного таймера (_INTERRUPT_TIME: 1 мс, если кто-то в системе поднял
+// разрешение, иначе 15,6 мс). Ответ по loopback быстрее шага и меряется как 0,
+// а healthping нулевой замер не записывает (`rtt.value > 0`) — узел остаётся
+// без результатов («=none»), сторож его не наблюдает, и тест ждёт следующего
+// раунда до своего срока. Поэтому проба в тестах длится дольше любого шага.
+const vupenProbeRTT = 20 * time.Millisecond
+
 // freezeRelay — TCP-ретранслятор, который ведёт себя как ТСПУ: после limit байт в
 // одном соединении перестаёт пересылать, не закрывая его.
 func freezeRelay(t *testing.T, backend string, limit int64) int {
@@ -119,6 +129,7 @@ func TestVupenTspuEndToEnd(t *testing.T) {
 			return
 		}
 		// Проба через «замороженный» узел — быстрая: лучшим по задержке был бы он.
+		time.Sleep(vupenProbeRTT)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -220,6 +231,7 @@ func TestVupenTspuSentinelOnRealTraffic(t *testing.T) {
 			_, _ = w.Write([]byte(strings.Repeat("x", 64<<10)))
 			return
 		}
+		time.Sleep(vupenProbeRTT)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
