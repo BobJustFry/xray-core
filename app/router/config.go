@@ -122,7 +122,19 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 }
 
 // Build builds the balancing rule
+//
+// Vupen (ядро 75): с vupenSticky балансировщик получает состояние «держать
+// текущий» (strategy_vupen_sticky.go); тип стратегии не меняется.
 func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatcher) (*Balancer, error) {
+	b, err := br.buildBalancer(ohm, dispatcher)
+	if err != nil || br.GetVupenSticky() == nil {
+		return b, err
+	}
+	b.vupen = newVupenSticky(br, b)
+	return b, nil
+}
+
+func (br *BalancingRule) buildBalancer(ohm outbound.Manager, dispatcher routing.Dispatcher) (*Balancer, error) {
 	switch strings.ToLower(br.Strategy) {
 	case "leastping":
 		return &Balancer{

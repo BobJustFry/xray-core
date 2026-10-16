@@ -89,10 +89,17 @@ type Balancer struct {
 	fallbackTag string
 
 	override override
+
+	// Ядро 75 (АВТО 4.1): «держать текущий» (strategy_vupen_sticky.go); nil —
+	// балансировщик без vupenSticky, выбор прежним кодом.
+	vupen *vupenSticky
 }
 
 // PickOutbound picks the tag of a outbound
 func (b *Balancer) PickOutbound() (string, error) {
+	if b.vupen != nil {
+		return b.vupenPickOutbound()
+	}
 	candidates, err := b.SelectOutbounds()
 	if err != nil {
 		if b.fallbackTag != "" {
@@ -121,6 +128,9 @@ func (b *Balancer) PickOutbound() (string, error) {
 func (b *Balancer) InjectContext(ctx context.Context) {
 	if contextReceiver, ok := b.strategy.(extension.ContextReceiver); ok {
 		contextReceiver.InjectContext(ctx)
+	}
+	if b.vupen != nil {
+		b.vupen.injectContext(ctx)
 	}
 }
 

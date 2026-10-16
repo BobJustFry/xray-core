@@ -149,6 +149,7 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 	if !shouldAppend {
 		closeWebhooks(oldRules)
 	}
+	vupenStopReplacedSticky(oldBalancers, newBalancers)
 	return nil
 }
 
@@ -242,6 +243,7 @@ func (r *Router) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	closeWebhooks(*r.rules.Load())
+	vupenStopSticky(*r.balancers.Load())
 	return nil
 }
 

@@ -34,8 +34,55 @@ import (
 // Соединения не оборачиваются: тип, который получает вызывающий, не меняется.
 
 // VupenNetChangeCloseStableSec — сколько секунд новая сеть должна продержаться
-// без смены, прежде чем закрыть соединения прежней сети (D-18).
-const VupenNetChangeCloseStableSec = 9
+// без смены, прежде чем закрыть соединения прежней сети (D-18). По тому же
+// таймеру АВТО 4.1 повторяет поиск, если ничего не работает (ADR-0001 §4.4 (6) В3).
+// Переменная, а не константа: значение ещё может поменять владелец.
+var VupenNetChangeCloseStableSec = 9
+
+// VupenNetEvent — событие эпохи сети для подписчиков (app/router, АВТО 4.1).
+type VupenNetEvent int
+
+const (
+	// VupenNetChanged — тип или подпись сети сменились (сразу, в том числе на мигании).
+	VupenNetChanged VupenNetEvent = iota + 1
+	// VupenNetStable — новая сеть продержалась VupenNetChangeCloseStableSec
+	// (тот же момент, когда закрываются соединения прежней сети).
+	VupenNetStable
+)
+
+var vupenNetSubs = struct {
+	mu   sync.Mutex
+	next uint64
+	m    map[uint64]func(VupenNetEvent)
+}{m: map[uint64]func(VupenNetEvent){}}
+
+// VupenNetEpochSubscribe — получать события эпохи сети. f вызывается вне
+// блокировок, из горутины таймера или VupenSetUplink, и не должна блокировать.
+// Возвращает отписку.
+func VupenNetEpochSubscribe(f func(VupenNetEvent)) (unsubscribe func()) {
+	vupenNetSubs.mu.Lock()
+	vupenNetSubs.next++
+	id := vupenNetSubs.next
+	vupenNetSubs.m[id] = f
+	vupenNetSubs.mu.Unlock()
+	return func() {
+		vupenNetSubs.mu.Lock()
+		delete(vupenNetSubs.m, id)
+		vupenNetSubs.mu.Unlock()
+	}
+}
+
+func vupenNetNotify(ev VupenNetEvent) {
+	vupenNetSubs.mu.Lock()
+	fs := make([]func(VupenNetEvent), 0, len(vupenNetSubs.m))
+	for _, f := range vupenNetSubs.m {
+		fs = append(fs, f)
+	}
+	vupenNetSubs.mu.Unlock()
+	for _, f := range fs {
+		f(ev)
+	}
+}
 
 // VupenNetEpochHooks — связь со слоем, который знает конфиг экземпляра ядра
 // (сюда core импортировать нельзя: он сам зависит от transport/internet).
@@ -152,15 +199,17 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 			errors.LogWarning(context.Background(), "[netchange] close cancelled: back to ", id.sig,
 				" after ", away.Milliseconds(), " ms")
 		}
+		vupenNetNotify(VupenNetChanged)
 		return
 	}
 	if !hadPending {
 		s.leftBaseAt = now
 	}
-	s.stopPending = vupenNetAfter(VupenNetChangeCloseStableSec*time.Second, func() { s.stable(epoch) })
+	s.stopPending = vupenNetAfter(time.Duration(VupenNetChangeCloseStableSec)*time.Second, func() { s.stable(epoch) })
 	s.publishLocked()
 	s.mu.Unlock()
 	errors.LogWarning(context.Background(), "[netchange] uplink ", old.kind, "→", id, " epoch=", epoch)
+	vupenNetNotify(VupenNetChanged)
 }
 
 // stable — сеть эпохи epoch продержалась 9 с: закрыть соединения других сетей.
@@ -195,6 +244,7 @@ func (s *vupenNetState) stable(epoch uint64) {
 	errors.LogWarning(context.Background(), fmt.Sprintf(
 		"[netchange] stable %ds on %s: closed %d connections (reason=net-change)",
 		VupenNetChangeCloseStableSec, cur.sig, len(closing)))
+	vupenNetNotify(VupenNetStable)
 }
 
 // vupenNetAuto41Ctx — метка контекста: соединение открывает экземпляр с АВТО 4.1

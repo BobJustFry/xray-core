@@ -51,6 +51,9 @@ type HealthPing struct {
 	tspu      vupenTspuState
 	tspuSem   chan struct{}
 	tspuProbe func(ctx context.Context, tag string, stall time.Duration) (vupenTspuVerdict, string)
+	// Ядро 75 (АВТО 4.1): обсерватория по требованию — tuning_vupen_sticky.go.
+	vupenOnDemand bool
+	vupenSubject  func(tag string) bool
 }
 
 // NewHealthPing creates a new HealthPing with settings

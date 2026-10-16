@@ -70,6 +70,8 @@ type vupenTspuEntry struct {
 	frozenUntil   time.Time
 	checking      bool
 	lastCheck     time.Time
+	// Ядро 75: итог последней проверки — для того, кто ждал её (vupenTspuVerifyNow).
+	lastVerdict vupenTspuVerdict
 }
 
 type vupenTspuState struct {
@@ -145,7 +147,8 @@ func (h *HealthPing) vupenTspuRequest(tag string, force bool, reason string) {
 // vupenTspuAfterRound — после раунда: VupenTspuTopK лучших живых кандидатов без
 // свежей проверки идут на проверку (по очереди, по одному — tspuSem).
 func (h *HealthPing) vupenTspuAfterRound(tags []string) {
-	if !VupenTspuEnabled || VupenTspuTopK <= 0 {
+	// Ядро 75: в АВТО 4.1 кандидатов проверяет сам поиск — по пулу и по порядку.
+	if !VupenTspuEnabled || VupenTspuTopK <= 0 || h.vupenOnDemand {
 		return
 	}
 	type cand struct {
@@ -180,14 +183,15 @@ func (h *HealthPing) vupenTspuAfterRound(tags []string) {
 	}
 }
 
-func (h *HealthPing) vupenTspuVerify(tag, reason string) {
-	verdict := vupenTspuUnknown
+func (h *HealthPing) vupenTspuVerify(tag, reason string) (verdict vupenTspuVerdict) {
+	verdict = vupenTspuUnknown
 	detail := ""
 	defer func() {
 		now := time.Now()
 		h.tspu.mu.Lock()
 		e := h.tspu.entryLocked(tag)
 		e.checking = false
+		e.lastVerdict = verdict
 		switch verdict {
 		case vupenTspuOK:
 			e.verifiedUntil = now.Add(VupenTspuVerifiedFor)
@@ -257,6 +261,7 @@ func (h *HealthPing) vupenTspuVerify(tag, reason string) {
 		verdict = vupenTspuSuspect
 	}
 	// Прошёл со второго раза — ТСПУ непостоянен, «проверенным» не считаем.
+	return verdict
 }
 
 // vupenTspuProbeOnce — одна загрузка через узел tag.
@@ -317,6 +322,12 @@ func vupenTspuClassify(r vupenDownloadResult, want int64) vupenTspuVerdict {
 // vupenDownload — GET url клиентом client с подсчётом байт тела; сторож тишины
 // включается с первого байта тела и обрывает загрузку после stall без данных.
 func vupenDownload(ctx context.Context, client *http.Client, url string, timeout, stall time.Duration) vupenDownloadResult {
+	return vupenDownloadFB(ctx, client, url, timeout, stall, 0)
+}
+
+// vupenDownloadFB — то же, плюс firstByte (ядро 75, проверка 24 КБ): не пришло ни
+// байта тела за firstByte — загрузка обрывается как «не началась». 0 — без предела.
+func vupenDownloadFB(ctx context.Context, client *http.Client, url string, timeout, stall, firstByte time.Duration) vupenDownloadResult {
 	r := vupenDownloadResult{stallWait: stall}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -332,6 +343,7 @@ func vupenDownload(ctx context.Context, client *http.Client, url string, timeout
 	start := time.Now()
 	var lastProgress atomic.Int64
 	var stalled atomic.Bool
+	var noStart atomic.Bool
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -348,6 +360,11 @@ func vupenDownload(ctx context.Context, client *http.Client, url string, timeout
 					cancel()
 					return
 				}
+				if firstByte > 0 && last == 0 && time.Since(start) > firstByte {
+					noStart.Store(true)
+					cancel()
+					return
+				}
 			}
 		}
 	}()
@@ -356,7 +373,7 @@ func vupenDownload(ctx context.Context, client *http.Client, url string, timeout
 	if err != nil {
 		r.elapsed = time.Since(start)
 		r.err = err
-		r.timedOut = vupenIsTimeout(err)
+		r.timedOut = vupenIsTimeout(err) || noStart.Load()
 		return r
 	}
 	defer resp.Body.Close()
@@ -382,6 +399,9 @@ func vupenDownload(ctx context.Context, client *http.Client, url string, timeout
 	}
 	r.elapsed = time.Since(start)
 	r.stalled = stalled.Load() && (r.expected <= 0 || r.bytes < r.expected)
+	if noStart.Load() && !r.started {
+		r.timedOut = true
+	}
 	return r
 }
 
@@ -424,7 +444,8 @@ func vupenTspuWatch(ctx context.Context, tag string) any {
 		h.access.Lock()
 		_, ok := h.Results[tag]
 		h.access.Unlock()
-		if ok {
+		// Ядро 75: по требованию замеров может не быть — узел пула узнаём по селектору.
+		if ok || (h.vupenOnDemand && h.vupenSubject != nil && h.vupenSubject(tag)) {
 			return h
 		}
 	}

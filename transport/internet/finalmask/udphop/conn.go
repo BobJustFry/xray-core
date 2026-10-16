@@ -56,6 +56,10 @@ type udpHopConn struct {
 	closeCh chan struct{}
 	wg      sync.WaitGroup
 	mu      sync.Mutex
+
+	// Vupen (ядро 75): контекст новых сокетов при смене порта — решение
+	// «отслеживать эпохами сети» принято один раз, по исходному сокету.
+	dialCtx context.Context
 }
 
 func NewUDPHopConn(c *Config, raw net.PacketConn) (net.PacketConn, error) {
@@ -69,6 +73,7 @@ func NewUDPHopConn(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 	conn := &udpHopConn{
 		conn:       raw,
 		sockopt:    c.Sockopt,
+		dialCtx:    internet.VupenNetEpochContextFor(raw),
 		local:      c.Local,
 		remote:     c.Remote,
 		remoteOnce: c.RemoteOnce,
@@ -109,7 +114,7 @@ func (c *udpHopConn) hop(addr *net.UDPAddr) {
 	}
 	if c.local {
 		// Vupen (ядро 74): новый сокет отслеживается эпохами сети, если отслеживается исходный.
-		raw, err := internet.DialSystem(internet.VupenNetEpochContextFor(c.conn), net.UDPDestination(net.IPAddress(newAddr.IP), net.Port(newAddr.Port)), c.sockopt)
+		raw, err := internet.DialSystem(c.dialCtx, net.UDPDestination(net.IPAddress(newAddr.IP), net.Port(newAddr.Port)), c.sockopt)
 		if err != nil {
 			errors.LogErrorInner(context.Background(), err, "hop err")
 			return

@@ -3,6 +3,7 @@ package internet
 import (
 	"context"
 	"errors"
+	"fmt"
 	stdnet "net"
 	"runtime"
 	"sync"
@@ -204,7 +205,7 @@ func TestVupenNetEpochOtherInstancesUntouched(t *testing.T) {
 		t.Fatalf("non-AUTO-4.1 connections tracked: %d", netEntries())
 	}
 	VupenSetUplink("cellular", "")
-	clock.Advance(VupenNetChangeCloseStableSec * time.Second)
+	clock.Advance(time.Duration(VupenNetChangeCloseStableSec) * time.Second)
 	if isClosed(tcp) || isClosed(udp) {
 		t.Fatal("a non-AUTO-4.1 connection was closed on network change")
 	}
@@ -575,5 +576,39 @@ func TestVupenNetEpochContextFor(t *testing.T) {
 	auto := dial(t, auto41Ctx("proxy-hy2"), dest).(*PacketConnWrapper).PacketConn
 	if vupenNetEpochBeforeDial(VupenNetEpochContextFor(auto)) == nil {
 		t.Fatal("replacement of a tracked socket must be tracked")
+	}
+}
+
+// 2.3: subscribers get "changed" on every change (flaps included) and
+// "stable" once the new network has held for VupenNetChangeCloseStableSec.
+func TestVupenNetEpochSubscribe(t *testing.T) {
+	clock := netEpochTest(t)
+	var mu sync.Mutex
+	var got []VupenNetEvent
+	unsub := VupenNetEpochSubscribe(func(ev VupenNetEvent) {
+		mu.Lock()
+		got = append(got, ev)
+		mu.Unlock()
+	})
+	events := func() []VupenNetEvent {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]VupenNetEvent(nil), got...)
+	}
+	VupenSetUplink("wifi", "")     // first report: no event
+	VupenSetUplink("cellular", "") // changed
+	clock.Advance(5 * time.Second)
+	VupenSetUplink("wifi", "") // flap back: changed, no stable
+	clock.Advance(time.Minute)
+	VupenSetUplink("cellular", "") // changed
+	clock.Advance(time.Duration(VupenNetChangeCloseStableSec) * time.Second)
+	want := []VupenNetEvent{VupenNetChanged, VupenNetChanged, VupenNetChanged, VupenNetStable}
+	if g := events(); fmt.Sprint(g) != fmt.Sprint(want) {
+		t.Fatalf("events %v, want %v", g, want)
+	}
+	unsub()
+	VupenSetUplink("wifi", "")
+	if g := events(); len(g) != len(want) {
+		t.Fatalf("event after unsubscribe: %v", g)
 	}
 }

@@ -90,6 +90,11 @@ func (o *Observer) Start() error {
 			}
 			return vupenLaneFor(stream, proxyType)
 		}
+		// Ядро 75 (АВТО 4.1, D-16): плановых раундов нет, пробы только по требованию.
+		if o.config.GetVupenOnDemand() {
+			o.vupenStartOnDemand()
+			return nil
+		}
 		o.hp.StartScheduler(func() ([]string, error) {
 			hs, ok := o.ohm.(outbound.HandlerSelector)
 			if !ok {
@@ -104,6 +109,10 @@ func (o *Observer) Start() error {
 }
 
 func (o *Observer) Close() error {
+	if o.finished != nil && o.config.GetVupenOnDemand() {
+		o.vupenStopOnDemand()
+		return o.finished.Close()
+	}
 	if o.finished != nil {
 		o.hp.StopScheduler()
 		return o.finished.Close()

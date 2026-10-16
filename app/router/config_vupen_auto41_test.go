@@ -1,8 +1,9 @@
 package router
 
-// Vupen 4.1 AUTO, core step 2.1: the new BalancingRule fields (vupen_spill,
-// vupen_sticky) are carried by the config only. Until the later sub-steps use
-// them, BalancingRule.Build must produce the same Balancer with or without them.
+// Vupen 4.1 AUTO (cores 73/75; CR-002): BalancingRule.Build without the new
+// fields builds exactly the balancer it built before them — vupen state is nil
+// and every other field is the same. With vupenSticky the balancer gets the
+// sticky state and nothing else changes; vupenSpill alone (2.5) does nothing yet.
 
 import (
 	"reflect"
@@ -13,10 +14,28 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// vupenAuto41SameBalancer compares two built balancers field by field; proto
-// settings are compared with proto.Equal (their internal state is not
-// reflect-comparable between two unmarshals) and the leastLoad weight
-// manager field by field (it holds a func).
+// vupenAuto41BalancerFields — every Balancer field and how this test compares
+// it. A new field fails the test until it is listed here (CR-002).
+var vupenAuto41BalancerFields = map[string]bool{
+	"selectors": true, "strategy": true, "ohm": true, "fallbackTag": true, "override": true,
+	"vupen": true, // asserted separately (nil without vupenSticky)
+}
+
+func TestVupenAuto41BalancerFieldsKnown(t *testing.T) {
+	typ := reflect.TypeOf(Balancer{})
+	for i := 0; i < typ.NumField(); i++ {
+		if name := typ.Field(i).Name; !vupenAuto41BalancerFields[name] {
+			t.Fatalf("Balancer has a new field %q: decide how a config without vupen fields keeps it unchanged and list it here", name)
+		}
+	}
+	if typ.NumField() != len(vupenAuto41BalancerFields) {
+		t.Fatalf("Balancer has %d fields, the test knows %d", typ.NumField(), len(vupenAuto41BalancerFields))
+	}
+}
+
+// vupenAuto41SameBalancer compares every field except vupen; proto settings
+// with proto.Equal (their internal state is not reflect-comparable between two
+// unmarshals), the leastLoad weight manager field by field (it holds a func).
 func vupenAuto41SameBalancer(a, b *Balancer) bool {
 	if !reflect.DeepEqual(a.selectors, b.selectors) || a.fallbackTag != b.fallbackTag ||
 		a.ohm != b.ohm || !reflect.DeepEqual(&a.override, &b.override) ||
@@ -44,7 +63,7 @@ func vupenAuto41SameBalancer(a, b *Balancer) bool {
 		la.observer == lb.observer && la.ctx == lb.ctx && reflect.DeepEqual(&la.vupen, &lb.vupen)
 }
 
-func TestVupenAuto41BuildIgnoresNewFields(t *testing.T) {
+func TestVupenAuto41BuildVupenState(t *testing.T) {
 	leastLoad := serial.ToTypedMessage(&StrategyLeastLoadConfig{Expected: 2, MaxRTT: 1e9, Tolerance: 0.3})
 	for _, strategy := range []string{"", "random", "leastping", "leastload", "roundrobin"} {
 		base := &BalancingRule{
@@ -56,25 +75,40 @@ func TestVupenAuto41BuildIgnoresNewFields(t *testing.T) {
 		if strategy == "leastload" {
 			base.StrategySettings = leastLoad
 		}
-		withVupen := &BalancingRule{
-			Tag:              base.Tag,
-			OutboundSelector: base.OutboundSelector,
-			Strategy:         base.Strategy,
-			StrategySettings: base.StrategySettings,
-			FallbackTag:      base.FallbackTag,
-			VupenSpill:       &VupenSpill{BalancerTag: "LTE", Uplink: []string{"cellular"}},
-			VupenSticky:      &VupenSticky{Initial: "proxy-7"},
+		with := func(spill *VupenSpill, sticky *VupenSticky) *BalancingRule {
+			return &BalancingRule{
+				Tag: base.Tag, OutboundSelector: base.OutboundSelector, Strategy: base.Strategy,
+				StrategySettings: base.StrategySettings, FallbackTag: base.FallbackTag,
+				VupenSpill: spill, VupenSticky: sticky,
+			}
 		}
 		a, err := base.Build(nil, nil)
 		if err != nil {
 			t.Fatalf("%q: %v", strategy, err)
 		}
-		b, err := withVupen.Build(nil, nil)
-		if err != nil {
-			t.Fatalf("%q with vupen fields: %v", strategy, err)
+		if a.vupen != nil {
+			t.Fatalf("%q: a balancer without vupen fields must have nil vupen state", strategy)
 		}
-		if !vupenAuto41SameBalancer(a, b) {
-			t.Fatalf("%q: Build differs with vupen fields:\n%#v\n%#v", strategy, a, b)
+		spillOnly, err := with(&VupenSpill{BalancerTag: "LTE", Uplink: []string{"cellular"}}, nil).Build(nil, nil)
+		if err != nil {
+			t.Fatalf("%q spill only: %v", strategy, err)
+		}
+		if spillOnly.vupen != nil || !vupenAuto41SameBalancer(a, spillOnly) {
+			t.Fatalf("%q: vupenSpill alone must not change the balancer (2.5)", strategy)
+		}
+		sticky, err := with(nil, &VupenSticky{Initial: "proxy-7"}).Build(nil, nil)
+		if err != nil {
+			t.Fatalf("%q sticky: %v", strategy, err)
+		}
+		if sticky.vupen == nil || sticky.vupen.initial != "proxy-7" || sticky.vupen.balancer != "REG" || sticky.vupen.b != sticky {
+			t.Fatalf("%q: vupenSticky must give sticky state for this balancer: %+v", strategy, sticky.vupen)
+		}
+		if !vupenAuto41SameBalancer(a, sticky) {
+			t.Fatalf("%q: vupenSticky must not change the rest of the balancer", strategy)
+		}
+		empty, err := with(nil, &VupenSticky{}).Build(nil, nil)
+		if err != nil || empty.vupen == nil || empty.vupen.initial != "" {
+			t.Fatalf("%q: vupenSticky {} = sticky without initial (search at once): %v %+v", strategy, err, empty.vupen)
 		}
 	}
 
@@ -82,5 +116,22 @@ func TestVupenAuto41BuildIgnoresNewFields(t *testing.T) {
 		VupenSticky: &VupenSticky{Initial: "x"}}
 	if _, err := bad.Build(nil, nil); err == nil {
 		t.Fatal("unknown strategy type must still be rejected")
+	}
+}
+
+// Without vupen state PickOutbound takes the old path: the strategy decides.
+func TestVupenAuto41PickWithoutStickyIsUnchanged(t *testing.T) {
+	ohm := &stickyFakeOhm{tags: []string{"p-1", "p-2", "p-3"}}
+	b := &Balancer{selectors: []string{"p"}, strategy: &RoundRobinStrategy{}, ohm: ohm}
+	var got []string
+	for i := 0; i < 4; i++ {
+		tag, err := b.PickOutbound()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, tag)
+	}
+	if want := []string{"p-1", "p-2", "p-3", "p-1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("round robin without sticky: %v, want %v", got, want)
 	}
 }
