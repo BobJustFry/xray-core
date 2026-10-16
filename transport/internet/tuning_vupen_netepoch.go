@@ -50,6 +50,9 @@ const (
 	// VupenNetStable — новая сеть продержалась VupenNetChangeCloseStableSec
 	// (тот же момент, когда закрываются соединения прежней сети).
 	VupenNetStable
+	// VupenNetClosing — сейчас будут закрыты соединения (чистка прежней сети или
+	// по outbound'у); приходит до закрытия (ядро 78: burst взводит окно проб, CR-105).
+	VupenNetClosing
 )
 
 var vupenNetSubs = struct {
@@ -167,16 +170,18 @@ var (
 
 // VupenSetUplink — платформа сообщает тип сети (cellular | wifi | wired |
 // other | none) и подпись пути; пустая подпись = тип. Смена типа или подписи —
-// новая эпоха сети.
-func VupenSetUplink(kind, sig string) {
-	vupenNet.setUplink(kind, sig)
+// новая эпоха сети. changed — сеть сменилась относительно прежней сообщённой
+// (первое сообщение и тот же тип с подписью — false; ядро 78: по нему
+// burst.VupenSetUplink взводит окно проб, CR-105).
+func VupenSetUplink(kind, sig string) (changed bool) {
+	return vupenNet.setUplink(kind, sig)
 }
 
 func (s *vupenNetState) publishLocked() {
 	s.snap.Store(&vupenNetSnap{id: s.current, sweeps: s.sweeps})
 }
 
-func (s *vupenNetState) setUplink(kind, sig string) {
+func (s *vupenNetState) setUplink(kind, sig string) bool {
 	if sig == "" {
 		sig = kind
 	}
@@ -191,11 +196,11 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 		s.active.Store(true)
 		s.mu.Unlock()
 		errors.LogWarning(context.Background(), "[netchange] uplink unknown→", id, " epoch=1")
-		return
+		return false
 	}
 	if id == s.current {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	old := s.current
 	s.current = id
@@ -219,7 +224,7 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 				" after ", away.Milliseconds(), " ms")
 		}
 		vupenNetNotify(VupenNetChanged)
-		return
+		return true
 	}
 	if !hadPending {
 		s.leftBaseAt = now
@@ -229,6 +234,7 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 	s.mu.Unlock()
 	errors.LogWarning(context.Background(), "[netchange] uplink ", old.kind, "→", id, " epoch=", epoch)
 	vupenNetNotify(VupenNetChanged)
+	return true
 }
 
 // stable — сеть эпохи epoch продержалась 9 с: закрыть соединения других сетей.
@@ -258,9 +264,11 @@ func (s *vupenNetState) stable(epoch uint64) {
 	s.publishLocked()
 	s.mu.Unlock()
 
-	for _, c := range closing {
-		c.Close()
+	if len(closing) > 0 || len(byTag) > 0 {
+		vupenNetNotify(VupenNetClosing)
 	}
+	vupenCloseConns(closing) // ядро 78: параллельно, зависший Close не держит остальные
+	vupenNetRecordClose("net-change", len(closing))
 	errors.LogWarning(context.Background(), fmt.Sprintf(
 		"[netchange] stable %ds on %s: closed %d connections (reason=net-change)",
 		VupenNetChangeCloseStableSec, cur.sig, len(closing)))
@@ -359,9 +367,11 @@ func vupenNetCloseTagged(closing []net.Conn, reasons []string, sig string) {
 	if len(reasons) == 0 {
 		return
 	}
-	for _, c := range closing {
-		c.Close()
+	if len(closing) > 0 {
+		vupenNetNotify(VupenNetClosing)
 	}
+	vupenCloseConns(closing)
+	vupenNetRecordClose(strings.Join(reasons, ","), len(closing))
 	errors.LogWarning(context.Background(), fmt.Sprintf(
 		"[netchange] stable %ds on %s: closed %d connections (reason=%s)",
 		VupenNetChangeCloseStableSec, sig, len(closing), strings.Join(reasons, ",")))

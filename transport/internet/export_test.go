@@ -29,4 +29,5 @@ func (s *vupenNetState) resetForTest() {
 		s.stopTag()
 	}
 	s.stopTag, s.tagCloses, s.changedAt = nil, nil, time.Time{}
+	vupenNetLastClose.Store(nil)
 }

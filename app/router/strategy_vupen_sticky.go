@@ -124,8 +124,9 @@ func (p vupenStickyPhase) String() string {
 }
 
 type vupenStickyEvent struct {
-	kind   string // start | check | search | retry | net-stable | current-excluded
+	kind   string // start | check | search | retry | net-stable | current-excluded | wake | sleep | heal …
 	reason string
+	heal   *vupenHealReq // kind "heal" (ядро 78, VupenCheckRoute)
 }
 
 type vupenSticky struct {
@@ -167,6 +168,9 @@ type vupenSticky struct {
 	// балансировщиков сейчас в него переливают.
 	spillTargetOf atomic.Bool
 	feeders       atomic.Int32
+	// CR-602: перелив разбудил цель; если событие wake не влезло в очередь,
+	// обработчик цели увидит флаг на следующем событии.
+	wakePending atomic.Bool
 	// Ядро 77: состояние для 2.6 (VupenAutoState).
 	stateMu sync.Mutex
 	report  vupenStickyReport
@@ -293,6 +297,7 @@ func (s *vupenSticky) start(cands []string) {
 			s.signals.netChangedAt = vupenStickyNow()
 			s.signals.fails = nil
 			s.signals.mu.Unlock()
+			s.setReport(func(r *vupenStickyReport) { r.network = "" }) // ядро 78: сеть новая — не проверена
 			// Ядро 77: сменилась сеть — вердикт «обычный мёртв» сброшен сразу:
 			// новые соединения идут в REG (R4, D-12).
 			if s.unspill("network changed") {
@@ -357,6 +362,9 @@ func (s *vupenSticky) onSignal(tag, kind string, ok bool, detail string) {
 	}
 	sig.mu.Unlock()
 	if reason != "" {
+		s.setReport(func(r *vupenStickyReport) {
+			r.lastSignal = vupenStickyMark{at: now, kind: kind, detail: tag + ": " + detail}
+		})
 		if s.requestCheck(reason) {
 			errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", reason, " on ", tag, " → check")
 		}
@@ -417,6 +425,10 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 		return
 	default:
 	}
+	// CR-602: перелив разбудил цель, а событие wake могло не влезть в очередь.
+	if s.wakePending.Swap(false) {
+		s.onWake()
+	}
 	// CR-501: цель перелива без перелива не ищет и не повторяет.
 	if s.dormant() {
 		switch ev.kind {
@@ -431,9 +443,10 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 			s.stopRetry = nil
 		}
 	case "wake":
-		if !s.dormant() && s.getPhase() == vupenPhaseNoWorking {
-			s.retryIdx = 0
-			s.search("spill")
+		// Разобрано выше по флагу wakePending (CR-602).
+	case "heal":
+		if ev.heal != nil {
+			ev.heal.reply <- s.healRoute(ev.heal)
 		}
 	case "check":
 		defer s.checkPending.Store(false)
@@ -468,15 +481,28 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 
 func (s *vupenSticky) spilledNow() bool { return s.spill != nil && s.spill.spilled.Load() }
 
+// onWake — цель перелива снова в работе: ничего рабочего не было — искать сразу.
+func (s *vupenSticky) onWake() {
+	if !s.dormant() && s.getPhase() == vupenPhaseNoWorking {
+		s.retryIdx = 0
+		s.search("spill")
+	}
+}
+
 func (s *vupenSticky) hold(tag string) { s.holdBecause(tag, "check") }
 
 func (s *vupenSticky) holdBecause(tag, reason string) {
 	s.setReport(func(r *vupenStickyReport) {
+		now := vupenStickyNow()
 		if r.current != tag {
-			r.lastSwitch = vupenStickyMark{at: vupenStickyNow(), from: r.current, to: tag, reason: reason}
+			r.lastSwitch = vupenStickyMark{at: now, from: r.current, to: tag, reason: reason}
+			r.since = now
+		} else if r.since.IsZero() {
+			r.since = now
 		}
 		r.current = tag
 		r.failedChecks = 0
+		r.nextSearchAt = time.Time{}
 	})
 	s.current = tag
 	s.retryIdx = 0
@@ -496,9 +522,13 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 		return
 	}
 	verdict := obs.VupenStickyCheck(tag)
+	if reason == "start" {
+		s.setReport(func(r *vupenStickyReport) { r.startVerdict = verdict })
+	}
 	switch verdict {
 	case vupenStickyOK:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", reason, " ", tag, " check ok")
+		s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
 		s.hold(tag)
 		return
 	case vupenStickyFailed:
@@ -512,7 +542,9 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 		r.failedChecks++
 		r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "check", detail: tag + ": " + reason}
 	})
-	switch obs.VupenStickyNetwork() {
+	devNet := obs.VupenStickyNetwork()
+	s.setReport(func(r *vupenStickyReport) { r.network = devNet })
+	switch devNet {
 	case vupenNetUp:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
 			" check failed (net ok) → excluded 15m, search ", s.balancer)
@@ -530,10 +562,14 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 }
 
 // search — поиск по пулу: пробы → порядок стратегии → до N проверок 64 КБ.
-func (s *vupenSticky) search(reason string) {
+func (s *vupenSticky) search(reason string) { s.searchN(reason, VupenStickySearchMaxChecks) }
+
+// searchN — поиск с пределом проверок maxChecks (VupenCheckRoute: maxSwitches);
+// возвращает, сколько узлов проверено загрузкой.
+func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 	obs := s.observatory()
 	if obs == nil {
-		return
+		return 0
 	}
 	cands, err := s.b.SelectOutbounds()
 	if err != nil {
@@ -545,7 +581,7 @@ func (s *vupenSticky) search(reason string) {
 		s.publish(s.fallbackPick(cands))
 		s.scheduleRetry(false)
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": search postponed (asleep)")
-		return
+		return 0
 	}
 	s.setPhase(vupenPhaseSearching)
 	s.publish(s.fallbackPick(cands))
@@ -557,14 +593,16 @@ func (s *vupenSticky) search(reason string) {
 	}
 	obs.VupenStickyProbe(pool)
 	alive, _ := s.order(obs, pool)
-	picks := vupenStickyDiverse(alive, s.nodeKey, VupenStickySearchMaxChecks)
-	for _, tag := range picks {
+	s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
+	picks := vupenStickyDiverse(alive, s.nodeKey, maxChecks)
+	for i, tag := range picks {
 		if obs.VupenStickyVerify(tag) == vupenStickyOK {
 			from := s.current
 			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q)",
 				s.balancer, reason, len(pool), len(alive), tag, from))
+			s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
 			s.holdBecause(tag, "search")
-			return
+			return i + 1
 		}
 		s.setReport(func(r *vupenStickyReport) {
 			r.failedChecks++
@@ -577,9 +615,10 @@ func (s *vupenSticky) search(reason string) {
 	s.publish(s.fallbackPick(cands))
 	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.
 	if s.trySpill(reason) {
-		return
+		return len(picks)
 	}
 	s.scheduleRetry(true)
+	return len(picks)
 }
 
 func (s *vupenSticky) scheduleRetry(advance bool) {
@@ -595,6 +634,7 @@ func (s *vupenSticky) scheduleRetry(advance bool) {
 		s.retryIdx++
 	}
 	s.stopRetry = vupenStickyAfter(d, func() { s.send(vupenStickyEvent{kind: "retry"}) })
+	s.setReport(func(r *vupenStickyReport) { r.nextSearchAt = vupenStickyNow().Add(d) })
 	errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": next search in ", d)
 }
 

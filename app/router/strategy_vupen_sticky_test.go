@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/app/observatory"
+	"github.com/xtls/xray-core/app/observatory/burst"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/features/outbound"
@@ -39,6 +40,12 @@ type stickyFakeObs struct {
 	checks   []string
 	verifies []string
 	listener func(tag, kind string, ok bool, detail string)
+	// Ядро 78 (VupenCheckRoute): итоги проверки с параметрами, исключения на срок, закрытия.
+	route       map[string]burst.VupenCheckResult
+	routeChecks []string
+	routeOpts   []burst.VupenCheckOptions
+	excludedFor map[string]time.Duration
+	closedTags  []string
 }
 
 func (f *stickyFakeObs) VupenStickyListen(fn func(tag, kind string, ok bool, detail string)) func() {

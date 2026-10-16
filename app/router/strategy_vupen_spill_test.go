@@ -470,3 +470,106 @@ func TestVupenSpillOneLevelOnly(t *testing.T) {
 		t.Fatal("a two-balancer cycle must be rejected on both sides")
 	}
 }
+
+// lteNoWorkingAfterSpill — сотовая: REG мёртв → перелив; LTE не отвечает внятно
+// (узлы не исключаются) → у LTE тоже «ничего не работает».
+func lteNoWorkingAfterSpill(t *testing.T) *spillRig {
+	t.Helper()
+	r := newSpillRig(t, []string{"cellular"}, []string{"p-1", "p-2", "p-3"}, []string{"lte-1", "lte-2"})
+	r.alive(map[string]int64{"p-1": 10, "p-2": 20, "p-3": 30, "lte-1": 1, "lte-2": 2})
+	r.obs.mu.Lock()
+	for _, tag := range []string{"p-1", "p-2", "p-3", "lte-1", "lte-2"} {
+		r.obs.verify[tag] = "unknown"
+	}
+	r.obs.mu.Unlock()
+	r.pick()
+	r.drain()
+	r.pick()
+	r.drain()
+	if !r.reg.spilledNow() || r.lte.getPhase() != vupenPhaseNoWorking {
+		t.Fatalf("setup: spilled=%v lte=%v", r.reg.spilledNow(), r.lte.getPhase())
+	}
+	return r
+}
+
+// CR-601 (а): LTE ничего не нашёл в первом переливе, вернулись в REG; второй
+// перелив будит LTE — он ищет снова.
+func TestVupenSpillWakesTargetOnRespill(t *testing.T) {
+	r := lteNoWorkingAfterSpill(t)
+	r.netChanged("wifi")
+	r.drain()
+	r.netChanged("cellular")
+	r.drain()
+	before := lteProbes(r)
+	r.clock.Advance(5 * time.Minute) // REG retry → поиск → снова мёртв → перелив #2
+	r.drain()
+	if !r.reg.spilledNow() || r.reg.state().Spills != 2 {
+		t.Fatalf("second spill expected: spilled=%v %+v", r.reg.spilledNow(), r.reg.state())
+	}
+	if n := lteProbes(r); n <= before {
+		t.Fatalf("the second spill must wake LTE to search again (probes %d → %d)", before, n)
+	}
+}
+
+// CR-601 (б): возврат по лёгкой проверке — LTE больше никто не кормит:
+// feeders = 0, цель спит.
+func TestVupenSpillReturnOnRecheckReleasesTarget(t *testing.T) {
+	r := lteNoWorkingAfterSpill(t)
+	if r.lte.feeders.Load() != 1 || r.lte.dormant() {
+		t.Fatalf("spilled: feeders=%d dormant=%v", r.lte.feeders.Load(), r.lte.dormant())
+	}
+	r.obs.mu.Lock()
+	r.obs.check["p-2"] = vupenStickyOK
+	r.obs.check["p-1"] = vupenStickyFailed
+	r.obs.check["p-3"] = vupenStickyFailed
+	r.obs.mu.Unlock()
+	r.clock.Advance(VupenLteRegularRecheck)
+	r.drain()
+	if r.reg.spilledNow() {
+		t.Fatal("a regular node passed → return")
+	}
+	if r.lte.feeders.Load() != 0 || !r.lte.dormant() {
+		t.Fatalf("after the return: feeders=%d dormant=%v", r.lte.feeders.Load(), r.lte.dormant())
+	}
+}
+
+// CR-602: очередь цели полна, wake не влез — цель всё равно просыпается на
+// следующем событии (флаг wakePending).
+func TestVupenSpillWakeSurvivesFullQueue(t *testing.T) {
+	r := lteNoWorkingAfterSpill(t)
+	r.netChanged("wifi")
+	r.drain()
+	r.netChanged("cellular")
+	r.drain()
+	for r.lte.send(vupenStickyEvent{kind: "noop"}) {
+	}
+	before := lteProbes(r)
+	r.clock.Advance(5 * time.Minute)
+	for done := false; !done; { // только REG: перелив #2, wake в полную очередь LTE
+		select {
+		case ev := <-r.reg.events:
+			r.reg.handle(ev)
+		default:
+			done = true
+		}
+	}
+	if !r.reg.spilledNow() || !r.lte.wakePending.Load() {
+		t.Fatalf("setup: spilled=%v wakePending=%v", r.reg.spilledNow(), r.lte.wakePending.Load())
+	}
+	r.drain()
+	if n := lteProbes(r); n <= before {
+		t.Fatalf("a lost wake event must not leave LTE asleep (probes %d → %d)", before, n)
+	}
+}
+
+// CR-603: повторный trySpill при уже перелитом REG ничего не считает дважды.
+func TestVupenSpillTrySpillOnce(t *testing.T) {
+	r := lteNoWorkingAfterSpill(t)
+	r.clock.Advance(2 * VupenSpillMinGap)
+	if !r.reg.trySpill("again") {
+		t.Fatal("already spilled: stays spilled")
+	}
+	if r.lte.feeders.Load() != 1 || r.reg.state().Spills != 1 {
+		t.Fatalf("feeders=%d spills=%d — one spill counted twice", r.lte.feeders.Load(), r.reg.state().Spills)
+	}
+}

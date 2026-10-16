@@ -157,20 +157,26 @@ func (s *vupenSticky) trySpill(reason string) bool {
 		errors.LogWarning(s.logCtx(), "[spill] ", s.balancer, ": no spill (", blocked, ")")
 		return false
 	}
+	// CR-603: перелив ставится один раз — уже перелито, счётчики не трогаем.
+	if !sp.spilled.CompareAndSwap(false, true) {
+		return true
+	}
 	sp.lastSpillAt = vupenStickyNow()
 	if sp.cancelClose != nil {
 		sp.cancelClose() // снова на LTE до закрытия его соединений — не закрываем
 		sp.cancelClose = nil
 	}
-	sp.spilled.Store(true)
 	if t := sp.target.Load(); t != nil && t.vupen != nil {
 		t.vupen.feeders.Add(1)
-		t.vupen.send(vupenStickyEvent{kind: "wake"}) // CR-501: цель снова в работе
+		// CR-501: цель снова в работе; CR-602: флаг — на случай полной очереди.
+		t.vupen.wakePending.Store(true)
+		t.vupen.send(vupenStickyEvent{kind: "wake"})
 	}
 	if s.stopRetry != nil {
 		s.stopRetry()
 		s.stopRetry = nil
 	}
+	s.setReport(func(r *vupenStickyReport) { r.nextSearchAt = time.Time{} })
 	s.setReport(func(r *vupenStickyReport) {
 		r.spills++
 		r.lastSwitch = vupenStickyMark{at: vupenStickyNow(), from: s.current, to: sp.targetTag, reason: "spill"}
@@ -332,6 +338,16 @@ type vupenStickyReport struct {
 	spills       int
 	returns      int
 	spillBlocked string
+	// Ядро 78 (VupenAutoState).
+	since        time.Time       // когда взят текущий узел
+	startVerdict string          // итог проверки initial при старте: ok | failed | unknown; "" — не было
+	nextSearchAt time.Time       // следующий повтор поиска (ничего не работает); нуль — не назначен
+	alive        int             // живых по пробам последнего поиска
+	searched     bool            // поиск уже был
+	lastSignal   vupenStickyMark // последний признак отказа: dial | freeze | manual
+	network      string          // сеть устройства по последней проверке: up | down | unknown; "" — не проверялась
+	routeCheck   vupenRouteMark  // последний check VupenCheckRoute (для heal)
+	lastRoute    vupenStickyMark // последний итог VupenCheckRoute (kind = режим, detail = вердикт)
 }
 
 func (s *vupenSticky) setReport(f func(r *vupenStickyReport)) {
@@ -359,6 +375,16 @@ type vupenAutoState struct {
 	Spills       int
 	Returns      int
 	SpillBlocked string
+	// Ядро 78: кто сейчас выбирает (REG или LTE при переливе) и его подробности.
+	Serving      string
+	Since        time.Time
+	StartVerdict string
+	NextSearchAt time.Time
+	LastSignal   vupenStickyMark
+	Network      string
+	RegularAlive int // -1 — поиска ещё не было
+	LteAlive     int // -1 — поиска ещё не было или перелива нет в конфиге
+	LastRoute    vupenStickyMark
 }
 
 func (s *vupenSticky) state() vupenAutoState {
@@ -369,6 +395,20 @@ func (s *vupenSticky) state() vupenAutoState {
 		Balancer: s.balancer, Tier: "regular", Phase: s.getPhase().String(), Current: r.current,
 		FailedChecks: r.failedChecks, LastFailure: r.lastFailure, LastSwitch: r.lastSwitch,
 		Spills: r.spills, Returns: r.returns, SpillBlocked: r.spillBlocked,
+		Serving: s.balancer, Since: r.since, StartVerdict: r.startVerdict, NextSearchAt: r.nextSearchAt,
+		LastSignal: r.lastSignal, Network: r.network, RegularAlive: -1, LteAlive: -1, LastRoute: r.lastRoute,
+	}
+	if r.searched {
+		st.RegularAlive = r.alive
+	}
+	if s.spill != nil {
+		if t := s.spill.target.Load(); t != nil && t.vupen != nil {
+			t.vupen.stateMu.Lock()
+			if t.vupen.report.searched {
+				st.LteAlive = t.vupen.report.alive
+			}
+			t.vupen.stateMu.Unlock()
+		}
 	}
 	if p := s.view.Load(); p != nil && st.Current == "" {
 		st.Current = *p
@@ -381,11 +421,30 @@ func (s *vupenSticky) state() vupenAutoState {
 		lte := t.vupen.state()
 		st.Tier, st.Spilled = "lte", true
 		st.Current, st.Phase, st.Searching, st.NoWorking = lte.Current, lte.Phase, lte.Searching, lte.NoWorking
+		st.Serving, st.Since, st.NextSearchAt, st.FailedChecks = lte.Balancer, lte.Since, lte.NextSearchAt, lte.FailedChecks
+		if vupenNewer(lte.LastSignal, st.LastSignal) {
+			st.LastSignal = lte.LastSignal
+		}
+		if vupenNewer(lte.LastFailure, st.LastFailure) {
+			st.LastFailure = lte.LastFailure
+		}
+		if lte.LastSwitch.at.After(st.LastSwitch.at) { // при равенстве — перелив REG
+			st.LastSwitch = lte.LastSwitch
+		}
+		if vupenNewer(lte.LastRoute, st.LastRoute) {
+			st.LastRoute = lte.LastRoute
+		}
+		if lte.Network != "" {
+			st.Network = lte.Network
+		}
 		b = t
 	}
 	st.Host, st.Port = vupenNodeAddr(b, st.Current)
 	return st
 }
+
+// vupenNewer — a не старше b (при равенстве — a: событие того, кто выбирает сейчас).
+func vupenNewer(a, b vupenStickyMark) bool { return !a.at.IsZero() && !a.at.Before(b.at) }
 
 // vupenNodeAddr — адрес и порт сервера outbound'а tag (из его настроек).
 func vupenNodeAddr(b *Balancer, tag string) (string, uint32) {

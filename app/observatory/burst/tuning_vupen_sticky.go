@@ -22,7 +22,8 @@ import (
 // работает. Пробы, проверка 64 КБ и проверка 24 КБ идут только по запросу
 // балансировщика. Остальные обсерватории (без поля) работают как раньше.
 var (
-	// VupenStickyCheckURL — файл проверки 24 КБ (в 2.6 — VupenSetCheckURL).
+	// VupenStickyCheckURL — файл проверки 24 КБ по умолчанию; платформа задаёт
+	// свой через VupenSetCheckURL (ядро 78, tuning_vupen_api.go).
 	VupenStickyCheckURL       = "https://speed.cloudflare.com/__down?bytes=24576"
 	VupenStickyCheckBytes     = int64(24576)
 	VupenStickyCheckTimeout   = 6 * time.Second
@@ -84,34 +85,15 @@ func (o *Observer) VupenStickyVerify(tag string) string {
 	return o.hp.vupenTspuVerifyNow(tag, "search")
 }
 
-// VupenStickyCheck — загрузка 24 КБ через узел tag мимо правил маршрутизации.
+// VupenStickyCheck — загрузка 24 КБ через узел tag мимо правил маршрутизации
+// (файлы VupenSetCheckURL; основной «не понял» — запасной).
 func (o *Observer) VupenStickyCheck(tag string) string {
 	if o.hp == nil {
 		return VupenStickyUnknown
 	}
-	h := o.hp
-	client := newHTTPClient(h.ctx, h.dispatcher, tag, 0)
-	r := vupenDownloadFB(h.ctx, client, VupenStickyCheckURL, VupenStickyCheckTimeout,
-		VupenStickyCheckStall, VupenStickyCheckFirstByte)
-	v := vupenTspuClassify(r, VupenStickyCheckBytes)
-	verdict := VupenStickyUnknown
-	switch {
-	case v == vupenTspuOK:
-		verdict = VupenStickyOK
-	case v == vupenTspuSuspect:
-		verdict = VupenStickyFailed
-	case r.status == 0 && r.err != nil:
-		// Ответа узла нет вовсе (соединение отвергнуто, сброшено, рукопожатие не
-		// прошло): для проверки текущего это провал — исключать или нет, решит
-		// проверка сети. «Не поняли» — только HTTP ≠ 200 (ответ был). У проверки
-		// 64 КБ (ядро 71) классификация прежняя.
-		verdict = VupenStickyFailed
-	case r.status == 200 && r.bytes < vupenStickyExpected(r) && r.err != nil:
-		// Заголовки пришли, а тело оборвалось ошибкой (сброс посреди файла) — тоже провал.
-		verdict = VupenStickyFailed
-	}
-	errors.LogWarning(h.ctx, fmt.Sprintf("[sticky] check %s: %s (%s)", tag, verdict, r.String()))
-	return verdict
+	r := o.VupenStickyCheckWith(tag, VupenCheckOptions{})
+	errors.LogWarning(o.hp.ctx, fmt.Sprintf("[sticky] check %s: %s (%s)", tag, r.Verdict, r.Detail))
+	return r.Verdict
 }
 
 // VupenStickyExcluded — узел исключён (заморожен) и не может быть выбором.
@@ -121,16 +103,7 @@ func (o *Observer) VupenStickyExcluded(tag string) bool {
 
 // VupenStickyExclude — исключить узел на VupenTspuFrozenFor (тот же механизм, что у ядра 71).
 func (o *Observer) VupenStickyExclude(tag, reason string) {
-	if o.hp == nil {
-		return
-	}
-	h := o.hp
-	h.tspu.mu.Lock()
-	e := h.tspu.entryLocked(tag)
-	e.frozenUntil = time.Now().Add(VupenTspuFrozenFor)
-	e.verifiedUntil = time.Time{}
-	h.tspu.mu.Unlock()
-	errors.LogWarning(h.ctx, "[sticky] ", tag, " excluded for ", VupenTspuFrozenFor, " (", reason, ")")
+	o.VupenStickyExcludeFor(tag, reason, VupenTspuFrozenFor)
 }
 
 // VupenStickyAsleep — устройство спит или нет сети по сигналу платформы: поиск запрещён.
@@ -265,13 +238,6 @@ func (h *HealthPing) vupenTspuVerifyNow(tag, reason string) string {
 		}
 	}
 	return vupenStickyVerdict(h.vupenTspuVerify(tag, reason))
-}
-
-func vupenStickyExpected(r vupenDownloadResult) int64 {
-	if r.expected > 0 {
-		return r.expected
-	}
-	return VupenStickyCheckBytes
 }
 
 func vupenStickyVerdict(v vupenTspuVerdict) string {
