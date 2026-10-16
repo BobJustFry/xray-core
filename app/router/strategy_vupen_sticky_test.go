@@ -38,6 +38,34 @@ type stickyFakeObs struct {
 	probes   [][]string
 	checks   []string
 	verifies []string
+	listener func(tag, kind string, ok bool, detail string)
+}
+
+func (f *stickyFakeObs) VupenStickyListen(fn func(tag, kind string, ok bool, detail string)) func() {
+	f.mu.Lock()
+	f.listener = fn
+	f.mu.Unlock()
+	return func() {
+		f.mu.Lock()
+		f.listener = nil
+		f.mu.Unlock()
+	}
+}
+
+// emit — признак от «обсерватории» (как из горутины соединения).
+func (f *stickyFakeObs) emit(tag, kind string, ok bool) {
+	f.mu.Lock()
+	fn := f.listener
+	f.mu.Unlock()
+	if fn != nil {
+		fn(tag, kind, ok, "test")
+	}
+}
+
+func (f *stickyFakeObs) checkCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.checks)
 }
 
 func newStickyFakeObs() *stickyFakeObs {
@@ -169,9 +197,14 @@ type stickyRig struct {
 func newStickyRig(t *testing.T, initial, fallback string, tags ...string) *stickyRig {
 	t.Helper()
 	clock := &stickyClock{now: time.Unix(1_800_000_000, 0)}
-	old := vupenStickyAfter
+	old, oldNow := vupenStickyAfter, vupenStickyNow
 	vupenStickyAfter = clock.After
-	t.Cleanup(func() { vupenStickyAfter = old })
+	vupenStickyNow = func() time.Time {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return clock.now
+	}
+	t.Cleanup(func() { vupenStickyAfter, vupenStickyNow = old, oldNow })
 	b := &Balancer{selectors: []string{"p"}, strategy: &LeastPingStrategy{}, ohm: &stickyFakeOhm{tags: tags}, fallbackTag: fallback}
 	s := newVupenSticky(&BalancingRule{Tag: "REG", VupenSticky: &VupenSticky{Initial: initial}}, b)
 	b.vupen = s
@@ -621,5 +654,164 @@ func TestVupenStickyGetsNetworkSettledFromEpoch(t *testing.T) {
 		case <-deadline:
 			t.Fatal("no net-stable event from the network epoch")
 		}
+	}
+}
+
+// ── ядро 76: признаки отказа ────────────────────────────────────────────────
+
+// holdingRig — держим p-1 (проверка initial прошла), признаки идут от «обсерватории».
+func holdingRig(t *testing.T) *stickyRig {
+	t.Helper()
+	r := newStickyRig(t, "p-1", "p-1", "p-1", "p-2", "p-3")
+	r.alive(map[string]int64{"p-1": 900, "p-2": 10, "p-3": 20})
+	r.pick()
+	r.drain()
+	r.expectPhase(vupenPhaseHolding)
+	if r.obs.checkCount() != 1 {
+		t.Fatalf("start check: %v", r.obs.checks)
+	}
+	return r
+}
+
+// П1: 3 неудачных соединения подряд за 10 с — ровно одна проверка; проверка
+// прошла — медленный рабочий узел остаётся.
+func TestVupenStickyDialFailuresTriggerOneCheck(t *testing.T) {
+	r := holdingRig(t)
+	for i := 0; i < 3; i++ {
+		r.obs.emit("p-1", "dial", false)
+		r.clock.Advance(2 * time.Second)
+	}
+	r.drain()
+	if n := r.obs.checkCount(); n != 2 {
+		t.Fatalf("3 failures in 10 s → one check, got %d checks", n-1)
+	}
+	if got := r.pick(); got != "p-1" || len(r.obs.probes) != 0 {
+		t.Fatalf("a check that passed keeps the node: pick %q probes %v", got, r.obs.probes)
+	}
+}
+
+// П1: успех между неудачами, неудачи дольше окна, чужой узел — проверки нет.
+func TestVupenStickyDialFailuresNeedAStreakInTheWindow(t *testing.T) {
+	r := holdingRig(t)
+	r.obs.emit("p-1", "dial", false)
+	r.obs.emit("p-1", "dial", false)
+	r.obs.emit("p-1", "dial", true) // узел ответил — серия прервана
+	r.obs.emit("p-1", "dial", false)
+	for i := 0; i < 3; i++ { // по одной раз в 6 с — в окно 10 с попадают две
+		r.clock.Advance(6 * time.Second)
+		r.obs.emit("p-1", "dial", false)
+	}
+	for i := 0; i < 10; i++ {
+		r.obs.emit("p-2", "dial", false) // не текущий
+	}
+	r.drain()
+	if n := r.obs.checkCount(); n != 1 {
+		t.Fatalf("no check expected, got %d", n-1)
+	}
+}
+
+// Признаки не считаются в окне смены сети и во сне.
+func TestVupenStickySignalsIgnoredAfterNetChangeAndAsleep(t *testing.T) {
+	r := holdingRig(t)
+	r.s.signals.mu.Lock()
+	r.s.signals.netChangedAt = vupenStickyNow()
+	r.s.signals.mu.Unlock()
+	for i := 0; i < 5; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	r.obs.emit("p-1", "freeze", false)
+	r.drain()
+	if n := r.obs.checkCount(); n != 1 {
+		t.Fatalf("network-change window: %d checks", n-1)
+	}
+	r.clock.Advance(VupenStickySignalNetGrace)
+	r.obs.mu.Lock()
+	r.obs.asleep = true
+	r.obs.mu.Unlock()
+	for i := 0; i < 5; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	r.drain()
+	if n := r.obs.checkCount(); n != 1 {
+		t.Fatalf("asleep: %d checks", n-1)
+	}
+	r.obs.mu.Lock()
+	r.obs.asleep = false
+	r.obs.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	r.drain()
+	if n := r.obs.checkCount(); n != 2 {
+		t.Fatalf("after the window and awake: want one check, got %d", n-1)
+	}
+}
+
+// CR-205 (c): поток признаков склеивается в одну проверку в очереди.
+func TestVupenStickySignalFloodCoalesced(t *testing.T) {
+	r := holdingRig(t)
+	for i := 0; i < 1000; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	if n := len(r.s.events); n != 1 {
+		t.Fatalf("1000 failures → one queued check, queue %d", n)
+	}
+	r.drain()
+	if n := r.obs.checkCount(); n != 2 {
+		t.Fatalf("one check run, got %d", n-1)
+	}
+	// После проверки признаки снова могут её запросить.
+	for i := 0; i < 3; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	r.drain()
+	if n := r.obs.checkCount(); n != 3 {
+		t.Fatalf("a new streak after the check → next check, got %d", n-1)
+	}
+}
+
+// П2: заморозка — проверка, не чаще раза в минуту на узел.
+func TestVupenStickyFreezeSignalRateLimited(t *testing.T) {
+	r := holdingRig(t)
+	r.obs.emit("p-1", "freeze", false)
+	r.drain()
+	r.clock.Advance(30 * time.Second)
+	r.obs.emit("p-1", "freeze", false)
+	r.drain()
+	if n := r.obs.checkCount(); n != 2 {
+		t.Fatalf("one freeze check per minute, got %d", n-1)
+	}
+	r.clock.Advance(30 * time.Second)
+	r.obs.emit("p-1", "freeze", false)
+	r.drain()
+	if n := r.obs.checkCount(); n != 3 {
+		t.Fatalf("after a minute → next check, got %d", n-1)
+	}
+}
+
+// Смена — только после проваленной проверки при живой сети.
+func TestVupenStickySignalSwitchOnlyAfterFailedCheck(t *testing.T) {
+	r := holdingRig(t)
+	r.obs.mu.Lock()
+	r.obs.check["p-1"] = vupenStickyFailed
+	r.obs.network = vupenNetDown
+	r.obs.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	r.drain()
+	if got := r.pick(); got != "p-1" || len(r.obs.probes) != 0 {
+		t.Fatalf("no network on the device: keep, got %q probes %v", got, r.obs.probes)
+	}
+	r.obs.mu.Lock()
+	r.obs.network = vupenNetUp
+	r.obs.verify["p-2"] = vupenStickyOK
+	r.obs.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		r.obs.emit("p-1", "dial", false)
+	}
+	r.drain()
+	if got := r.pick(); got != "p-2" || !r.obs.excluded["p-1"] {
+		t.Fatalf("failed check + network up → excluded and switched: pick %q excluded %v", got, r.obs.excluded["p-1"])
 	}
 }

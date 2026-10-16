@@ -419,6 +419,7 @@ func init() {
 	internet.VupenSetFreezeHooks(&internet.VupenFreezeHooks{
 		Watch:   vupenTspuWatch,
 		Suspect: vupenTspuSuspectHook,
+		Attempt: vupenTspuAttemptHook,
 	})
 }
 
@@ -458,7 +459,23 @@ func vupenTspuSuspectHook(key any, tag string, sent, recv int64) {
 		return
 	}
 	errors.LogWarning(h.ctx, fmt.Sprintf(
-		"[tspu] %s: a connection went silent after %d KB (up %d, down %d) — checking the node",
+		"[tspu] %s: connections went silent after %d KB (up %d, down %d) — checking the node",
 		tag, (sent+recv)>>10, sent>>10, recv>>10))
+	// Ядро 76 (АВТО 4.1): по требованию проверяет балансировщик «держать текущий»
+	// (24 КБ через текущий узел, D-16); остальные — как ядро 71 (64 КБ).
+	if h.vupenOnDemand {
+		h.vupenSignal(tag, "freeze", false, fmt.Sprintf("%d KB up %d down %d", (sent+recv)>>10, sent>>10, recv>>10))
+		return
+	}
 	h.vupenTspuRequest(tag, true, "silent connection")
+}
+
+// vupenTspuAttemptHook — итог установления соединения к узлу (П1): только для
+// обсерваторий по требованию (АВТО 4.1), остальным не нужен.
+func vupenTspuAttemptHook(key any, tag string, ok bool, detail string) {
+	h, isPing := key.(*HealthPing)
+	if !isPing || h == nil || !h.vupenOnDemand {
+		return
+	}
+	h.vupenSignal(tag, "dial", ok, detail)
 }

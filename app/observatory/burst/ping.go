@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tagged"
 )
 
@@ -39,7 +40,8 @@ func newHTTPClient(ctxv context.Context, dispatcher routing.Dispatcher, handler 
 			if err != nil {
 				return nil, err
 			}
-			return tagged.Dialer(ctxv, dispatcher, dest, handler)
+			// Ядро 76: пробы и проверки — служебные соединения, сторож их не наблюдает.
+			return tagged.Dialer(internet.VupenServiceContext(ctxv), dispatcher, dest, handler)
 		},
 	}
 	return &http.Client{

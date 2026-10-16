@@ -14,7 +14,6 @@ import (
 
 	"github.com/xtls/xray-core/app/observatory"
 	"github.com/xtls/xray-core/app/observatory/burst"
-	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/extension"
@@ -42,13 +41,32 @@ func freezeRelay(t *testing.T, backend string, limit int64) int {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	t.Cleanup(func() { ln.Close(); wg.Wait() })
+	// CR-401: в конце теста закрываем всё, что ретранслятор открыл: иначе его
+	// горутины висят в чтении (на Windows Close слушателя их не будит) и
+	// wg.Wait не возвращается.
+	var mu sync.Mutex
+	var open []stdnet.Conn
+	track := func(c stdnet.Conn) {
+		mu.Lock()
+		open = append(open, c)
+		mu.Unlock()
+	}
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		for _, c := range open {
+			c.Close()
+		}
+		mu.Unlock()
+		wg.Wait()
+	})
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			track(c)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -57,6 +75,7 @@ func freezeRelay(t *testing.T, backend string, limit int64) int {
 				if err != nil {
 					return
 				}
+				track(s)
 				defer s.Close()
 				var total atomic.Int64
 				frozen := make(chan struct{})
@@ -197,9 +216,11 @@ func TestVupenTspuEndToEnd(t *testing.T) {
 		obs.VupenTspuVerified("proxy-good"), alive)
 }
 
-// Сторож на настоящем трафике: проверка кандидатов выключена (TopK=0), через
-// «замороженный» узел идёт обычное соединение — 16 КБ туда, в ответ тишина.
-// Сторож должен найти обсерваторию своего ядра, та — проверить узел и заморозить.
+// Сторож на настоящем трафике (ядро 71, фильтры ядра 76 — D-19, для всех
+// балансировщиков): проверка кандидатов выключена (TopK=0). Через «замороженный»
+// узел идут соединения приложения: обмен 2 КБ в обе стороны, затем 16 КБ туда и
+// тишина. Одно такое соединение — ещё не тревога; второе — узел проверяется
+// загрузкой 64 КБ и замораживается (обычный балансировщик, без АВТО 4.1).
 func TestVupenTspuSentinelOnRealTraffic(t *testing.T) {
 	oldK := burst.VupenTspuTopK
 	burst.VupenTspuTopK = 0
@@ -224,19 +245,7 @@ func TestVupenTspuSentinelOnRealTraffic(t *testing.T) {
 		}
 	}()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/file" {
-			w.Header().Set("Content-Length", fmt.Sprint(64<<10))
-			w.WriteHeader(200)
-			_, _ = w.Write([]byte(strings.Repeat("x", 64<<10)))
-			return
-		}
-		time.Sleep(vupenProbeRTT)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-	relayPort := freezeRelay(t, strings.TrimPrefix(srv.URL, "http://"), 16<<10)
-
+	relayPort := freezeRelay(t, muxBackend(t), 16<<10)
 	cfg := fmt.Sprintf(`{
 	  "log": {"loglevel": "none"},
 	  "outbounds": [
@@ -260,34 +269,33 @@ func TestVupenTspuSentinelOnRealTraffic(t *testing.T) {
 	}
 	defer inst.Close()
 	obs := inst.GetFeature(extension.ObservatoryType()).(*burst.Observer)
+	alive := func() bool {
+		res, _ := obs.GetObservation(context.Background())
+		st := res.(*observatory.ObservationResult).Status
+		return len(st) == 1 && st[0].Alive
+	}
 
 	// Ждём первую удачную пробу: без неё обсерватория узел ещё не наблюдает.
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		res, _ := obs.GetObservation(context.Background())
-		if st := res.(*observatory.ObservationResult).Status; len(st) == 1 && st[0].Alive {
-			break
-		}
+	for time.Now().Before(deadline) && !alive() {
 		time.Sleep(50 * time.Millisecond)
 	}
-
+	if !alive() {
+		t.Fatal("the probe through the node must pass")
+	}
 	ctx := session.SetForcedOutboundTagToContext(context.Background(), "proxy-frozen")
-	conn, err := core.Dial(ctx, inst, xnet.TCPDestination(xnet.DomainAddress("probe.test"), 80))
-	if err != nil {
-		t.Fatal(err)
+	frozenAppConn(t, inst, ctx)
+	time.Sleep(10 * internet.VupenFreezeSilence)
+	if !alive() {
+		t.Fatal("one silent connection must not freeze the node (D-19 filter)")
 	}
-	defer conn.Close()
-	if _, err := conn.Write([]byte("POST /upload HTTP/1.1\r\nHost: probe.test\r\nContent-Length: 20000\r\n\r\n" + strings.Repeat("y", 20000))); err != nil {
-		t.Fatal(err)
-	}
-
+	frozenAppConn(t, inst, ctx)
 	deadline = time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		res, _ := obs.GetObservation(context.Background())
-		if st := res.(*observatory.ObservationResult).Status; len(st) == 1 && !st[0].Alive {
+		if !alive() {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatal("a silent connection on a watched node must get it checked and frozen")
+	t.Fatal("two silent connections on a watched node must get it checked and frozen")
 }

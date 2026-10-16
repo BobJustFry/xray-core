@@ -56,7 +56,38 @@ var (
 	vupenStickyAfter = func(d time.Duration, f func()) (stop func() bool) {
 		return time.AfterFunc(d, f).Stop
 	}
+
+	// Ядро 76: признаки «текущий не работает» (ADR-0001 §4.4 (2), §13). Признак
+	// только запускает проверку текущего (24 КБ + сеть); сам узел не меняет.
+	//
+	// П1: VupenStickyFailDials неудачных соединений подряд к текущему узлу за
+	// VupenStickyFailWindow, без единого ответа узла между ними.
+	VupenStickyFailDials  = 3
+	VupenStickyFailWindow = 10 * time.Second
+	// П2: сторож заморозки (уже с фильтром «два соединения за 30 с») — не чаще
+	// VupenStickyFreezeEvery на узел.
+	VupenStickyFreezeEvery = time.Minute
+	// Признаки не считаются VupenStickySignalNetGrace после смены сети (эпоха
+	// ядра 74) и во сне.
+	VupenStickySignalNetGrace = 10 * time.Second
+
+	vupenStickyNow = time.Now
 )
+
+// vupenStickySignalSource — обсерватория, которая сообщает признаки отказа узлов
+// (burst, ядро 76). Без неё признаков нет — остаётся только старт и поиск.
+type vupenStickySignalSource interface {
+	VupenStickyListen(f func(tag, kind string, ok bool, detail string)) func()
+}
+
+// vupenStickySignals — счётчики признаков текущего узла (из горутин соединений).
+type vupenStickySignals struct {
+	mu           sync.Mutex
+	tag          string
+	fails        []time.Time
+	lastFreeze   time.Time
+	netChangedAt time.Time
+}
 
 // Итоги проверок обсерватории (app/observatory/burst, tuning_vupen_sticky.go).
 const (
@@ -123,6 +154,12 @@ type vupenSticky struct {
 	stopRetry    func() bool
 	excludedSent atomic.Bool
 	keys         map[string]string
+
+	// Ядро 76: признаки отказа и склейка проверок (CR-205 (c)): пока проверка
+	// стоит в очереди или идёт, новые признаки её не дублируют.
+	signals      vupenStickySignals
+	checkPending atomic.Bool
+	unsubSignals func() // под life
 }
 
 func newVupenSticky(br *BalancingRule, b *Balancer) *vupenSticky {
@@ -237,27 +274,104 @@ func (s *vupenSticky) start(cands []string) {
 		return // ядро уже закрыли: ни подписки, ни обработчика
 	}
 	s.unsub = internet.VupenNetEpochSubscribe(func(ev internet.VupenNetEvent) {
-		if ev == internet.VupenNetStable {
+		switch ev {
+		case internet.VupenNetStable:
 			s.send(vupenStickyEvent{kind: "net-stable"})
+		case internet.VupenNetChanged:
+			s.signals.mu.Lock()
+			s.signals.netChangedAt = vupenStickyNow()
+			s.signals.fails = nil
+			s.signals.mu.Unlock()
 		}
 	})
+	if src, ok := s.observatory().(vupenStickySignalSource); ok {
+		s.unsubSignals = src.VupenStickyListen(s.onSignal)
+	}
 	s.runWorker()
 }
 
+// onSignal — признак от обсерватории (горутины соединений; быстро, без блокировок
+// надолго). Считается только для текущего узла, вне окна смены сети и не во сне.
+func (s *vupenSticky) onSignal(tag, kind string, ok bool, detail string) {
+	if s.getPhase() != vupenPhaseHolding {
+		return
+	}
+	p := s.view.Load()
+	if p == nil || *p != tag {
+		return
+	}
+	now := vupenStickyNow()
+	sig := &s.signals
+	sig.mu.Lock()
+	if sig.tag != tag {
+		sig.tag, sig.fails, sig.lastFreeze = tag, nil, time.Time{}
+	}
+	if kind == "dial" && ok {
+		sig.fails = nil
+		sig.mu.Unlock()
+		return
+	}
+	if !sig.netChangedAt.IsZero() && now.Sub(sig.netChangedAt) < VupenStickySignalNetGrace {
+		sig.mu.Unlock()
+		return
+	}
+	if obs := s.observatory(); obs != nil && obs.VupenStickyAsleep() {
+		sig.mu.Unlock()
+		return
+	}
+	reason := ""
+	switch kind {
+	case "dial":
+		kept := sig.fails[:0]
+		for _, at := range sig.fails {
+			if now.Sub(at) <= VupenStickyFailWindow {
+				kept = append(kept, at)
+			}
+		}
+		sig.fails = append(kept, now)
+		if len(sig.fails) >= VupenStickyFailDials {
+			sig.fails = nil
+			reason = fmt.Sprintf("signal dial: %d failed connections in %s (%s)", VupenStickyFailDials, VupenStickyFailWindow, detail)
+		}
+	case "freeze":
+		if sig.lastFreeze.IsZero() || now.Sub(sig.lastFreeze) >= VupenStickyFreezeEvery {
+			sig.lastFreeze = now
+			reason = "signal freeze: " + detail
+		}
+	}
+	sig.mu.Unlock()
+	if reason != "" {
+		if s.requestCheck(reason) {
+			errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", reason, " on ", tag, " → check")
+		}
+	}
+}
+
 // requestCheck — проверить текущий узел (признаки отказа 2.4, проверка 2.6).
-func (s *vupenSticky) requestCheck(reason string) {
-	s.send(vupenStickyEvent{kind: "check", reason: reason})
+// Склеивается: пока проверка в очереди или идёт, новая не ставится (false).
+func (s *vupenSticky) requestCheck(reason string) bool {
+	if !s.checkPending.CompareAndSwap(false, true) {
+		return false
+	}
+	if !s.send(vupenStickyEvent{kind: "check", reason: reason}) {
+		s.checkPending.Store(false)
+		return false
+	}
+	return true
 }
 
 func (s *vupenSticky) stop() {
 	s.stopOnce.Do(func() {
 		s.life.Lock()
 		s.stopped = true
-		unsub := s.unsub
+		unsub, unsubSignals := s.unsub, s.unsubSignals
 		s.life.Unlock()
 		close(s.stopCh)
 		if unsub != nil {
 			unsub()
+		}
+		if unsubSignals != nil {
+			unsubSignals()
 		}
 	})
 }
@@ -286,6 +400,7 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 	}
 	switch ev.kind {
 	case "check":
+		defer s.checkPending.Store(false)
 		switch s.getPhase() {
 		case vupenPhaseChecking:
 			s.checkCurrent(s.initial, ev.reason)

@@ -138,6 +138,50 @@ func (o *Observer) VupenStickyAsleep() bool {
 	return !VupenObservatoryActive()
 }
 
+// vupenSignalListeners — подписчики на признаки отказа узлов (ядро 76).
+type vupenSignalListeners struct {
+	mu   sync.Mutex
+	next int
+	m    map[int]func(tag, kind string, ok bool, detail string)
+}
+
+// VupenStickyListen — получать признаки отказа узлов этой обсерватории:
+// kind "dial" (ok — узел ответил, !ok — соединение не установилось) и "freeze"
+// (замолчали соединения). f вызывается из горутин соединений и не должна
+// блокировать. Возвращает отписку.
+func (o *Observer) VupenStickyListen(f func(tag, kind string, ok bool, detail string)) func() {
+	if o.hp == nil {
+		return func() {}
+	}
+	l := &o.hp.vupenListeners
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[int]func(tag, kind string, ok bool, detail string){}
+	}
+	l.next++
+	id := l.next
+	l.m[id] = f
+	l.mu.Unlock()
+	return func() {
+		l.mu.Lock()
+		delete(l.m, id)
+		l.mu.Unlock()
+	}
+}
+
+func (h *HealthPing) vupenSignal(tag, kind string, ok bool, detail string) {
+	l := &h.vupenListeners
+	l.mu.Lock()
+	fs := make([]func(tag, kind string, ok bool, detail string), 0, len(l.m))
+	for _, f := range l.m {
+		fs = append(fs, f)
+	}
+	l.mu.Unlock()
+	for _, f := range fs {
+		f(tag, kind, ok, detail)
+	}
+}
+
 // vupenDialer — outbound, через который можно установить соединение (proxyman).
 type vupenDialer interface {
 	Dial(ctx context.Context, dest net.Destination) (stat.Connection, error)

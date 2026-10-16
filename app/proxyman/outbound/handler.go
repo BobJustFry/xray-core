@@ -272,7 +272,9 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connecti
 		h.SetOutboundGateway(ctx, ob)
 	}
 
+	ctx, vupenAttemptDone := internet.VupenTransportAttempt(ctx, h.tag) // Vupen (ядро 76): П1/П5, только АВТО 4.1
 	conn, err := internet.Dial(ctx, dest, h.streamSettings)
+	vupenAttemptDone(err)
 	conn = h.getStatCouterConnection(conn)
 	return conn, err
 }

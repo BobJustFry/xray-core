@@ -54,6 +54,8 @@ type HealthPing struct {
 	// Ядро 75 (АВТО 4.1): обсерватория по требованию — tuning_vupen_sticky.go.
 	vupenOnDemand bool
 	vupenSubject  func(tag string) bool
+	// Ядро 76: подписчики на признаки отказа (балансировщики «держать текущий»).
+	vupenListeners vupenSignalListeners
 }
 
 // NewHealthPing creates a new HealthPing with settings

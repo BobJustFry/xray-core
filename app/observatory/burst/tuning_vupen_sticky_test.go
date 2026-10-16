@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -393,5 +394,65 @@ func TestVupenStickyVerifyWaitsForInflightCheck(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("VupenStickyVerify did not return")
+	}
+}
+
+// Ядро 76: по требованию тишина и итоги соединений идут подписчику (балансировщику
+// «держать текущий»), а не в проверку 64 КБ ядра 71; без поля — как раньше.
+func TestVupenSignalsRouting(t *testing.T) {
+	type sig struct {
+		tag, kind string
+		ok        bool
+	}
+	h, calls := tspuTestPing(t, vupenTspuOK, vupenTspuOK)
+	o := &Observer{hp: h}
+	got := make(chan sig, 8)
+	unsub := o.VupenStickyListen(func(tag, kind string, ok bool, detail string) { got <- sig{tag, kind, ok} })
+
+	h.vupenOnDemand = true
+	vupenTspuSuspectHook(h, "proxy-1", 16<<10, 2<<10)
+	vupenTspuAttemptHook(h, "proxy-1", false, "refused")
+	vupenTspuAttemptHook(h, "proxy-1", true, "")
+	for _, want := range []sig{{"proxy-1", "freeze", false}, {"proxy-1", "dial", false}, {"proxy-1", "dial", true}} {
+		select {
+		case g := <-got:
+			if g != want {
+				t.Fatalf("signal %+v, want %+v", g, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing signal %+v", want)
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatalf("on demand the watchdog must not start the 64 KB check, probes %d", calls.Load())
+	}
+
+	h.vupenOnDemand = false
+	vupenTspuAttemptHook(h, "proxy-1", false, "refused")
+	vupenTspuSuspectHook(h, "proxy-2", 16<<10, 2<<10)
+	waitTspuIdle(t, h, "proxy-2")
+	if calls.Load() == 0 {
+		t.Fatal("without vupenOnDemand the watchdog keeps the core-71 64 KB check")
+	}
+	select {
+	case g := <-got:
+		t.Fatalf("no signals without vupenOnDemand: %+v", g)
+	default:
+	}
+	unsub()
+}
+
+// Пробы и проверки (24/64 КБ) открываются в служебном контексте — сторож их не наблюдает.
+func TestVupenProbeConnectionsAreService(t *testing.T) {
+	var service atomic.Bool
+	setTestDialer(t, func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
+		service.Store(internet.VupenIsServiceContext(ctx))
+		return nil, errors.New("down")
+	})
+	c := newHTTPClient(context.Background(), nil, "proxy-1", time.Second)
+	_, _ = c.Get("http://probe.test/")
+	if !service.Load() {
+		t.Fatal("probe connections must carry the service marker")
 	}
 }
