@@ -3,6 +3,7 @@ package router
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -31,6 +32,16 @@ import (
 //     закрываются, поиск проверяет до maxSwitches узлов пула; ничего — на
 //     сотовой перелив в LTE, иначе «нет рабочих». Вердикт: ok | switched |
 //     network_down | no_working | spilled_lte | unknown.
+//   - "switch" (ядро 79, D-42; ≤ 15 с, кнопка «Сменить сервер»): текущий узел не
+//     проверяется и не исключается — он только пропускается в этом поиске.
+//     Кандидаты — неисключённые узлы той же группы (REG, при переливе — LTE),
+//     кроме текущего и тех, с кого пользователь уже уходил (visited); каждый
+//     проверяется 64 КБ, как в поиске. Все прочие рабочие уже были — круг заново,
+//     с того, с кого ушли раньше всех (A→B→C→A, без A→B→A). Нашёлся — switched,
+//     соединения прежнего закрываются (closeConnections). Никто не прошёл —
+//     остаёмся на текущем, no_alternative, список не меняется. Перелива в LTE
+//     из-за switch нет никогда; «нет рабочих» из-за switch тоже. Вердикт:
+//     switched | no_alternative | no_working (рабочих не было и до запроса) | unknown.
 
 var (
 	// VupenCheckRouteHealWait — сколько VupenCheckRoute(heal) ждёт итог; дальше
@@ -64,6 +75,10 @@ const (
 	vupenRouteHealMode    = "heal"
 	vupenRouteFreezeStall = "stall"
 	vupenRouteNoStart     = "nostart"
+
+	// Ядро 79 (D-42).
+	vupenRouteSwitchMode    = "switch"
+	vupenRouteNoAlternative = "no_alternative"
 )
 
 // vupenStickyRouteObs — что ещё нужно от обсерватории для VupenCheckRoute (burst, ядро 78).
@@ -76,7 +91,7 @@ type vupenStickyRouteObs interface {
 // vupenRouteReq — запрос VupenCheckRoute.
 type vupenRouteReq struct {
 	V                int    `json:"v"`
-	Mode             string `json:"mode"`     // check | heal
+	Mode             string `json:"mode"`     // check | heal | switch (ядро 79)
 	Balancer         string `json:"balancer"` // тег балансировщика АВТО; "" — тот, у кого vupenSpill
 	URL              string `json:"url"`      // "" — файлы VupenSetCheckURL
 	FallbackURL      string `json:"fallbackUrl"`
@@ -84,8 +99,8 @@ type vupenRouteReq struct {
 	MinStallMs       int64  `json:"minStallMs"`     // 0 — 1500
 	MaxFirstByteMs   int64  `json:"maxFirstByteMs"` // 0 — 5000
 	TimeoutMs        int64  `json:"timeoutMs"`      // 0 — 6000
-	MaxSwitches      int    `json:"maxSwitches"`    // 0 — 3
-	ExcludeMin       int    `json:"excludeMin"`     // 0 — 15
+	MaxSwitches      int    `json:"maxSwitches"`    // 0 — 3 (switch: сколько кандидатов проверить)
+	ExcludeMin       int    `json:"excludeMin"`     // 0 — 15 (switch не исключает — поле не действует)
 	CloseConnections *bool  `json:"closeConnections"`
 	Reason           string `json:"reason"` // foreground | after-connect | manual (для журнала)
 }
@@ -95,7 +110,7 @@ type vupenRouteResp struct {
 	V        int    `json:"v"`
 	Verdict  string `json:"verdict"`
 	From     string `json:"from"`  // узел, который проверяли
-	To       string `json:"to"`    // узел после лечения (switched / spilled_lte)
+	To       string `json:"to"`    // узел после лечения (switched / spilled_lte; no_alternative — тот же, что from)
 	Tried    int    `json:"tried"` // сколько узлов проверено загрузкой
 	Ms       int64  `json:"ms"`
 	Kind     string `json:"kind"` // stall | nostart | error | http — вид провала проверки
@@ -121,8 +136,8 @@ func parseVupenRouteReq(raw string) (vupenRouteReq, string) {
 	if err := json.Unmarshal([]byte(raw), &q); err != nil {
 		return q, "bad request: " + err.Error()
 	}
-	if q.Mode != vupenRouteCheckMode && q.Mode != vupenRouteHealMode {
-		return q, fmt.Sprintf("bad request: mode %q (want check or heal)", q.Mode)
+	if q.Mode != vupenRouteCheckMode && q.Mode != vupenRouteHealMode && q.Mode != vupenRouteSwitchMode {
+		return q, fmt.Sprintf("bad request: mode %q (want check, heal or switch)", q.Mode)
 	}
 	for _, u := range []struct{ name, v string }{{"url", q.URL}, {"fallbackUrl", q.FallbackURL}} {
 		if u.v != "" {
@@ -327,7 +342,8 @@ func (s *vupenSticky) checkRoute(q vupenRouteReq) vupenRouteResp {
 	return resp
 }
 
-// requestHeal — heal в горутине обработчика; ждём итог не дольше VupenCheckRouteHealWait.
+// requestHeal — heal или switch (ядро 79) в горутине обработчика; ждём итог не
+// дольше VupenCheckRouteHealWait.
 func (s *vupenSticky) requestHeal(q vupenRouteReq) vupenRouteResp {
 	if s.getPhase() == vupenPhaseNew {
 		return vupenRouteResp{Verdict: vupenRouteUnknown, Detail: "the balancer has not started yet (no traffic)"}
@@ -342,8 +358,12 @@ func (s *vupenSticky) requestHeal(q vupenRouteReq) vupenRouteResp {
 	case resp := <-h.reply:
 		return resp
 	case <-t.C:
+		doing := "healing"
+		if q.Mode == vupenRouteSwitchMode {
+			doing = "switching"
+		}
 		return vupenRouteResp{Verdict: vupenRouteUnknown, From: s.viewTag(),
-			Detail: "still healing after " + VupenCheckRouteHealWait.String() + " — see VupenAutoState"}
+			Detail: "still " + doing + " after " + VupenCheckRouteHealWait.String() + " — see VupenAutoState"}
 	case <-s.stopCh:
 		return vupenRouteResp{Verdict: vupenRouteUnknown, Detail: "the balancer was stopped"}
 	}
@@ -445,6 +465,104 @@ func (s *vupenSticky) healOutcome(resp vupenRouteResp) vupenRouteResp {
 	return resp
 }
 
+// switchRoute — режим switch (ядро 79, D-42; горутина обработчика): сменить
+// работающий узел по просьбе пользователя, без проверки и без исключения текущего.
+func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
+	q := h.q
+	resp := vupenRouteResp{Verdict: vupenRouteUnknown, From: s.viewTag()}
+	obs, ro, why := s.routeObs()
+	if why != "" {
+		resp.Detail = why
+		return resp
+	}
+	if s.visitedReset.Swap(false) {
+		s.visited = nil // сеть сменилась — перебор заново
+	}
+	reason := "checkRoute switch (" + q.Reason + ")"
+	switch p := s.getPhase(); p {
+	case vupenPhaseHolding:
+	case vupenPhaseNoWorking:
+		// Рабочих не было и до запроса: поискать сразу (как heal), но без перелива
+		// в LTE — switch не переливает никогда; дальше повтор по графику.
+		s.retryIdx = 0
+		resp.Tried = s.searchOpt(reason, q.maxSwitches(), false)
+		if s.getPhase() == vupenPhaseHolding {
+			resp.Verdict, resp.To = vupenRouteSwitched, s.current
+		} else {
+			resp.Verdict = vupenRouteNoWorking
+		}
+		return resp
+	default:
+		resp.Detail = "the core is " + p.String()
+		return resp
+	}
+	prev := s.current
+	resp.From = prev
+	cands, _ := s.b.SelectOutbounds()
+	// Исключённые по провалам (heal, сторож, проверки) — не кандидаты; текущий
+	// пропускается только в этом поиске.
+	var others, fresh, seen []string
+	for _, t := range cands {
+		if t == prev || obs.VupenStickyExcluded(t) {
+			continue
+		}
+		others = append(others, t)
+		if slices.Contains(s.visited, t) {
+			seen = append(seen, t)
+		} else {
+			fresh = append(fresh, t)
+		}
+	}
+	budget := q.maxSwitches()
+	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch (%s): leave %s without a check: %d other, %d already visited",
+		s.balancer, q.Reason, prev, len(others), len(seen)))
+	// Выдача остаётся prev (он работает), пока новый не проверен.
+	s.setPhase(vupenPhaseSearching)
+	tried, found := 0, false
+	if len(fresh) > 0 {
+		tried, found = s.verifyPool(obs, fresh, reason, "switch", false, func(alive []string) []string {
+			return vupenStickyDiverse(alive, s.nodeKey, budget)
+		})
+	}
+	if !found && len(seen) > 0 && tried < budget {
+		// Все прочие рабочие уже были: круг заново — с того, с кого ушли раньше всех.
+		left := budget - tried
+		var n int
+		n, found = s.verifyPool(obs, seen, reason+" next round", "switch", false, func(alive []string) []string {
+			order := slices.Clone(alive)
+			sort.SliceStable(order, func(i, j int) bool {
+				return slices.Index(s.visited, order[i]) < slices.Index(s.visited, order[j])
+			})
+			if len(order) > left {
+				order = order[:left]
+			}
+			return order
+		})
+		tried += n
+		if found {
+			s.visited = nil
+		}
+	}
+	resp.Tried = tried
+	if found {
+		to := s.current
+		s.visited = append(slices.DeleteFunc(s.visited, func(t string) bool { return t == prev || t == to }), prev)
+		resp.Verdict, resp.To = vupenRouteSwitched, to
+		if q.closeConns() {
+			resp.Closed = ro.VupenStickyCloseConns(prev)
+		}
+		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch: %s → %s, %d connections of %s closed, visited %v",
+			s.balancer, prev, to, resp.Closed, prev, s.visited))
+		return resp
+	}
+	// Никто другой не прошёл: остаёмся на prev (не «нет рабочих»), список не меняется.
+	s.holdBecause(prev, "switch")
+	resp.Verdict, resp.To = vupenRouteNoAlternative, prev
+	resp.Detail = fmt.Sprintf("no other working node in %s (%d other, %d checked) → kept %s", s.balancer, len(others), tried, prev)
+	errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": checkRoute switch: ", resp.Detail)
+	return resp
+}
+
 // ── VupenAutoState ──────────────────────────────────────────────────────────
 
 type vupenAutoEventJSON struct {
@@ -457,7 +575,7 @@ type vupenAutoSwitchJSON struct {
 	AtMs   int64  `json:"atMs"`
 	From   string `json:"from"`
 	To     string `json:"to"`
-	Reason string `json:"reason"` // check | search | spill | return
+	Reason string `json:"reason"` // check | search | spill | return | switch (ядро 79)
 }
 
 type vupenAutoCloseJSON struct {

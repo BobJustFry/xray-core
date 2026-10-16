@@ -126,7 +126,7 @@ func (p vupenStickyPhase) String() string {
 type vupenStickyEvent struct {
 	kind   string // start | check | search | retry | net-stable | current-excluded | wake | sleep | heal …
 	reason string
-	heal   *vupenHealReq // kind "heal" (ядро 78, VupenCheckRoute)
+	heal   *vupenHealReq // kind "heal" (ядро 78, VupenCheckRoute heal; ядро 79 — и switch)
 }
 
 type vupenSticky struct {
@@ -174,6 +174,12 @@ type vupenSticky struct {
 	// Ядро 77: состояние для 2.6 (VupenAutoState).
 	stateMu sync.Mutex
 	report  vupenStickyReport
+	// Ядро 79 (VupenCheckRoute(switch), D-42): узлы, с которых пользователь ушёл
+	// кнопкой «Сменить сервер», по порядку ухода (только в горутине обработчика).
+	// Без срока и без исключения: только порядок перебора. visitedReset — сеть
+	// сменилась (эпоха ядра 74): список очищается при следующем switch.
+	visited      []string
+	visitedReset atomic.Bool
 }
 
 func newVupenSticky(br *BalancingRule, b *Balancer) *vupenSticky {
@@ -297,6 +303,7 @@ func (s *vupenSticky) start(cands []string) {
 			s.signals.netChangedAt = vupenStickyNow()
 			s.signals.fails = nil
 			s.signals.mu.Unlock()
+			s.visitedReset.Store(true)                                 // ядро 79: перебор switch — заново
 			s.setReport(func(r *vupenStickyReport) { r.network = "" }) // ядро 78: сеть новая — не проверена
 			// Ядро 77: сменилась сеть — вердикт «обычный мёртв» сброшен сразу:
 			// новые соединения идут в REG (R4, D-12).
@@ -446,7 +453,11 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 		// Разобрано выше по флагу wakePending (CR-602).
 	case "heal":
 		if ev.heal != nil {
-			ev.heal.reply <- s.healRoute(ev.heal)
+			if ev.heal.q.Mode == vupenRouteSwitchMode {
+				ev.heal.reply <- s.switchRoute(ev.heal)
+			} else {
+				ev.heal.reply <- s.healRoute(ev.heal)
+			}
 		}
 	case "check":
 		defer s.checkPending.Store(false)
@@ -567,6 +578,12 @@ func (s *vupenSticky) search(reason string) { s.searchN(reason, VupenStickySearc
 // searchN — поиск с пределом проверок maxChecks (VupenCheckRoute: maxSwitches);
 // возвращает, сколько узлов проверено загрузкой.
 func (s *vupenSticky) searchN(reason string, maxChecks int) int {
+	return s.searchOpt(reason, maxChecks, true)
+}
+
+// searchOpt — поиск; allowSpill = false — без перелива в LTE (ядро 79:
+// VupenCheckRoute(switch) никогда не переливает), повтор по графику как обычно.
+func (s *vupenSticky) searchOpt(reason string, maxChecks int, allowSpill bool) int {
 	obs := s.observatory()
 	if obs == nil {
 		return 0
@@ -591,34 +608,54 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 			pool = append(pool, t)
 		}
 	}
+	diverse := func(alive []string) []string { return vupenStickyDiverse(alive, s.nodeKey, maxChecks) }
+	tried, found := s.verifyPool(obs, pool, reason, "search", true, diverse)
+	if found {
+		return tried
+	}
+	s.setPhase(vupenPhaseNoWorking)
+	s.publish(s.fallbackPick(cands))
+	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.
+	if allowSpill && s.trySpill(reason) {
+		return tried
+	}
+	s.scheduleRetry(true)
+	return tried
+}
+
+// verifyPool — пробы по pool → порядок стратегии → pick выбирает, кого проверить
+// загрузкой 64 КБ; первый прошедший становится текущим (holdReason — для
+// lastSwitch). normal = false (ядро 79, VupenCheckRoute(switch)): провал
+// кандидата не считается провалом текущего (failedChecks), живые подмножества
+// не пишутся в regularAlive, журнал — у вызывающего. Фаза и выдача не меняются,
+// пока не найден рабочий.
+func (s *vupenSticky) verifyPool(obs vupenStickyObservatory, pool []string, reason, holdReason string, normal bool,
+	pick func(alive []string) []string) (tried int, found bool) {
 	obs.VupenStickyProbe(pool)
 	alive, _ := s.order(obs, pool)
-	s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
-	picks := vupenStickyDiverse(alive, s.nodeKey, maxChecks)
+	if normal {
+		s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
+	}
+	picks := pick(alive)
 	for i, tag := range picks {
 		if obs.VupenStickyVerify(tag) == vupenStickyOK {
 			from := s.current
 			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q)",
 				s.balancer, reason, len(pool), len(alive), tag, from))
 			s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
-			s.holdBecause(tag, "search")
-			return i + 1
+			s.holdBecause(tag, holdReason)
+			return i + 1, true
 		}
 		s.setReport(func(r *vupenStickyReport) {
-			r.failedChecks++
+			if normal {
+				r.failedChecks++
+			}
 			r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "verify", detail: tag}
 		})
 	}
 	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %d checked → nothing works",
 		s.balancer, reason, len(pool), len(alive), len(picks)))
-	s.setPhase(vupenPhaseNoWorking)
-	s.publish(s.fallbackPick(cands))
-	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.
-	if s.trySpill(reason) {
-		return len(picks)
-	}
-	s.scheduleRetry(true)
-	return len(picks)
+	return len(picks), false
 }
 
 func (s *vupenSticky) scheduleRetry(advance bool) {
