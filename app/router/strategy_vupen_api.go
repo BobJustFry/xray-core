@@ -41,7 +41,19 @@ import (
 //     соединения прежнего закрываются (closeConnections). Никто не прошёл —
 //     остаёмся на текущем, no_alternative, список не меняется. Перелива в LTE
 //     из-за switch нет никогда; «нет рабочих» из-за switch тоже. Вердикт:
-//     switched | no_alternative | no_working (рабочих не было и до запроса) | unknown.
+//     switched | no_alternative | failed (ядро 80, CR-002: вышел бюджет, а
+//     непроверенные кандидаты остались — остаёмся на текущем) | no_working
+//     (рабочих не было и до запроса) | busy_searching | unknown.
+//     Ядро 80 (D-43): без раунда обсерватории. Кандидаты по порядку перебора
+//     (ещё не посещённые, затем посещённые — с самого давнего): сначала те, кто
+//     ответил на пробу за последние VupenSwitchCacheMaxAge (и после смены сети),
+//     затем быстрые пробы пачками по VupenSwitchProbeBatch параллельно
+//     (VupenQuickProbeTimeout каждая) — ответившие проверяются по мере прихода.
+//     Поиск — не дольше VupenSwitchBudget; вызов целиком (с ожиданием очереди
+//     обработчика) — не дольше VupenCheckRouteHealWait. Пока ядро само выбирает узел (new | checking |
+//     searching), второй поиск не начинается: сразу busy_searching, итог поиска —
+//     в VupenAutoState. Смена по switch видна и после ответа: lastSwitch с reason
+//     "switch", from, to, atMs.
 
 var (
 	// VupenCheckRouteHealWait — сколько VupenCheckRoute(heal) ждёт итог; дальше
@@ -79,6 +91,8 @@ const (
 	// Ядро 79 (D-42).
 	vupenRouteSwitchMode    = "switch"
 	vupenRouteNoAlternative = "no_alternative"
+	// Ядро 80 (D-43).
+	vupenRouteBusySearching = "busy_searching"
 )
 
 // vupenStickyRouteObs — что ещё нужно от обсерватории для VupenCheckRoute (burst, ядро 78).
@@ -86,6 +100,9 @@ type vupenStickyRouteObs interface {
 	VupenStickyCheckWith(tag string, opt burst.VupenCheckOptions) burst.VupenCheckResult
 	VupenStickyExcludeFor(tag, reason string, d time.Duration)
 	VupenStickyCloseConns(tag string) int
+	// Ядро 80 (D-43): быстрый поиск switch (burst, tuning_vupen_switch.go).
+	VupenStickyRecent(tags []string, maxAge time.Duration) map[string]time.Duration
+	VupenStickyQuickProbe(tags []string, timeout time.Duration, deadline time.Time, each func(tag string, rtt time.Duration, ok bool) bool) int
 }
 
 // vupenRouteReq — запрос VupenCheckRoute.
@@ -345,6 +362,12 @@ func (s *vupenSticky) checkRoute(q vupenRouteReq) vupenRouteResp {
 // requestHeal — heal или switch (ядро 79) в горутине обработчика; ждём итог не
 // дольше VupenCheckRouteHealWait.
 func (s *vupenSticky) requestHeal(q vupenRouteReq) vupenRouteResp {
+	if q.Mode == vupenRouteSwitchMode {
+		// Ядро 80 (D-43): ядро уже ищет — второй поиск не начинаем.
+		if p := s.getPhase(); p == vupenPhaseNew || p == vupenPhaseChecking || p == vupenPhaseSearching {
+			return vupenRouteResp{Verdict: vupenRouteBusySearching, From: s.viewTag(), Detail: vupenBusyDetail(p)}
+		}
+	}
 	if s.getPhase() == vupenPhaseNew {
 		return vupenRouteResp{Verdict: vupenRouteUnknown, Detail: "the balancer has not started yet (no traffic)"}
 	}
@@ -465,8 +488,27 @@ func (s *vupenSticky) healOutcome(resp vupenRouteResp) vupenRouteResp {
 	return resp
 }
 
-// switchRoute — режим switch (ядро 79, D-42; горутина обработчика): сменить
-// работающий узел по просьбе пользователя, без проверки и без исключения текущего.
+var (
+	// Ядро 80 (D-43): быстрый поиск switch.
+	// VupenSwitchBudget — предел switch целиком (кэш, пробы, проверки 64 КБ).
+	VupenSwitchBudget = 12 * time.Second
+	// VupenSwitchCacheMaxAge — замер обсерватории моложе этого считается свежим
+	// (и только после последней смены сети).
+	VupenSwitchCacheMaxAge = 5 * time.Minute
+	// VupenSwitchProbeBatch — сколько узлов без свежего замера пробуется разом.
+	VupenSwitchProbeBatch = 8
+)
+
+func vupenBusyDetail(p vupenStickyPhase) string {
+	if p == vupenPhaseNew {
+		return "the core has not chosen a node yet (no traffic) — no second search; see VupenAutoState"
+	}
+	return "the core is " + p.String() + " — no second search; the result will be in VupenAutoState"
+}
+
+// switchRoute — режим switch (ядро 79–80, D-42, D-43; горутина обработчика):
+// сменить работающий узел по просьбе пользователя, без проверки и без
+// исключения текущего, без раунда обсерватории.
 func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 	q := h.q
 	resp := vupenRouteResp{Verdict: vupenRouteUnknown, From: s.viewTag()}
@@ -478,89 +520,295 @@ func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 	if s.visitedReset.Swap(false) {
 		s.visited = nil // сеть сменилась — перебор заново
 	}
-	reason := "checkRoute switch (" + q.Reason + ")"
+	prev := ""
 	switch p := s.getPhase(); p {
 	case vupenPhaseHolding:
+		prev = s.current
+		resp.From = prev
 	case vupenPhaseNoWorking:
-		// Рабочих не было и до запроса: поискать сразу (как heal), но без перелива
-		// в LTE — switch не переливает никогда; дальше повтор по графику.
-		s.retryIdx = 0
-		resp.Tried = s.searchOpt(reason, q.maxSwitches(), false)
-		if s.getPhase() == vupenPhaseHolding {
-			resp.Verdict, resp.To = vupenRouteSwitched, s.current
-		} else {
-			resp.Verdict = vupenRouteNoWorking
-		}
-		return resp
+		// Рабочих не было и до запроса: тот же быстрый поиск по всем, без
+		// перелива в LTE; не нашёлся — повтор по графику, как был.
 	default:
-		resp.Detail = "the core is " + p.String()
+		resp.Verdict, resp.Detail = vupenRouteBusySearching, vupenBusyDetail(p)
 		return resp
 	}
-	prev := s.current
-	resp.From = prev
 	cands, _ := s.b.SelectOutbounds()
 	// Исключённые по провалам (heal, сторож, проверки) — не кандидаты; текущий
 	// пропускается только в этом поиске.
-	var others, fresh, seen []string
+	var fresh, seen []string
 	for _, t := range cands {
 		if t == prev || obs.VupenStickyExcluded(t) {
 			continue
 		}
-		others = append(others, t)
 		if slices.Contains(s.visited, t) {
 			seen = append(seen, t)
 		} else {
 			fresh = append(fresh, t)
 		}
 	}
-	budget := q.maxSwitches()
-	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch (%s): leave %s without a check: %d other, %d already visited",
-		s.balancer, q.Reason, prev, len(others), len(seen)))
-	// Выдача остаётся prev (он работает), пока новый не проверен.
-	s.setPhase(vupenPhaseSearching)
-	tried, found := 0, false
-	if len(fresh) > 0 {
-		tried, found = s.verifyPool(obs, fresh, reason, "switch", false, func(alive []string) []string {
-			return vupenStickyDiverse(alive, s.nodeKey, budget)
-		})
+	// Посещённые — с того, с кого ушли раньше всех.
+	sort.SliceStable(seen, func(i, j int) bool {
+		return slices.Index(s.visited, seen[i]) < slices.Index(s.visited, seen[j])
+	})
+	if prev != "" {
+		s.setPhase(vupenPhaseSearching) // выдача остаётся prev: он работает, пока новый не проверен
 	}
-	if !found && len(seen) > 0 && tried < budget {
-		// Все прочие рабочие уже были: круг заново — с того, с кого ушли раньше всех.
-		left := budget - tried
-		var n int
-		n, found = s.verifyPool(obs, seen, reason+" next round", "switch", false, func(alive []string) []string {
-			order := slices.Clone(alive)
-			sort.SliceStable(order, func(i, j int) bool {
-				return slices.Index(s.visited, order[i]) < slices.Index(s.visited, order[j])
-			})
-			if len(order) > left {
-				order = order[:left]
+	start := time.Now()
+	f := vupenSwitchFind{s: s, obs: obs, ro: ro, deadline: start.Add(VupenSwitchBudget), maxChecks: q.maxSwitches()}
+	recent := ro.VupenStickyRecent(append(append([]string(nil), fresh...), seen...), s.cacheMaxAge())
+	tag, round := f.find(recent, fresh, seen)
+	resp.Tried = f.tried
+	summary := fmt.Sprintf("%d fresh, %d visited, %d cached alive, %d probed, %d answered, %d checked, %dms",
+		len(fresh), len(seen), f.cached, f.probed, f.answered, f.tried, time.Since(start).Milliseconds())
+	unchecked := f.total - len(f.checked)
+	if tag == "" && f.outOfTime {
+		summary += fmt.Sprintf(", budget %s spent, %d candidates unchecked", VupenSwitchBudget, unchecked)
+	}
+	if tag != "" {
+		s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
+		s.holdBecause(tag, "switch")
+		resp.Verdict, resp.To = vupenRouteSwitched, tag
+		if prev != "" {
+			if round == 1 {
+				s.visited = nil // круг пройден: начинаем новый
 			}
-			return order
-		})
-		tried += n
-		if found {
-			s.visited = nil
+			s.visited = append(slices.DeleteFunc(s.visited, func(t string) bool { return t == prev || t == tag }), prev)
+			if q.closeConns() {
+				resp.Closed = ro.VupenStickyCloseConns(prev)
+			}
 		}
+		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch: %q → %s (%s), %d connections of %q closed, visited %v",
+			s.balancer, prev, tag, summary, resp.Closed, prev, s.visited))
+		return resp
 	}
-	resp.Tried = tried
-	if found {
-		to := s.current
-		s.visited = append(slices.DeleteFunc(s.visited, func(t string) bool { return t == prev || t == to }), prev)
-		resp.Verdict, resp.To = vupenRouteSwitched, to
-		if q.closeConns() {
-			resp.Closed = ro.VupenStickyCloseConns(prev)
-		}
-		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch: %s → %s, %d connections of %s closed, visited %v",
-			s.balancer, prev, to, resp.Closed, prev, s.visited))
+	if prev == "" {
+		// Как было: «нет рабочих», повтор по графику (таймер не трогаем).
+		resp.Verdict, resp.Detail = vupenRouteNoWorking, "no working node ("+summary+")"
+		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": checkRoute switch: ", resp.Detail)
 		return resp
 	}
 	// Никто другой не прошёл: остаёмся на prev (не «нет рабочих»), список не меняется.
 	s.holdBecause(prev, "switch")
-	resp.Verdict, resp.To = vupenRouteNoAlternative, prev
-	resp.Detail = fmt.Sprintf("no other working node in %s (%d other, %d checked) → kept %s", s.balancer, len(others), tried, prev)
+	resp.To = prev
+	if f.outOfTime && unchecked > 0 {
+		// CR-002: не успели проверить всех — это не «других нет».
+		resp.Verdict = vupenRouteFailed
+		resp.Detail = fmt.Sprintf("budget %s spent, %d candidates unchecked (%s) → kept %s", VupenSwitchBudget, unchecked, summary, prev)
+	} else {
+		resp.Verdict = vupenRouteNoAlternative
+		resp.Detail = fmt.Sprintf("no other working node in %s (%s) → kept %s", s.balancer, summary, prev)
+	}
 	errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": checkRoute switch: ", resp.Detail)
 	return resp
+}
+
+// cacheMaxAge — до какой давности замеры обсерватории годятся для switch:
+// VupenSwitchCacheMaxAge, но не раньше последней смены сети.
+func (s *vupenSticky) cacheMaxAge() time.Duration {
+	age := VupenSwitchCacheMaxAge
+	s.signals.mu.Lock()
+	changed := s.signals.netChangedAt
+	s.signals.mu.Unlock()
+	if !changed.IsZero() {
+		if d := vupenStickyNow().Sub(changed); d < age {
+			age = d
+		}
+	}
+	return age
+}
+
+// vupenSwitchFind — поиск switch: по кругам перебора (0 — ещё не посещённые, 1 —
+// посещённые); кандидат — ответивший на пробу недавно (кэш) или на быструю пробу
+// сейчас; каждый проверяется 64 КБ, первый прошедший — выбор.
+type vupenSwitchFind struct {
+	s         *vupenSticky
+	obs       vupenStickyObservatory
+	ro        vupenStickyRouteObs
+	deadline  time.Time
+	maxChecks int
+
+	tried, cached, probed, answered int
+	stop                            bool
+	// CR-002: кончился бюджет (или ядро остановили), а не кандидаты; total —
+	// кандидатов без свежего провала, checked — проверенные 64 КБ или провалившие пробу.
+	outOfTime bool
+	total     int
+	checked   map[string]bool
+}
+
+// outOfBudget — остановиться: вышло время.
+func (f *vupenSwitchFind) outOfBudget() {
+	f.stop, f.outOfTime = true, true
+}
+
+func (f *vupenSwitchFind) markChecked(tag string) {
+	if f.checked == nil {
+		f.checked = map[string]bool{}
+	}
+	f.checked[tag] = true
+}
+
+// find — круг 0: недавно ответившие по задержке, затем быстрые пробы остальных
+// пачками, ответившие — по мере прихода. Круг 1: строго с того, с кого ушли
+// раньше всех (без A→B→A); недавно ответившие идут без пробы. Свежий провал в
+// кэше — узел не пробуется (его таймаут второй раз не ждём).
+func (f *vupenSwitchFind) find(recent map[string]time.Duration, rounds ...[]string) (string, int) {
+	for round, tier := range rounds {
+		var alive, unknown, ordered []string
+		for _, t := range tier {
+			switch d, ok := recent[t]; {
+			case !ok:
+				unknown = append(unknown, t)
+				ordered = append(ordered, t)
+			case d > 0:
+				alive = append(alive, t)
+				ordered = append(ordered, t)
+			}
+		}
+		f.cached += len(alive)
+		f.total += len(alive) + len(unknown)
+		if round == 0 {
+			sort.SliceStable(alive, func(i, j int) bool { return recent[alive[i]] < recent[alive[j]] })
+			for _, t := range alive {
+				if f.verify(t) {
+					return t, round
+				}
+				if f.stop {
+					return "", round
+				}
+			}
+			for len(unknown) > 0 && !f.stop {
+				n := min(len(unknown), max(1, VupenSwitchProbeBatch))
+				if t := f.probeBatch(unknown[:n], nil); t != "" {
+					return t, round
+				}
+				unknown = unknown[n:]
+			}
+		} else {
+			for len(ordered) > 0 && !f.stop {
+				// Пачка — VupenSwitchProbeBatch узлов без свежего замера плюс
+				// недавно ответившие между ними (их не пробуем).
+				n, probe := 0, 0
+				for n < len(ordered) && probe < max(1, VupenSwitchProbeBatch) {
+					if d := recent[ordered[n]]; d <= 0 {
+						probe++
+					}
+					n++
+				}
+				if t := f.probeBatch(ordered[:n], recent); t != "" {
+					return t, round
+				}
+				ordered = ordered[n:]
+			}
+		}
+		if f.stop {
+			return "", round
+		}
+	}
+	return "", 0
+}
+
+// probeBatch — быстрые пробы пачки, ответившие проверяются 64 КБ. order == nil —
+// по мере прихода ответов (кто быстрее, тот первый). Иначе — строго по порядку
+// пачки: ответивший ждёт, пока не ответят или не провалятся те, кто раньше него;
+// узлы с order[t] > 0 (недавно ответили) считаются ответившими без пробы.
+func (f *vupenSwitchFind) probeBatch(batch []string, order map[string]time.Duration) string {
+	const pending, answered, failed = 0, 1, 2
+	status := make(map[string]int, len(batch))
+	var toProbe []string
+	for _, t := range batch {
+		if order != nil && order[t] > 0 {
+			status[t] = answered
+		} else {
+			toProbe = append(toProbe, t)
+		}
+	}
+	next, found := 0, ""
+	// walk — по порядку пачки до первого, кто ещё не ответил; true — закончили.
+	walk := func() bool {
+		for next < len(batch) && !f.stop {
+			t := batch[next]
+			switch status[t] {
+			case pending:
+				return false
+			case answered:
+				next++
+				if f.verify(t) {
+					found = t
+					return true
+				}
+			default:
+				next++
+			}
+		}
+		return true
+	}
+	if order != nil && walk() {
+		return found
+	}
+	if len(toProbe) == 0 {
+		return found
+	}
+	f.probed += len(toProbe)
+	f.answered += f.ro.VupenStickyQuickProbe(toProbe, 0, f.deadline, func(tag string, _ time.Duration, ok bool) bool {
+		if ok {
+			status[tag] = answered
+		} else {
+			status[tag] = failed
+			f.markChecked(tag)
+		}
+		if order == nil {
+			if ok && f.verify(tag) {
+				found = tag
+				return true
+			}
+			return f.stop
+		}
+		return walk()
+	})
+	if found == "" && !time.Now().Before(f.deadline) {
+		f.outOfBudget()
+	}
+	return found
+}
+
+// verify — проверка 64 КБ через tag в пределах бюджета; true — прошёл.
+func (f *vupenSwitchFind) verify(tag string) bool {
+	left := time.Until(f.deadline)
+	if f.tried >= f.maxChecks {
+		f.stop = true // предел maxSwitches — по просьбе вызывающего, не бюджет
+		return false
+	}
+	if left <= 0 {
+		f.outOfBudget()
+		return false
+	}
+	f.tried++
+	f.markChecked(tag)
+	done := make(chan string, 1)
+	go func() { done <- f.obs.VupenStickyVerify(tag) }()
+	t := time.NewTimer(left)
+	defer t.Stop()
+	var v string
+	select {
+	case v = <-done:
+	case <-t.C:
+		// Проверка доходит в фоне (итог запишет обсерватория), switch её не ждёт.
+		delete(f.checked, tag)
+		f.outOfBudget()
+		return false
+	case <-f.s.stopCh:
+		delete(f.checked, tag)
+		f.outOfBudget()
+		return false
+	}
+	if v == vupenStickyOK {
+		return true
+	}
+	f.s.setReport(func(r *vupenStickyReport) {
+		r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "verify", detail: tag}
+	})
+	return false
 }
 
 // ── VupenAutoState ──────────────────────────────────────────────────────────

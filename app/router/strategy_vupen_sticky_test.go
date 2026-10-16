@@ -46,6 +46,13 @@ type stickyFakeObs struct {
 	routeOpts   []burst.VupenCheckOptions
 	excludedFor map[string]time.Duration
 	closedTags  []string
+	// Ядро 80 (switch): кэш замеров (задержка или -1) и их возраст; быстрые пробы
+	// отвечают узлам из delay (по возрастанию задержки), если не задан quickDelay.
+	recent     map[string]time.Duration
+	recentAge  map[string]time.Duration
+	recentAsks []time.Duration
+	quickDelay map[string]time.Duration
+	quick      [][]string
 }
 
 func (f *stickyFakeObs) VupenStickyListen(fn func(tag, kind string, ok bool, detail string)) func() {

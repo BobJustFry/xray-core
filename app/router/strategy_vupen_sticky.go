@@ -578,12 +578,6 @@ func (s *vupenSticky) search(reason string) { s.searchN(reason, VupenStickySearc
 // searchN — поиск с пределом проверок maxChecks (VupenCheckRoute: maxSwitches);
 // возвращает, сколько узлов проверено загрузкой.
 func (s *vupenSticky) searchN(reason string, maxChecks int) int {
-	return s.searchOpt(reason, maxChecks, true)
-}
-
-// searchOpt — поиск; allowSpill = false — без перелива в LTE (ядро 79:
-// VupenCheckRoute(switch) никогда не переливает), повтор по графику как обычно.
-func (s *vupenSticky) searchOpt(reason string, maxChecks int, allowSpill bool) int {
 	obs := s.observatory()
 	if obs == nil {
 		return 0
@@ -608,54 +602,34 @@ func (s *vupenSticky) searchOpt(reason string, maxChecks int, allowSpill bool) i
 			pool = append(pool, t)
 		}
 	}
-	diverse := func(alive []string) []string { return vupenStickyDiverse(alive, s.nodeKey, maxChecks) }
-	tried, found := s.verifyPool(obs, pool, reason, "search", true, diverse)
-	if found {
-		return tried
-	}
-	s.setPhase(vupenPhaseNoWorking)
-	s.publish(s.fallbackPick(cands))
-	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.
-	if allowSpill && s.trySpill(reason) {
-		return tried
-	}
-	s.scheduleRetry(true)
-	return tried
-}
-
-// verifyPool — пробы по pool → порядок стратегии → pick выбирает, кого проверить
-// загрузкой 64 КБ; первый прошедший становится текущим (holdReason — для
-// lastSwitch). normal = false (ядро 79, VupenCheckRoute(switch)): провал
-// кандидата не считается провалом текущего (failedChecks), живые подмножества
-// не пишутся в regularAlive, журнал — у вызывающего. Фаза и выдача не меняются,
-// пока не найден рабочий.
-func (s *vupenSticky) verifyPool(obs vupenStickyObservatory, pool []string, reason, holdReason string, normal bool,
-	pick func(alive []string) []string) (tried int, found bool) {
 	obs.VupenStickyProbe(pool)
 	alive, _ := s.order(obs, pool)
-	if normal {
-		s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
-	}
-	picks := pick(alive)
+	s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
+	picks := vupenStickyDiverse(alive, s.nodeKey, maxChecks)
 	for i, tag := range picks {
 		if obs.VupenStickyVerify(tag) == vupenStickyOK {
 			from := s.current
 			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q)",
 				s.balancer, reason, len(pool), len(alive), tag, from))
 			s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
-			s.holdBecause(tag, holdReason)
-			return i + 1, true
+			s.holdBecause(tag, "search")
+			return i + 1
 		}
 		s.setReport(func(r *vupenStickyReport) {
-			if normal {
-				r.failedChecks++
-			}
+			r.failedChecks++
 			r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "verify", detail: tag}
 		})
 	}
 	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %d checked → nothing works",
 		s.balancer, reason, len(pool), len(alive), len(picks)))
-	return len(picks), false
+	s.setPhase(vupenPhaseNoWorking)
+	s.publish(s.fallbackPick(cands))
+	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.
+	if s.trySpill(reason) {
+		return len(picks)
+	}
+	s.scheduleRetry(true)
+	return len(picks)
 }
 
 func (s *vupenSticky) scheduleRetry(advance bool) {

@@ -2,6 +2,8 @@ package router
 
 import (
 	"encoding/json"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +48,71 @@ func (f *stickyFakeObs) VupenStickyCloseConns(tag string) int {
 	defer f.mu.Unlock()
 	f.closedTags = append(f.closedTags, tag)
 	return 2
+}
+
+// VupenStickyRecent — кэш замеров не старше maxAge (возраст — recentAge, по умолчанию 0).
+func (f *stickyFakeObs) VupenStickyRecent(tags []string, maxAge time.Duration) map[string]time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recentAsks = append(f.recentAsks, maxAge)
+	out := map[string]time.Duration{}
+	for _, t := range tags {
+		if d, ok := f.recent[t]; ok && f.recentAge[t] <= maxAge {
+			out[t] = d
+		}
+	}
+	return out
+}
+
+// VupenStickyQuickProbe — ответы по возрастанию задержки (quickDelay, иначе delay),
+// затем провалы (узлы без задержки или с задержкой больше timeout) — в порядке пачки.
+func (f *stickyFakeObs) VupenStickyQuickProbe(tags []string, timeout time.Duration, deadline time.Time,
+	each func(tag string, rtt time.Duration, ok bool) bool) int {
+	if timeout <= 0 {
+		timeout = burst.VupenQuickProbeTimeout
+	}
+	f.mu.Lock()
+	f.quick = append(f.quick, append([]string(nil), tags...))
+	type ans struct {
+		tag string
+		d   time.Duration
+	}
+	var answers []ans
+	var silent []string
+	for _, t := range tags {
+		d, ok := time.Duration(0), false
+		if f.quickDelay != nil {
+			d, ok = f.quickDelay[t]
+		} else if ms, alive := f.delay[t]; alive && !f.excluded[t] {
+			d, ok = time.Duration(ms)*time.Millisecond, true
+		}
+		if ok && d <= timeout {
+			answers = append(answers, ans{t, d})
+		} else {
+			silent = append(silent, t)
+		}
+	}
+	f.mu.Unlock()
+	sort.SliceStable(answers, func(i, j int) bool { return answers[i].d < answers[j].d })
+	n := 0
+	for _, a := range answers {
+		n++
+		if each(a.tag, a.d, true) {
+			return n
+		}
+	}
+	for _, t := range silent {
+		if each(t, 0, false) {
+			return n
+		}
+	}
+	return n
+}
+
+func (f *stickyFakeObs) quickBatches() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.quick)
 }
 
 func (f *stickyFakeObs) setRoute(tag, verdict, kind string) {
