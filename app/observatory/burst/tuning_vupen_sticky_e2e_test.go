@@ -671,3 +671,56 @@ func TestVupenTransportHandshakeFailuresAreSignals(t *testing.T) {
 		unsub()
 	}
 }
+
+// Ядро 77 (2.5) на настоящем ядре: REG мёртв, LTE жив. На сотовой — после
+// поиска по REG трафик идёт через проверенный узел LTE; стала Wi-Fi — новые
+// соединения сразу в REG (на Wi-Fi LTE никогда).
+func TestVupenSpillEndToEnd(t *testing.T) {
+	vupenStickySettings(t, localListener(t))
+	internet.VupenSetUplink("cellular", fmt.Sprintf("spill-e2e-cell-%d", time.Now().UnixNano()))
+	dead := func() int {
+		l, err := stdnet.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := l.Addr().(*stdnet.TCPAddr).Port
+		l.Close()
+		return p
+	}
+	inst := startCore(t, fmt.Sprintf(`{
+	  "log": {"loglevel": "none"},
+	  "outbounds": [
+	    {"tag": "proxy-1", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:%d"}},
+	    {"tag": "proxy-2", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:%d"}},
+	    {"tag": "lte-proxy-1", "protocol": "freedom", "settings": {"redirect": "%s"}},
+	    {"tag": "direct", "protocol": "freedom"}
+	  ],
+	  "routing": {
+	    "rules": [{"port": "0-65535", "balancerTag": "REG"}],
+	    "balancers": [
+	      {"tag": "REG", "selector": ["proxy"], "strategy": {"type": "leastPing"}, "fallbackTag": "proxy-1",
+	       "vupenSticky": {}, "vupenSpill": {"balancerTag": "LTE", "uplink": ["cellular"]}},
+	      {"tag": "LTE", "selector": ["lte-"], "strategy": {"type": "leastPing"}, "fallbackTag": "lte-proxy-1",
+	       "vupenSticky": {}}
+	    ]
+	  },
+	  "burstObservatory": {
+	    "subjectSelector": ["proxy", "lte-"], "vupenOnDemand": true,
+	    "pingConfig": {"destination": "http://probe.test/ping", "interval": "10s", "sampling": 1, "timeout": "3s"}
+	  }
+	}`, dead(), dead(), muxBackend(t)))
+	obs := inst.GetFeature(extension.ObservatoryType()).(*burst.Observer)
+	pickREG(t, inst) // the first connection starts REG: its search finds nothing
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && !obs.VupenTspuVerified("lte-proxy-1") {
+		pickREG(t, inst) // spilled: picks reach LTE, which searches and verifies
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := pickREG(t, inst); got != "lte-proxy-1" {
+		t.Fatalf("cellular, REG dead: traffic via the verified LTE node, got %q", got)
+	}
+	internet.VupenSetUplink("wifi", fmt.Sprintf("spill-e2e-wifi-%d", time.Now().UnixNano()))
+	if got := pickREG(t, inst); strings.HasPrefix(got, "lte-") {
+		t.Fatalf("Wi-Fi: new connections go to REG at once, got %q", got)
+	}
+}

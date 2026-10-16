@@ -160,6 +160,16 @@ type vupenSticky struct {
 	signals      vupenStickySignals
 	checkPending atomic.Bool
 	unsubSignals func() // под life
+
+	// Ядро 77: перелив REG → LTE (strategy_vupen_spill.go); nil — без vupenSpill.
+	spill *vupenSpill
+	// Ядро 77 (CR-501): этот балансировщик — цель перелива; feeders — сколько
+	// балансировщиков сейчас в него переливают.
+	spillTargetOf atomic.Bool
+	feeders       atomic.Int32
+	// Ядро 77: состояние для 2.6 (VupenAutoState).
+	stateMu sync.Mutex
+	report  vupenStickyReport
 }
 
 func newVupenSticky(br *BalancingRule, b *Balancer) *vupenSticky {
@@ -170,6 +180,7 @@ func newVupenSticky(br *BalancingRule, b *Balancer) *vupenSticky {
 		events:   make(chan vupenStickyEvent, 16),
 		stopCh:   make(chan struct{}),
 		keys:     map[string]string{},
+		spill:    newVupenSpillConfig(br),
 	}
 	s.runWorker = func() { go s.loop() }
 	return s
@@ -282,6 +293,11 @@ func (s *vupenSticky) start(cands []string) {
 			s.signals.netChangedAt = vupenStickyNow()
 			s.signals.fails = nil
 			s.signals.mu.Unlock()
+			// Ядро 77: сменилась сеть — вердикт «обычный мёртв» сброшен сразу:
+			// новые соединения идут в REG (R4, D-12).
+			if s.unspill("network changed") {
+				s.send(vupenStickyEvent{kind: "net-changed"})
+			}
 		}
 	})
 	if src, ok := s.observatory().(vupenStickySignalSource); ok {
@@ -381,6 +397,9 @@ func (s *vupenSticky) loop() {
 		if s.stopRetry != nil {
 			s.stopRetry()
 		}
+		if s.spill != nil && s.spill.stopRecheck != nil {
+			s.spill.stopRecheck()
+		}
 	}()
 	for {
 		select {
@@ -398,7 +417,24 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 		return
 	default:
 	}
+	// CR-501: цель перелива без перелива не ищет и не повторяет.
+	if s.dormant() {
+		switch ev.kind {
+		case "search", "retry", "net-stable", "current-excluded":
+			return
+		}
+	}
 	switch ev.kind {
+	case "sleep":
+		if s.dormant() && s.stopRetry != nil {
+			s.stopRetry()
+			s.stopRetry = nil
+		}
+	case "wake":
+		if !s.dormant() && s.getPhase() == vupenPhaseNoWorking {
+			s.retryIdx = 0
+			s.search("spill")
+		}
 	case "check":
 		defer s.checkPending.Store(false)
 		switch s.getPhase() {
@@ -414,10 +450,14 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 			s.search("retry")
 		}
 	case "net-stable":
-		if s.getPhase() == vupenPhaseNoWorking {
+		if s.getPhase() == vupenPhaseNoWorking && !s.spilledNow() {
 			s.retryIdx = 0
 			s.search("network settled")
 		}
+	case "net-changed":
+		s.onUnspilledByNetwork()
+	case "lte-recheck":
+		s.lteRecheck()
 	case "current-excluded":
 		if s.getPhase() == vupenPhaseHolding {
 			cur := s.current
@@ -426,7 +466,18 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 	}
 }
 
-func (s *vupenSticky) hold(tag string) {
+func (s *vupenSticky) spilledNow() bool { return s.spill != nil && s.spill.spilled.Load() }
+
+func (s *vupenSticky) hold(tag string) { s.holdBecause(tag, "check") }
+
+func (s *vupenSticky) holdBecause(tag, reason string) {
+	s.setReport(func(r *vupenStickyReport) {
+		if r.current != tag {
+			r.lastSwitch = vupenStickyMark{at: vupenStickyNow(), from: r.current, to: tag, reason: reason}
+		}
+		r.current = tag
+		r.failedChecks = 0
+	})
 	s.current = tag
 	s.retryIdx = 0
 	if s.stopRetry != nil {
@@ -457,6 +508,10 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 		s.hold(tag)
 		return
 	}
+	s.setReport(func(r *vupenStickyReport) {
+		r.failedChecks++
+		r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "check", detail: tag + ": " + reason}
+	})
 	switch obs.VupenStickyNetwork() {
 	case vupenNetUp:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
@@ -508,14 +563,22 @@ func (s *vupenSticky) search(reason string) {
 			from := s.current
 			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q)",
 				s.balancer, reason, len(pool), len(alive), tag, from))
-			s.hold(tag)
+			s.holdBecause(tag, "search")
 			return
 		}
+		s.setReport(func(r *vupenStickyReport) {
+			r.failedChecks++
+			r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "verify", detail: tag}
+		})
 	}
 	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %d checked → nothing works",
 		s.balancer, reason, len(pool), len(alive), len(picks)))
 	s.setPhase(vupenPhaseNoWorking)
 	s.publish(s.fallbackPick(cands))
+	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.
+	if s.trySpill(reason) {
+		return
+	}
 	s.scheduleRetry(true)
 }
 
@@ -730,6 +793,10 @@ func (b *Balancer) vupenPickOutbound() (string, error) {
 	}
 	if o := b.override.Get(); o != "" {
 		return o, nil
+	}
+	// Ядро 77: перелито (и сеть сотовая) — выбирает LTE-балансировщик.
+	if t := b.vupen.spillTarget(); t != nil {
+		return t.PickOutbound()
 	}
 	if tag := b.vupen.pick(candidates); tag != "" {
 		return tag, nil

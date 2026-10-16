@@ -144,6 +144,7 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 		newRules = append(newRules, rr)
 	}
 
+	vupenLinkSpill(newBalancers) // Vupen (ядро 77): цель перелива REG → LTE
 	r.balancers.Store(&newBalancers)
 	r.rules.Store(&newRules)
 	if !shouldAppend {

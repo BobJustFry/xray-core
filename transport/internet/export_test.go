@@ -1,5 +1,7 @@
 package internet
 
+import "time"
+
 // Только для тестов (файл _test.go не попадает в сборку ядра).
 
 // VupenNetEpochResetForTest — сбросить состояние эпох сети процесса, как будто
@@ -23,4 +25,8 @@ func (s *vupenNetState) resetForTest() {
 	s.entries = map[uint64]*vupenNetEntry{}
 	s.index = map[any]uint64{}
 	s.untrackedLog = false
+	if s.stopTag != nil {
+		s.stopTag()
+	}
+	s.stopTag, s.tagCloses, s.changedAt = nil, nil, time.Time{}
 }

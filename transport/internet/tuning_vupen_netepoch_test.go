@@ -6,6 +6,7 @@ import (
 	"fmt"
 	stdnet "net"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -610,5 +611,96 @@ func TestVupenNetEpochSubscribe(t *testing.T) {
 	VupenSetUplink("wifi", "")
 	if g := events(); len(g) != len(want) {
 		t.Fatalf("event after unsubscribe: %v", g)
+	}
+}
+
+// Ядро 77: закрытие соединений по outbound'у (LTE при возврате в REG) — сразу,
+// если сеть стабильна 9 с; соединения других outbound'ов не трогаются.
+func TestVupenCloseConnsWhenStableImmediate(t *testing.T) {
+	clock := netEpochTest(t)
+	dest := tcpServer(t)
+	VupenSetUplink("cellular", "cell-a")
+	clock.Advance(10 * time.Second)
+	lte := dial(t, auto41Ctx("lte-proxy-1"), dest)
+	reg := dial(t, auto41Ctx("proxy-1"), dest)
+	plain := dial(t, plainCtx("lte-proxy-2"), dest) // не АВТО 4.1 — не отслеживается
+	VupenCloseConnsWhenStable(func(tag string) bool { return strings.HasPrefix(tag, "lte-") }, "lte-return")
+	if !isClosed(lte) || isClosed(reg) || isClosed(plain) {
+		t.Fatalf("lte closed=%v reg closed=%v non-AUTO closed=%v", isClosed(lte), isClosed(reg), isClosed(plain))
+	}
+}
+
+// Сеть стабильна меньше 9 с — закрытие, когда станет; отмена — не закрывать.
+func TestVupenCloseConnsWhenStableWaitsAndCancels(t *testing.T) {
+	clock := netEpochTest(t)
+	dest := tcpServer(t)
+	VupenSetUplink("wifi", "wifi-a")
+	VupenSetUplink("cellular", "cell-a") // countdown 9 s
+	lte := dial(t, auto41Ctx("lte-proxy-1"), dest)
+	clock.Advance(3 * time.Second)
+	isLTE := func(tag string) bool { return strings.HasPrefix(tag, "lte-") }
+	VupenCloseConnsWhenStable(isLTE, "lte-return")
+	if isClosed(lte) {
+		t.Fatal("closed before the network was stable 9 s")
+	}
+	clock.Advance(6 * time.Second)
+	if !isClosed(lte) {
+		t.Fatal("not closed once the network was stable 9 s")
+	}
+
+	VupenSetUplink("cellular", "cell-b")            // new countdown
+	lte2 := dial(t, auto41Ctx("lte-proxy-2"), dest) // opened on the new network
+	cancel := VupenCloseConnsWhenStable(isLTE, "lte-return")
+	cancel() // перелили снова до закрытия
+	clock.Advance(9 * time.Second)
+	if isClosed(lte2) {
+		t.Fatal("a cancelled close must not close the LTE connection of the current network")
+	}
+}
+
+// Вернулись к прежней сети раньше 9 с (отсчёт отменён) — ждущее закрытие по
+// outbound'у всё равно выполнится, когда эта сеть продержится 9 с.
+func TestVupenCloseConnsWhenStableAfterFlapBack(t *testing.T) {
+	clock := netEpochTest(t)
+	dest := tcpServer(t)
+	VupenSetUplink("cellular", "cell-a")
+	clock.Advance(10 * time.Second)
+	VupenSetUplink("wifi", "wifi-a")
+	lte := dial(t, VupenServiceContext(auto41Ctx("x")), dest) // service: not tracked
+	_ = lte
+	lteConn := dial(t, auto41Ctx("lte-proxy-1"), dest)
+	VupenCloseConnsWhenStable(func(tag string) bool { return strings.HasPrefix(tag, "lte-") }, "lte-return")
+	clock.Advance(2 * time.Second)
+	VupenSetUplink("cellular", "cell-a") // back to base: countdown cancelled
+	if isClosed(lteConn) {
+		t.Fatal("must wait until the network is stable 9 s")
+	}
+	clock.Advance(9 * time.Second)
+	if !isClosed(lteConn) {
+		t.Fatal("pending close must run 9 s after the flap back")
+	}
+}
+
+// CR-505: сокет взамен исходного (udphop) наследует его outbound — закрытие LTE
+// по тегу закроет и его.
+func TestVupenNetEpochContextForCarriesTag(t *testing.T) {
+	clock := netEpochTest(t)
+	VupenSetUplink("cellular", fmt.Sprintf("hop-tag-%d", time.Now().UnixNano()))
+	dest := udpServer(t)
+	orig := dial(t, auto41Ctx("lte-proxy-hy"), dest).(*PacketConnWrapper).PacketConn
+	hop := dial(t, VupenNetEpochContextFor(orig), dest)
+	vupenNet.mu.Lock()
+	tags := map[string]int{}
+	for _, e := range vupenNet.entries {
+		tags[e.tag]++
+	}
+	vupenNet.mu.Unlock()
+	if tags["lte-proxy-hy"] != 2 {
+		t.Fatalf("hop socket must carry the original outbound tag: %v", tags)
+	}
+	VupenCloseConnsWhenStable(func(tag string) bool { return strings.HasPrefix(tag, "lte-") }, "lte-return")
+	clock.Advance(time.Duration(VupenNetChangeCloseStableSec) * time.Second) // сеть устоялась
+	if !isClosed(hop) {
+		t.Fatal("the hop socket of an LTE node must be closed with the LTE pool")
 	}
 }

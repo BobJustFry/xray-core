@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 )
 
 // Vupen (ядро 74, АВТО 4.1; ADR-0001 §9.1, §13; D-18, D-19): эпохи сети.
@@ -113,12 +115,21 @@ func (id vupenNetID) String() string { return id.kind + " sig=" + id.sig }
 type vupenNetSnap struct {
 	id     vupenNetID
 	sweeps uint64
+	tag    string // outbound соединения (ядро 77; заполняется на установление)
 }
 
 type vupenNetEntry struct {
 	id  vupenNetID
 	get func() net.Conn // nil — сокет уже собран сборщиком мусора
 	idx any             // ключ в index (слабый указатель на сокет)
+	tag string          // outbound, через который открыто (ядро 77)
+}
+
+// vupenTagClose — отложенное закрытие соединений по outbound'у (ядро 77).
+type vupenTagClose struct {
+	match     func(tag string) bool
+	reason    string
+	cancelled atomic.Bool
 }
 
 type vupenNetState struct {
@@ -137,6 +148,11 @@ type vupenNetState struct {
 	entries      map[uint64]*vupenNetEntry
 	index        map[any]uint64 // слабый указатель на сокет → ключ записи
 	untrackedLog bool
+	// Ядро 77: когда сеть последний раз сменилась (или впервые сообщена) и
+	// закрытия по outbound'у, ждущие 9 с стабильной сети.
+	changedAt time.Time
+	tagCloses []*vupenTagClose
+	stopTag   func() bool
 }
 
 func newVupenNetState() *vupenNetState {
@@ -170,6 +186,7 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 	now := vupenNetNow()
 	if !s.active.Load() {
 		s.current, s.base, s.epoch = id, id, 1
+		s.changedAt = now
 		s.publishLocked()
 		s.active.Store(true)
 		s.mu.Unlock()
@@ -183,6 +200,7 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 	old := s.current
 	s.current = id
 	s.epoch++
+	s.changedAt = now
 	epoch := s.epoch
 	hadPending := s.stopPending != nil
 	if hadPending {
@@ -192,6 +210,7 @@ func (s *vupenNetState) setUplink(kind, sig string) {
 	if id == s.base {
 		// Мигание: вернулись к сети, на которой соединения открыты, — закрывать нечего.
 		away := now.Sub(s.leftBaseAt)
+		s.scheduleTagClosesLocked(epoch) // ждущие закрытия — через 9 с этой сети
 		s.publishLocked()
 		s.mu.Unlock()
 		errors.LogWarning(context.Background(), "[netchange] uplink ", old.kind, "→", id, " epoch=", epoch)
@@ -235,6 +254,7 @@ func (s *vupenNetState) stable(epoch uint64) {
 		}
 	}
 	cur := s.current
+	byTag, reasons := s.takeTagClosesLocked()
 	s.publishLocked()
 	s.mu.Unlock()
 
@@ -244,7 +264,107 @@ func (s *vupenNetState) stable(epoch uint64) {
 	errors.LogWarning(context.Background(), fmt.Sprintf(
 		"[netchange] stable %ds on %s: closed %d connections (reason=net-change)",
 		VupenNetChangeCloseStableSec, cur.sig, len(closing)))
+	vupenNetCloseTagged(byTag, reasons, cur.sig)
 	vupenNetNotify(VupenNetStable)
+}
+
+// VupenCloseConnsWhenStable — закрыть отслеживаемые соединения, чей outbound
+// подходит под match (ядро 77: соединения LTE при возврате в REG, D-14 п. 3,
+// D-18): сразу, если сеть стабильна VupenNetChangeCloseStableSec, иначе — когда
+// станет; новая смена сети перезапускает отсчёт. Возвращает отмену (перелили в
+// LTE снова до закрытия). Без VupenSetUplink — ничего (соединения и не отслеживаются).
+func VupenCloseConnsWhenStable(match func(tag string) bool, reason string) (cancel func()) {
+	s := vupenNet
+	req := &vupenTagClose{match: match, reason: reason}
+	s.mu.Lock()
+	if !s.active.Load() {
+		s.mu.Unlock()
+		return func() {}
+	}
+	stable := time.Duration(VupenNetChangeCloseStableSec) * time.Second
+	if s.stopPending == nil && vupenNetNow().Sub(s.changedAt) >= stable {
+		s.tagCloses = append(s.tagCloses, req)
+		byTag, reasons := s.takeTagClosesLocked()
+		cur := s.current.sig
+		s.mu.Unlock()
+		vupenNetCloseTagged(byTag, reasons, cur)
+		return func() {}
+	}
+	s.tagCloses = append(s.tagCloses, req)
+	if s.stopPending == nil {
+		s.scheduleTagClosesLocked(s.epoch)
+	}
+	s.mu.Unlock()
+	return func() { req.cancelled.Store(true) }
+}
+
+// scheduleTagClosesLocked — сеть сейчас не в отсчёте смены (вернулись к прежней
+// или только что сообщена): ждущие закрытия по outbound'у — когда она продержится 9 с.
+func (s *vupenNetState) scheduleTagClosesLocked(epoch uint64) {
+	if len(s.tagCloses) == 0 {
+		return
+	}
+	if s.stopTag != nil {
+		s.stopTag()
+	}
+	wait := time.Duration(VupenNetChangeCloseStableSec)*time.Second - vupenNetNow().Sub(s.changedAt)
+	if wait < 0 {
+		wait = 0
+	}
+	s.stopTag = vupenNetAfter(wait, func() {
+		s.mu.Lock()
+		if s.epoch != epoch || s.stopPending != nil {
+			s.mu.Unlock() // сеть снова сменилась: закроет её отсчёт
+			return
+		}
+		s.stopTag = nil
+		byTag, reasons := s.takeTagClosesLocked()
+		cur := s.current.sig
+		s.mu.Unlock()
+		vupenNetCloseTagged(byTag, reasons, cur)
+	})
+}
+
+// takeTagClosesLocked — забрать ждущие закрытия и подходящие соединения.
+func (s *vupenNetState) takeTagClosesLocked() ([]net.Conn, []string) {
+	if len(s.tagCloses) == 0 {
+		return nil, nil
+	}
+	var live []*vupenTagClose
+	var reasons []string
+	for _, r := range s.tagCloses {
+		if !r.cancelled.Load() {
+			live = append(live, r)
+			reasons = append(reasons, r.reason)
+		}
+	}
+	s.tagCloses = nil
+	var closing []net.Conn
+	for key, e := range s.entries {
+		for _, r := range live {
+			if r.match(e.tag) {
+				delete(s.entries, key)
+				delete(s.index, e.idx)
+				if c := e.get(); c != nil {
+					closing = append(closing, c)
+				}
+				break
+			}
+		}
+	}
+	return closing, reasons
+}
+
+func vupenNetCloseTagged(closing []net.Conn, reasons []string, sig string) {
+	if len(reasons) == 0 {
+		return
+	}
+	for _, c := range closing {
+		c.Close()
+	}
+	errors.LogWarning(context.Background(), fmt.Sprintf(
+		"[netchange] stable %ds on %s: closed %d connections (reason=%s)",
+		VupenNetChangeCloseStableSec, sig, len(closing), strings.Join(reasons, ",")))
 }
 
 // vupenNetAuto41Ctx — метка контекста: соединение открывает экземпляр с АВТО 4.1
@@ -287,13 +407,25 @@ func VupenNetEpochContextFor(pc any) context.Context {
 		return ctx
 	}
 	vupenNet.mu.Lock()
-	_, ok := vupenNet.index[idx]
+	key, ok := vupenNet.index[idx]
+	tag := ""
+	if e := vupenNet.entries[key]; ok && e != nil {
+		tag = e.tag
+	}
 	vupenNet.mu.Unlock()
 	if !ok {
 		return ctx
 	}
-	return context.WithValue(ctx, vupenNetAuto41Ctx{}, true)
+	ctx = context.WithValue(ctx, vupenNetAuto41Ctx{}, true)
+	if tag != "" {
+		ctx = context.WithValue(ctx, vupenNetTagCtx{}, tag) // ядро 77: outbound исходного сокета
+	}
+	return ctx
 }
+
+// vupenNetTagCtx — outbound, к которому относится соединение без сессии в
+// контексте (сокеты udphop наследуют его от исходного; ядро 77).
+type vupenNetTagCtx struct{}
 
 // vupenNetEpochBeforeDial — снимок сети перед установлением соединения или nil,
 // если соединение не отслеживается (API не вызывался или ядро не АВТО 4.1).
@@ -301,7 +433,18 @@ func vupenNetEpochBeforeDial(ctx context.Context) *vupenNetSnap {
 	if !vupenNet.active.Load() || !vupenNetAuto41(ctx) {
 		return nil
 	}
-	return vupenNet.snap.Load()
+	snap := vupenNet.snap.Load()
+	if snap == nil {
+		return nil
+	}
+	// Ядро 77: запомнить outbound соединения (закрытие соединений LTE при возврате).
+	own := *snap
+	if obs := session.OutboundsFromContext(ctx); len(obs) > 0 {
+		own.tag = obs[len(obs)-1].Tag
+	} else if tag, _ := ctx.Value(vupenNetTagCtx{}).(string); tag != "" {
+		own.tag = tag
+	}
+	return &own
 }
 
 // vupenNetEpochTrack — запомнить соединение под сетью снимка. Ошибка —
@@ -339,7 +482,7 @@ func vupenNetEpochTrack(conn net.Conn, snap *vupenNetSnap) error {
 		}
 		return nil
 	}
-	s.entries[key] = &vupenNetEntry{id: snap.id, get: get, idx: idx}
+	s.entries[key] = &vupenNetEntry{id: snap.id, get: get, idx: idx, tag: snap.tag}
 	s.index[idx] = key
 	s.mu.Unlock()
 	return nil
@@ -401,4 +544,14 @@ func vupenNetWeak[T any, P interface {
 		}
 		return nil
 	}, w
+}
+
+// VupenUplinkKind — тип текущей сети, как его сообщила платформа (cellular |
+// wifi | wired | other | none); до первого VupenSetUplink — "unknown".
+// Ядро 77: по нему АВТО 4.1 разрешает перелив в LTE только на сотовой.
+func VupenUplinkKind() string {
+	if snap := vupenNet.snap.Load(); snap != nil && snap.id.kind != "" {
+		return snap.id.kind
+	}
+	return "unknown"
 }
