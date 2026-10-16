@@ -9,17 +9,14 @@ import (
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/transport/internet/tagged"
 )
 
 // Стартовый раунд: все пробы падают → через VupenObservatoryRetryDelay должен
 // прийти повтор ровно для провалившихся узлов (ядро 52).
 func TestVupenSchedulerRetriesFailedSubjects(t *testing.T) {
-	oldDialer := tagged.Dialer
-	tagged.Dialer = func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
+	setTestDialer(t, func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
 		return nil, errors.New("down")
-	}
-	defer func() { tagged.Dialer = oldDialer }()
+	})
 
 	oldInit, oldRetry := VupenObservatoryInitialDelay, VupenObservatoryRetryDelay
 	VupenObservatoryInitialDelay, VupenObservatoryRetryDelay = 10*time.Millisecond, 50*time.Millisecond
@@ -42,7 +39,7 @@ func TestVupenSchedulerRetriesFailedSubjects(t *testing.T) {
 		Destination:   "http://127.0.0.1:9/generate_204",
 	})
 	h.StartScheduler(func() ([]string, error) { return []string{"a", "b"}, nil })
-	defer h.StopScheduler()
+	defer quiesce(t, h)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

@@ -9,7 +9,6 @@ import (
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/transport/internet/tagged"
 )
 
 // vupenObsResetForTest — вентиль глобальный: без сброса тесты видят следы соседа.
@@ -44,12 +43,10 @@ func newSleepTestPing() *HealthPing {
 func TestVupenObservatoryPauseSkipsInitialBurst(t *testing.T) {
 	vupenObsResetForTest(t, 10*time.Millisecond, time.Millisecond)
 	var dials atomic.Int64
-	oldDialer := tagged.Dialer
-	tagged.Dialer = func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
+	setTestDialer(t, func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
 		dials.Add(1)
 		return nil, errors.New("down")
-	}
-	defer func() { tagged.Dialer = oldDialer }()
+	})
 
 	oldInit := VupenObservatoryInitialDelay
 	VupenObservatoryInitialDelay = 10 * time.Millisecond
@@ -60,7 +57,7 @@ func TestVupenObservatoryPauseSkipsInitialBurst(t *testing.T) {
 
 	h := newSleepTestPing()
 	h.StartScheduler(func() ([]string, error) { return []string{"a", "b"}, nil })
-	defer h.StopScheduler()
+	defer quiesce(t, h)
 
 	time.Sleep(150 * time.Millisecond)
 	if n := dials.Load(); n != 0 {
@@ -292,12 +289,10 @@ func TestVupenStaleResumeRunsRoundWithoutWaitingForTick(t *testing.T) {
 	vupenObsResetForTest(t, time.Hour, time.Millisecond)
 
 	var dials atomic.Int64
-	oldDialer := tagged.Dialer
-	tagged.Dialer = func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
+	setTestDialer(t, func(ctx context.Context, d routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
 		dials.Add(1)
 		return nil, errors.New("down")
-	}
-	defer func() { tagged.Dialer = oldDialer }()
+	})
 
 	oldInit := VupenObservatoryInitialDelay
 	VupenObservatoryInitialDelay = 10 * time.Millisecond
@@ -305,7 +300,7 @@ func TestVupenStaleResumeRunsRoundWithoutWaitingForTick(t *testing.T) {
 
 	h := newSleepTestPing() // interval 10s × sampling 1 → окно и тик 10 с
 	h.StartScheduler(func() ([]string, error) { return []string{"a", "b"}, nil })
-	defer h.StopScheduler()
+	defer quiesce(t, h)
 	time.Sleep(200 * time.Millisecond) // стартовая пачка отработала
 
 	base := dials.Load()
