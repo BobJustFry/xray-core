@@ -1,6 +1,9 @@
 package internet
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Vupen (T-075, аудит памяти T-071): кэши транспортов привязаны к outbound'у.
 //
@@ -15,6 +18,11 @@ import "sync"
 // настройки потока, транспорты закрывают и удаляют только записи с ними —
 // соединения работающего ядра (другие указатели) не трогаются.
 
+// VupenStreamReleaseRecheck — второй проход освобождения: соединение, которое
+// outbound начал устанавливать за мгновение до Close (проверку «закрыт» оно уже
+// прошло), создаёт запись в кэше чуть позже первого прохода (T-075, CR-001).
+var VupenStreamReleaseRecheck = 10 * time.Second
+
 var vupenStreamRelease struct {
 	mu sync.Mutex
 	fs []func(*MemoryStreamConfig)
@@ -28,11 +36,17 @@ func VupenRegisterStreamRelease(f func(*MemoryStreamConfig)) {
 	vupenStreamRelease.mu.Unlock()
 }
 
-// VupenReleaseStreamSettings — outbound с этими настройками потока закрыт.
+// VupenReleaseStreamSettings — outbound с этими настройками потока закрыт:
+// освободить сразу и ещё раз через VupenStreamReleaseRecheck.
 func VupenReleaseStreamSettings(ss *MemoryStreamConfig) {
 	if ss == nil {
 		return
 	}
+	vupenReleaseStreamNow(ss)
+	time.AfterFunc(VupenStreamReleaseRecheck, func() { vupenReleaseStreamNow(ss) })
+}
+
+func vupenReleaseStreamNow(ss *MemoryStreamConfig) {
 	vupenStreamRelease.mu.Lock()
 	fs := append([](func(*MemoryStreamConfig)){}, vupenStreamRelease.fs...)
 	vupenStreamRelease.mu.Unlock()

@@ -1,7 +1,9 @@
 package grpc
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -54,4 +56,32 @@ func TestVupenReleaseGRPCOnlyOwnEntries(t *testing.T) {
 	}
 	internet.VupenReleaseStreamSettings(nil) // без паники
 	_ = cb.Close()
+}
+
+// CR-001: запись, созданная после первого прохода освобождения, уходит на втором.
+func TestVupenReleaseGRPCLateEntry(t *testing.T) {
+	old := internet.VupenStreamReleaseRecheck
+	internet.VupenStreamReleaseRecheck = 50 * time.Millisecond
+	t.Cleanup(func() { internet.VupenStreamReleaseRecheck = old })
+	ss := &internet.MemoryStreamConfig{ProtocolName: "grpc", ProtocolSettings: &Config{ServiceName: "late"}}
+	dest := net.TCPDestination(net.LocalHostIP, 1)
+	before := TransportPoolSize()
+	internet.VupenReleaseStreamSettings(ss)
+	client, err := getGrpcClient(context.Background(), dest, ss) // опоздавшее соединение
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := TransportPoolSize(); n != before+1 {
+		t.Fatalf("setup: pool %d, want %d", n, before+1)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for TransportPoolSize() != before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := TransportPoolSize(); n != before {
+		t.Fatalf("the late entry stays: pool %d, want %d", n, before)
+	}
+	if client.GetState() != connectivity.Shutdown {
+		t.Fatalf("late client %v, want shutdown", client.GetState())
+	}
 }

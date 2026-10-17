@@ -305,6 +305,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			m: make(map[dialerConf]*client),
 		}
 		go manager.clean()
+		internet.VupenRegisterStreamRelease(vupenReleaseHysteria) // Vupen (T-075): кэш клиентов — по outbound'у
 	})
 
 	manager.RLock()

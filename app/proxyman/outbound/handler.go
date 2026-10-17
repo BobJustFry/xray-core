@@ -6,6 +6,7 @@ import (
 	goerrors "errors"
 	"io"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/dice"
 
@@ -65,6 +66,10 @@ type Handler struct {
 	udp443          string
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
+	// Vupen (T-075, CR-001): outbound закрыт — новые соединения (и новые
+	// mux-воркеры) не открываются, иначе повторы прокси после Close заново
+	// создавали бы записи в кэшах транспортов.
+	closed atomic.Bool
 }
 
 // NewHandler creates a new Handler based on the given configuration.
@@ -266,6 +271,9 @@ func (h *Handler) DestIpAddress() net.IP {
 
 // Dial implements internet.Dialer.
 func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+	if h.closed.Load() {
+		return nil, errors.New("outbound ", h.tag, " is closed")
+	}
 	if h.senderSettings != nil && h.senderSettings.Via != nil {
 		outbounds := session.OutboundsFromContext(ctx)
 		ob := outbounds[len(outbounds)-1]
@@ -331,6 +339,7 @@ func (h *Handler) Start() error {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
+	h.closed.Store(true)
 	common.Close(h.mux)
 	common.Close(h.xudp) // Vupen (T-075): XUDP-воркеры тоже не переживают outbound
 	common.Close(h.proxy)

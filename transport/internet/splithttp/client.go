@@ -38,6 +38,7 @@ type DefaultDialerClient struct {
 	// pool of net.Conn, created using dialUploadConn
 	uploadRawPool  *sync.Pool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
+	vupenKill      context.CancelFunc // Vupen (T-075): оборвать установление соединений
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {

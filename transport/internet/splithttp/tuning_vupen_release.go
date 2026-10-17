@@ -1,10 +1,10 @@
 package splithttp
 
 import (
+	"context"
 	"net"
 	"time"
 
-	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -18,31 +18,16 @@ func init() { internet.VupenRegisterStreamRelease(vupenReleaseXHTTP) }
 // закрываются, как только освободятся (повторный CloseIdleConnections).
 var VupenXHTTPReleaseRecheck = 10 * time.Second
 
-// vupenOwner — запись для downloadSettings принадлежит outbound'у, чьи
-// настройки потока её создали (ключ у неё — streamSettings.DownloadSettings).
-// Под globalDialerAccess.
-var vupenOwner = map[dialerConf]*internet.MemoryStreamConfig{}
-
-func vupenNoteOwner(dest xnet.Destination, ss, owner *internet.MemoryStreamConfig) {
-	if ss == nil || owner == nil || ss == owner {
-		return
-	}
-	globalDialerAccess.Lock()
-	if _, ok := globalDialerMap[dialerConf{dest, ss}]; ok {
-		vupenOwner[dialerConf{dest, ss}] = owner
-	}
-	globalDialerAccess.Unlock()
-}
-
 func vupenReleaseXHTTP(ss *internet.MemoryStreamConfig) {
 	var closing []XmuxConn
 	globalDialerAccess.Lock()
+	// downloadSettings — свои записи у той же outbound'а (ключ — её настройки).
+	down := ss.DownloadSettings
 	for k, m := range globalDialerMap {
-		if k.MemoryStreamConfig != ss && vupenOwner[k] != ss {
+		if k.MemoryStreamConfig != ss && (down == nil || k.MemoryStreamConfig != down) {
 			continue
 		}
 		delete(globalDialerMap, k)
-		delete(vupenOwner, k)
 		if m == nil {
 			continue
 		}
@@ -66,6 +51,9 @@ func vupenCloseDialerClient(c XmuxConn) {
 		return
 	}
 	d.closed.Store(true)
+	if d.vupenKill != nil {
+		d.vupenKill() // соединения, которые ещё устанавливаются (рукопожатие с молчащим узлом)
+	}
 	_ = d.Close() // HTTP/3
 	if ci, ok := d.client.Transport.(interface{ CloseIdleConnections() }); ok {
 		ci.CloseIdleConnections()
@@ -82,6 +70,16 @@ func vupenCloseDialerClient(c XmuxConn) {
 			}
 		}
 	}
+}
+
+// vupenDialLife — контекст установления соединения, который отменяется и когда
+// закрыт клиент (life). stop — снять связь, когда установление закончилось;
+// сам контекст после этого не отменяем: установленное соединение (и то, что
+// слои под ним могли к нему привязать) живёт, как раньше.
+func vupenDialLife(ctx, life context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	unhook := context.AfterFunc(life, cancel)
+	return ctx, func() { unhook() }
 }
 
 // VupenDialerPoolSize — записей в кэше XHTTP и клиентов в них (диагностика).

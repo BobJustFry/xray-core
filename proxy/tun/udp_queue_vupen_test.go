@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -102,14 +103,14 @@ func TestUDPQueueBytesReleasedOnRemove(t *testing.T) {
 		u.HandlePacket(testSrc(7), testDst(53), pkt)
 	}
 	c := u.testConn(testSrc(7))
-	if got := tunStats.udpQueued.Load() - base; got != 1500 || c.queued.Load() != 1500 {
-		t.Fatalf("queued %d (session %d), want 1500", got, c.queued.Load())
+	if got := tunStats.udpQueued.Load() - base; got != 1500 {
+		t.Fatalf("queued %d, want 1500", got)
 	}
 	u.Lock()
 	u.removeLocked(c)
 	u.Unlock()
-	if got := tunStats.udpQueued.Load() - base; got != 0 || c.queued.Load() != 0 {
-		t.Fatalf("after remove: queued %d (session %d), want 0", got, c.queued.Load())
+	if got := tunStats.udpQueued.Load() - base; got != 0 {
+		t.Fatalf("after remove: queued %d, want 0", got)
 	}
 	if u.testLen() != 0 {
 		t.Fatal("session not removed")
@@ -130,7 +131,63 @@ func TestUDPQueueBytesReleasedOnRead(t *testing.T) {
 	if n, err := c.Read(b); err != nil || n != 100 {
 		t.Fatalf("read %d %v", n, err)
 	}
-	if got := tunStats.udpQueued.Load() - base; got != 0 || c.queued.Load() != 0 {
+	if got := tunStats.udpQueued.Load() - base; got != 0 {
 		t.Fatalf("queued %d after read", got)
 	}
+}
+
+// CR-002: стек TUN закрывается — все сессии убраны, байты их очередей вернулись.
+func TestUDPQueueBytesReleasedOnCloseAll(t *testing.T) {
+	base := settledQueued()
+	u, release := stalledUDPHandler(t, 1024)
+	defer close(release)
+	pkt := make([]byte, 200)
+	for p := uint16(1); p <= 5; p++ {
+		for i := 0; i < 3; i++ {
+			u.HandlePacket(testSrc(p), testDst(443), pkt)
+		}
+	}
+	if got := tunStats.udpQueued.Load() - base; got != 3000 || u.testLen() != 5 {
+		t.Fatalf("setup: queued %d, sessions %d", got, u.testLen())
+	}
+	u.closeAll()
+	if got := tunStats.udpQueued.Load() - base; got != 0 || u.testLen() != 0 {
+		t.Fatalf("after closeAll: queued %d, sessions %d", got, u.testLen())
+	}
+}
+
+// CR-005: запись и чтение параллельно (горутины TUN и outbound-ов) — счётчик
+// сходится к исходному, без гонок (-race).
+func TestUDPQueueBytesParallel(t *testing.T) {
+	base := settledQueued()
+	prevCap, prevConns := atomic.LoadInt32(&udpQueueMaxKB), atomic.LoadInt32(&maxUDPConns)
+	t.Cleanup(func() {
+		atomic.StoreInt32(&udpQueueMaxKB, prevCap)
+		atomic.StoreInt32(&maxUDPConns, prevConns)
+	})
+	SetUDPQueueMaxKB(64)
+	SetMaxUDPConns(64)
+	u := newUdpConnectionHandler(func(conn net.Conn, dest net.Destination) {
+		defer conn.Close()
+		c := conn.(*udpConn)
+		for {
+			if _, err := c.ReadMultiBuffer(); err != nil {
+				return
+			}
+		}
+	}, func(data []byte, src net.Destination, dst net.Destination) error { return nil })
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			pkt := make([]byte, 700)
+			for i := 0; i < 2000; i++ {
+				u.HandlePacket(testSrc(uint16(100+w%4)), testDst(443), pkt)
+			}
+		}(w)
+	}
+	wg.Wait()
+	u.closeAll()
+	waitQueued(t, base)
 }

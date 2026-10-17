@@ -1,11 +1,15 @@
 package splithttp
 
 import (
+	"context"
 	"net"
 	"net/http"
+	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
@@ -21,13 +25,15 @@ func (f *vupenFakeTransport) CloseIdleConnections() { f.idleClosed.Add(1) }
 // Vupen (T-075): закрытый outbound освобождает свои записи XHTTP (и запись
 // downloadSettings), чужие не трогает; клиенты закрываются.
 func TestVupenReleaseXHTTPOnlyOwnEntries(t *testing.T) {
+	// sync.Pool теряет элементы при сборке мусора — на время теста без сборок.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	globalDialerAccess.Lock()
-	saved, savedOwner := globalDialerMap, vupenOwner
-	globalDialerMap, vupenOwner = map[dialerConf]*XmuxManager{}, map[dialerConf]*internet.MemoryStreamConfig{}
+	saved := globalDialerMap
+	globalDialerMap = map[dialerConf]*XmuxManager{}
 	globalDialerAccess.Unlock()
 	t.Cleanup(func() {
 		globalDialerAccess.Lock()
-		globalDialerMap, vupenOwner = saved, savedOwner
+		globalDialerMap = saved
 		globalDialerAccess.Unlock()
 	})
 	mkClient := func() (*DefaultDialerClient, *vupenFakeTransport, net.Conn) {
@@ -53,7 +59,7 @@ func TestVupenReleaseXHTTPOnlyOwnEntries(t *testing.T) {
 	put(down, cd)
 	put(b, cb)
 	globalDialerAccess.Unlock()
-	vupenNoteOwner(dest, down, a) // downloadSettings записи a
+	a.DownloadSettings = down // запись downloadSettings — того же outbound
 
 	if m, c := VupenDialerPoolSize(); m != 3 || c != 3 {
 		t.Fatalf("setup: %d managers, %d clients", m, c)
@@ -70,13 +76,51 @@ func TestVupenReleaseXHTTPOnlyOwnEntries(t *testing.T) {
 		t.Fatalf("CloseIdleConnections: a=%d down=%d b=%d", tra.idleClosed.Load(), trd.idleClosed.Load(), trb.idleClosed.Load())
 	}
 	// Соединение пула выгрузки закрыто: собеседник видит конец.
-	if _, err := peerA.Read(make([]byte, 1)); err == nil {
+	peerA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := peerA.Read(make([]byte, 1)); err == nil || (os.IsTimeout(err) && !vupenRaceEnabled) {
 		t.Fatal("the upload pool connection is still open")
 	}
-	globalDialerAccess.Lock()
-	n := len(vupenOwner)
-	globalDialerAccess.Unlock()
-	if n != 0 {
-		t.Fatalf("owner records left: %d", n)
+}
+
+// CR-001: соединение, начатое за мгновение до Close, создаёт запись уже после
+// первого прохода — второй проход (VupenStreamReleaseRecheck) её убирает.
+func TestVupenReleaseXHTTPLateEntry(t *testing.T) {
+	old := internet.VupenStreamReleaseRecheck
+	internet.VupenStreamReleaseRecheck = 50 * time.Millisecond
+	t.Cleanup(func() { internet.VupenStreamReleaseRecheck = old })
+	ss := &internet.MemoryStreamConfig{ProtocolName: "splithttp", ProtocolSettings: &Config{Path: "/x"}}
+	dest := xnet.TCPDestination(xnet.LocalHostIP, 1)
+	before, _ := VupenDialerPoolSize()
+	internet.VupenReleaseStreamSettings(ss)
+	getHTTPClient(t.Context(), dest, ss) // опоздавшее соединение
+	if m, _ := VupenDialerPoolSize(); m != before+1 {
+		t.Fatalf("setup: %d managers, want %d", m, before+1)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if m, _ := VupenDialerPoolSize(); m == before {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m, _ := VupenDialerPoolSize()
+	t.Fatalf("the late entry stays: %d managers, want %d", m, before)
+}
+
+// CR-001: установление соединения обрывается, когда клиент закрыт; законченное — нет.
+func TestVupenDialLife(t *testing.T) {
+	life, kill := context.WithCancel(context.Background())
+	ctx, stop := vupenDialLife(context.WithoutCancel(t.Context()), life)
+	done, stop2 := vupenDialLife(context.Background(), life)
+	stop2() // это установление уже закончилось
+	kill()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("in-flight dial context not cancelled by the client close")
+	}
+	stop()
+	if done.Err() != nil {
+		t.Fatal("a finished dial context must not be cancelled")
 	}
 }

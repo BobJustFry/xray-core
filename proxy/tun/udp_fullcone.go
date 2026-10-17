@@ -99,6 +99,16 @@ func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
 
 // removeLocked убирает сессию из таблицы и закрывает её очередь: чтение отдаёт
 // io.EOF, outbound доделывает своё и выходит. Вызывать под u.Lock().
+// closeAll — стек TUN закрывается: убрать все сессии (outbound'ы получают конец,
+// байты их очередей возвращаются в общий потолок).
+func (u *udpConnectionHandler) closeAll() {
+	u.Lock()
+	defer u.Unlock()
+	for _, c := range u.udpConns {
+		u.removeLocked(c)
+	}
+}
+
 func (u *udpConnectionHandler) removeLocked(conn *udpConn) {
 	delete(u.udpConns, conn.src)
 	close(conn.egress)
@@ -206,8 +216,6 @@ type udpConn struct {
 	// время последнего пакета в любую сторону, UnixNano.
 	dns        bool
 	lastActive atomic.Int64
-	// Vupen (T-075): байт в очереди этой сессии (часть tunStats.udpQueued).
-	queued atomic.Int64
 }
 
 // enqueue — в очередь сессии, если есть место и в ней, и в общем потолке байт
@@ -223,7 +231,6 @@ func (c *udpConn) enqueue(p *packet) bool {
 	}
 	select {
 	case c.egress <- p:
-		c.queued.Add(n)
 		return true
 	default:
 		tunStats.udpQueued.Add(-n)
@@ -233,9 +240,7 @@ func (c *udpConn) enqueue(p *packet) bool {
 
 // release — пакет ушёл из очереди (прочитан outbound'ом или выброшен при закрытии).
 func (c *udpConn) release(p *packet) {
-	n := int64(len(p.data))
-	c.queued.Add(-n)
-	tunStats.udpQueued.Add(-n)
+	tunStats.udpQueued.Add(-int64(len(p.data)))
 }
 
 func (c *udpConn) touch() {

@@ -40,6 +40,7 @@ type stackGVisor struct {
 	handler     *Handler
 	stack       *stack.Stack
 	endpoint    stack.LinkEndpoint
+	udp         *udpConnectionHandler // Vupen (T-075): закрыть сессии при Close
 }
 
 // NewStack builds new ip stack (using gVisor)
@@ -110,6 +111,7 @@ func (t *stackGVisor) Start() error {
 
 	// Use custom UDP packet handler, instead of strict gVisor forwarder, for FullCone NAT support
 	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket)
+	t.udp = udpForwarder
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 		data := pkt.Clone().Data().AsRange().ToSlice()
 		// if len(data) == 0 {
@@ -211,6 +213,11 @@ func (t *stackGVisor) Close() error {
 	t.stack.Close()
 	for _, endpoint := range t.stack.CleanupEndpoints() {
 		endpoint.Abort()
+	}
+	// Vupen (T-075): стек больше не отдаёт пакеты — убрать UDP-сессии; байты их
+	// очередей возвращаются в общий потолок (он на процесс, ядро может подняться снова).
+	if t.udp != nil {
+		t.udp.closeAll()
 	}
 
 	return nil
