@@ -23,9 +23,9 @@ const VupenAppleDirectRuleTag = "vupen-apple-direct"
 
 var (
 	vupenAppleViaVpnOnLte atomic.Bool
-	// vupenAppleDecision — последнее действующее решение для журнала: 0 — не было,
-	// 1 — напрямую, 2 — через VPN.
-	vupenAppleDecision atomic.Int32
+	// vupenAppleGen — поколение настройки: после её смены каждое ядро снова пишет
+	// своё решение в журнал (CR-103: состояние журнала — у Router).
+	vupenAppleGen atomic.Int64
 )
 
 // VupenSetAppleViaVpnOnLte — настройка «Apple через VPN при белых списках» (на
@@ -34,7 +34,7 @@ func VupenSetAppleViaVpnOnLte(on bool) bool {
 	if vupenAppleViaVpnOnLte.Swap(on) == on {
 		return false
 	}
-	vupenAppleDecision.Store(0)
+	vupenAppleGen.Add(1)
 	state := "off"
 	if on {
 		state = "on"
@@ -53,11 +53,13 @@ func (r *Router) vupenSkipRule(rule *Rule) bool {
 		return false
 	}
 	viaVpn := r.vupenOnLte()
-	d := int32(1)
+	d := vupenAppleGen.Load() * 4 // поколение настройки × решение: 1 — напрямую, 2 — через VPN
 	if viaVpn {
-		d = 2
+		d += 2
+	} else {
+		d++
 	}
-	if vupenAppleDecision.Swap(d) != d {
+	if r.vupenAppleLog.Swap(d) != d {
 		how := "direct"
 		if viaVpn {
 			how = "via VPN (LTE tier)"

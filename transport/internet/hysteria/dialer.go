@@ -258,7 +258,13 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 }
 
 func (c *client) clean() {
-	c.Lock()
+	// Vupen (T-075, CR-101): клиент посреди рукопожатия держит свой замок до
+	// 5–30 с; ждать его здесь под manager.RLock значило бы остановить все Dial
+	// Hysteria в процессе (ожидающий manager.Lock блокирует новые RLock) —
+	// живой туннель замирал на ~3 с на каждый молчащий узел. Занят — следующий тик.
+	if !c.TryLock() {
+		return
+	}
 	if c.status() == StatusInactive {
 		c.close()
 	}

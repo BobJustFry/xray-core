@@ -196,3 +196,29 @@ func TestVupenAppleViaVpnConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// CR-103: решение для журнала — своё у каждого ядра: перелитое и неперелитое не
+// перебивают друг друга.
+func TestVupenAppleDecisionLogPerRouter(t *testing.T) {
+	setAppleViaVpn(t, true)
+	spilled := appleRouter(spilledRig(t), VupenAppleDirectRuleTag)
+	r2 := newSpillRig(t, []string{"cellular"}, []string{"p-1"}, []string{"lte-1"})
+	r2.alive(map[string]int64{"p-1": 10})
+	r2.obs.mu.Lock()
+	r2.obs.verify["p-1"] = vupenStickyOK
+	r2.obs.mu.Unlock()
+	r2.pick()
+	r2.drain()
+	regular := appleRouter(r2, VupenAppleDirectRuleTag)
+	for i := 0; i < 3; i++ {
+		if got := pickTag(t, spilled); got == "direct" {
+			t.Fatalf("spilled router: %q", got)
+		}
+		if got := pickTag(t, regular); got != "direct" {
+			t.Fatalf("regular router: %q", got)
+		}
+	}
+	if s, g := spilled.vupenAppleLog.Load()%4, regular.vupenAppleLog.Load()%4; s != 2 || g != 1 {
+		t.Fatalf("log state spilled=%d regular=%d, want 2 and 1", s, g)
+	}
+}

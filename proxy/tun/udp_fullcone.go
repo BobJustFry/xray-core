@@ -97,8 +97,6 @@ func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
 	u.Unlock()
 }
 
-// removeLocked убирает сессию из таблицы и закрывает её очередь: чтение отдаёт
-// io.EOF, outbound доделывает своё и выходит. Вызывать под u.Lock().
 // closeAll — стек TUN закрывается: убрать все сессии (outbound'ы получают конец,
 // байты их очередей возвращаются в общий потолок).
 func (u *udpConnectionHandler) closeAll() {
@@ -109,6 +107,8 @@ func (u *udpConnectionHandler) closeAll() {
 	}
 }
 
+// removeLocked убирает сессию из таблицы и закрывает её очередь: чтение отдаёт
+// io.EOF, outbound доделывает своё и выходит. Вызывать под u.Lock().
 func (u *udpConnectionHandler) removeLocked(conn *udpConn) {
 	delete(u.udpConns, conn.src)
 	close(conn.egress)

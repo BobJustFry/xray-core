@@ -201,6 +201,8 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			QUICConfig:      quicConfig,
 			TLSClientConfig: gotlsConfig,
 			Dial: func(ctx context.Context, addr string, tlsCfg *gotls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				ctx, stop := vupenDialLife(ctx, life) // Vupen (T-075, CR-106): и для HTTP/3
+				defer stop()
 				var pktConn net.PacketConn
 				var udpAddr *net.UDPAddr
 

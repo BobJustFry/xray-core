@@ -30,6 +30,9 @@ type Router struct {
 
 	// Vupen (ядро 74): в конфиге есть поля АВТО 4.1 (tuning_vupen_netepoch.go).
 	vupenAuto41 atomic.Bool
+	// Vupen (T-079): последнее решение по правилу «Apple напрямую» для журнала
+	// (tuning_vupen_apple.go) — своё у каждого экземпляра ядра.
+	vupenAppleLog atomic.Int64
 }
 
 // Route is an implementation of routing.Route.
