@@ -422,6 +422,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		requestURL2.Path = config2.GetNormalizedPath()
 		requestURL2.RawQuery = config2.GetNormalizedQuery()
 		httpClient2, xmuxClient2 = getHTTPClient(ctx, dest2, memory2)
+		vupenNoteOwner(dest2, memory2, streamSettings) // Vupen (T-075): запись downloadSettings — этого outbound'а
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 

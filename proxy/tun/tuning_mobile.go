@@ -11,6 +11,10 @@ var (
 	// channel is 1024 pointers (~8 KB) per session, and a stalled outbound could
 	// queue 1024 MTU-sized packets per session before dropping (TUN-1).
 	udpEgressDepth int32 = 128
+	// Vupen (T-075, аудит T-071): потолок байт во всех очередях UDP-сессий TUN
+	// вместе. Без него худший случай — сессии × глубина × MTU (192 × 128 × 1,5 КБ
+	// ≈ 37 МБ при зависшем outbound'е) при стене памяти NE около 50 МБ.
+	udpQueueMaxKB int32 = 4096
 )
 
 // SetTCPBufMaxKB sets max TCP RX/TX buffer per connection in kilobytes.
@@ -69,6 +73,21 @@ func SetUDPEgressDepth(n int) {
 	if n > 0 {
 		atomic.StoreInt32(&udpEgressDepth, int32(n))
 	}
+}
+
+// SetUDPQueueMaxKB sets the cap of bytes queued in all TUN UDP sessions together.
+func SetUDPQueueMaxKB(kb int) {
+	if kb > 0 {
+		atomic.StoreInt32(&udpQueueMaxKB, int32(kb))
+	}
+}
+
+func mobileUDPQueueMaxBytes() int64 {
+	kb := atomic.LoadInt32(&udpQueueMaxKB)
+	if kb <= 0 {
+		kb = 4096
+	}
+	return int64(kb) * 1024
 }
 
 func mobileUDPEgressDepth() int {

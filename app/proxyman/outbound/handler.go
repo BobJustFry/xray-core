@@ -332,7 +332,11 @@ func (h *Handler) Start() error {
 // Close implements common.Closable.
 func (h *Handler) Close() error {
 	common.Close(h.mux)
+	common.Close(h.xudp) // Vupen (T-075): XUDP-воркеры тоже не переживают outbound
 	common.Close(h.proxy)
+	// Vupen (T-075): клиенты gRPC/XHTTP этого outbound'а в кэшах транспортов на
+	// весь процесс (transport/internet/tuning_vupen_release.go).
+	internet.VupenReleaseStreamSettings(h.streamSettings)
 	return nil
 }
 

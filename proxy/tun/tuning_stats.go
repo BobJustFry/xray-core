@@ -30,6 +30,8 @@ var tunStats struct {
 	udpCapDrops      atomic.Uint64 // пакетов отброшено по лимиту UDP-сессий
 	udpEvicted       atomic.Uint64 // сессий вытеснено при полной таблице (ядро 72)
 	udpDNSReaped     atomic.Uint64 // DNS-сессий закрыто через udpDNSIdle (ядро 72)
+	udpQueued        atomic.Int64  // байт в очередях всех UDP-сессий (T-075)
+	udpQueueDrops    atomic.Uint64 // пакетов отброшено по потолку байт в очередях (T-075)
 }
 
 var (
@@ -54,7 +56,7 @@ func Stats() string {
 	}
 	tunStackMu.Unlock()
 	return fmt.Sprintf(
-		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d udpEvict=%d dnsReap=%d",
+		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d udpEvict=%d dnsReap=%d udpQ=%dKB udpQDrop=%d",
 		tunStats.readerAlive.Load(),
 		tunStats.readPackets.Load(),
 		tunStats.readErrors.Load(),
@@ -70,6 +72,8 @@ func Stats() string {
 		tunStats.udpCapDrops.Load(),
 		tunStats.udpEvicted.Load(),
 		tunStats.udpDNSReaped.Load(),
+		tunStats.udpQueued.Load()>>10,
+		tunStats.udpQueueDrops.Load(),
 	)
 }
 

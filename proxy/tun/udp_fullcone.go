@@ -47,12 +47,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	conn, found := u.udpConns[src]
 	if found {
 		conn.touch()
-		select {
-		case conn.egress <- &packet{
-			data: data,
-			dest: &dst,
-		}:
-		default:
+		if !conn.enqueue(&packet{data: data, dest: &dst}) {
 			errors.LogDebug(context.Background(), "drop udp with size ", len(data), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full")
 		}
 		u.RUnlock()
@@ -87,12 +82,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 
 	// send packet data to the egress channel, if it has buffer, or discard
-	select {
-	case conn.egress <- &packet{
-		data: data,
-		dest: &dst,
-	}:
-	default:
+	if !conn.enqueue(&packet{data: data, dest: &dst}) {
 		errors.LogDebug(context.Background(), "drop udp with size ", len(data), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full 2")
 	}
 }
@@ -112,6 +102,13 @@ func (u *udpConnectionHandler) connectionFinished(c *udpConn) {
 func (u *udpConnectionHandler) removeLocked(conn *udpConn) {
 	delete(u.udpConns, conn.src)
 	close(conn.egress)
+	// Vupen (T-075): то, что осталось в очереди, outbound уже не прочтёт (он
+	// закончил) или это сессия, молчавшая 5–10 с (вытеснение, DNS), — байты
+	// возвращаются в общий потолок сразу. Чтение после close отдаёт остаток и
+	// конец, так что выбирать вместе с читателем безопасно.
+	for e := range conn.egress {
+		conn.release(e)
+	}
 	tunStats.udpSessions.Store(int32(len(u.udpConns)))
 }
 
@@ -209,6 +206,36 @@ type udpConn struct {
 	// время последнего пакета в любую сторону, UnixNano.
 	dns        bool
 	lastActive atomic.Int64
+	// Vupen (T-075): байт в очереди этой сессии (часть tunStats.udpQueued).
+	queued atomic.Int64
+}
+
+// enqueue — в очередь сессии, если есть место и в ней, и в общем потолке байт
+// (mobileUDPQueueMaxBytes). Звать под u.RLock или u.Lock (очередь не закрыта).
+func (c *udpConn) enqueue(p *packet) bool {
+	n := int64(len(p.data))
+	if tunStats.udpQueued.Add(n) > mobileUDPQueueMaxBytes() {
+		tunStats.udpQueued.Add(-n)
+		if d := tunStats.udpQueueDrops.Add(1); logEvery(d) {
+			errors.LogWarning(context.Background(), "[tun] drop udp: queued bytes cap ", mobileUDPQueueMaxBytes()>>10, " KB (drops ", d, ")")
+		}
+		return false
+	}
+	select {
+	case c.egress <- p:
+		c.queued.Add(n)
+		return true
+	default:
+		tunStats.udpQueued.Add(-n)
+		return false
+	}
+}
+
+// release — пакет ушёл из очереди (прочитан outbound'ом или выброшен при закрытии).
+func (c *udpConn) release(p *packet) {
+	n := int64(len(p.data))
+	c.queued.Add(-n)
+	tunStats.udpQueued.Add(-n)
 }
 
 func (c *udpConn) touch() {
@@ -221,6 +248,7 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if !ok {
 			return nil, io.EOF
 		}
+		c.release(e)
 
 		b := buf.New()
 		if _, err := b.Write(e.data); err != nil {
@@ -240,6 +268,7 @@ func (c *udpConn) Read(p []byte) (int, error) {
 	if !ok {
 		return 0, io.EOF
 	}
+	c.release(e)
 	n := copy(p, e.data)
 	if n != len(e.data) {
 		return 0, io.ErrShortBuffer
