@@ -898,6 +898,10 @@ type vupenAutoJSON struct {
 	Spills         int                  `json:"spills"`
 	Returns        int                  `json:"returns"`
 	SpillBlocked   string               `json:"spillBlocked"`
+	// T-079: настройка «Apple через VPN при белых списках» и действует ли она
+	// сейчас (настройка включена и АВТО перелит в мобильную группу).
+	AppleViaVpnOnLte  bool `json:"appleViaVpnOnLte"`
+	AppleViaVpnActive bool `json:"appleViaVpnActive"`
 }
 
 func vupenMs(t time.Time) int64 {
@@ -927,6 +931,8 @@ func (r *Router) vupenAutoState() vupenAutoJSON {
 		out.Uplink, out.Sig, out.Epoch, out.StableForMs = ni.Kind, ni.Sig, ni.Epoch, ni.StableFor.Milliseconds()
 	}
 	out.PendingClose, out.LastClose = vupenCloseJSON(ni.Pending), vupenCloseJSON(ni.LastClose)
+	out.AppleViaVpnOnLte = VupenAppleViaVpnOnLte()
+	out.AppleViaVpnActive = out.AppleViaVpnOnLte && r != nil && r.vupenOnLte()
 	root, why := r.vupenRoot("")
 	if root == nil {
 		out.Detail = why

@@ -204,7 +204,7 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 	rules := *r.rules.Load()
 
 	for _, rule := range rules {
-		if rule.Apply(ctx) {
+		if !r.vupenSkipRule(rule) && rule.Apply(ctx) { // Vupen (T-079): Apple через VPN на LTE
 			return rule, ctx, nil
 		}
 	}
@@ -217,7 +217,7 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 
 	// Try applying rules again if we have IPs.
 	for _, rule := range rules {
-		if rule.Apply(ctx) {
+		if !r.vupenSkipRule(rule) && rule.Apply(ctx) { // Vupen (T-079): Apple через VPN на LTE
 			return rule, ctx, nil
 		}
 	}
