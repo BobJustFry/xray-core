@@ -2,6 +2,7 @@ package burst
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -22,7 +23,9 @@ import (
 // vupenBurstEpochNow — эпоха сети ядра 74 (подмена в тестах).
 var vupenBurstEpochNow = func() uint64 { return internet.VupenNetState().Epoch }
 
-// vupenMergeCtx — контекст, который отменяется с любым из двух.
+// vupenMergeCtx — контекст, который отменяется с любым из двух; значения (экземпляр ядра,
+// нужный диспетчеру) берутся из a, поэтому a - всегда контекст обсерватории, если контекст
+// идёт в соединения.
 func vupenMergeCtx(a, b context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(a)
 	stop := context.AfterFunc(b, cancel)
@@ -61,6 +64,18 @@ func (o *Observer) VupenStickyProbeCtx(ctx context.Context, tags []string) {
 	o.hp.doCheck(pctx, tags, 0, 1)
 }
 
+// VupenStickyQuickProbeCtx — как VupenStickyQuickProbe, но прерывается и с ctx
+// (ядро 83, T-108, CR-002: быстрый поиск switch бросается при смене сети).
+func (o *Observer) VupenStickyQuickProbeCtx(ctx context.Context, tags []string, timeout time.Duration, deadline time.Time,
+	each func(tag string, rtt time.Duration, ok bool) bool) int {
+	if o.hp == nil {
+		return 0
+	}
+	mctx, cancel := vupenMergeCtx(o.hp.ctx, ctx)
+	defer cancel()
+	return o.vupenQuickProbe(mctx, tags, timeout, deadline, each)
+}
+
 // VupenStickyVerifyCtx — как VupenStickyVerify, но прерывается вместе с ctx; не ставит
 // заморозку при смене сети за время проверки и пока hold() — true (БС).
 func (o *Observer) VupenStickyVerifyCtx(ctx context.Context, tag string, hold func() bool) string {
@@ -70,9 +85,17 @@ func (o *Observer) VupenStickyVerifyCtx(ctx context.Context, tag string, hold fu
 	return o.hp.vupenTspuVerifyNowCtx(ctx, tag, "search", hold, true)
 }
 
-// VupenStickyUnfreezeSince — снять заморозки, поставленные не раньше since (сеть,
-// в которой они поставлены, оказалась БС или кончилась). Возвращает теги.
+// VupenStickyUnfreezeSince — снять заморозки проверки 64 КБ, поставленные не раньше
+// since (сеть, в которой они поставлены, оказалась БС или кончилась). Возвращает теги.
 func (o *Observer) VupenStickyUnfreezeSince(since time.Time) []string {
+	return o.VupenStickyUnfreezeTags(since, nil)
+}
+
+// VupenStickyUnfreezeTags — то же только для узлов из tags (nil — для всех). Ядро 83
+// (T-108, CR-004): снимаются лишь заморозки, поставленные самой проверкой 64 КБ (у
+// них есть frozenAt); исключения по настоящей причине (VupenStickyExcludeFor: провал
+// 24 КБ, heal, сторож) не трогаются, как и узлы чужого пула (например, LTE).
+func (o *Observer) VupenStickyUnfreezeTags(since time.Time, only []string) []string {
 	if o.hp == nil {
 		return nil
 	}
@@ -81,7 +104,10 @@ func (o *Observer) VupenStickyUnfreezeSince(since time.Time) []string {
 	var tags []string
 	h.tspu.mu.Lock()
 	for tag, e := range h.tspu.m {
-		if now.Before(e.frozenUntil) && !e.frozenAt.Before(since) {
+		if only != nil && !slices.Contains(only, tag) {
+			continue
+		}
+		if now.Before(e.frozenUntil) && !e.frozenAt.IsZero() && !e.frozenAt.Before(since) {
 			e.frozenUntil = time.Time{}
 			e.frozenAt = time.Time{}
 			tags = append(tags, tag)

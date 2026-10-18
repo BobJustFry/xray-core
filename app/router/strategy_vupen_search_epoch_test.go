@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/app/observatory/burst"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -21,10 +22,69 @@ type epochObs struct {
 	started  chan string             // какие проверки 64 КБ начались
 	nVerify  int
 	unfreeze []time.Time
+	// T-108 (CR-002/004): проверки 24 КБ и быстрые пробы, висящие до отмены контекста
+	// (или release); пул, для которого запрошено снятие заморозок.
+	blockCheck, blockRoute, blockQuick bool
+	hung                               chan string // что зависло (check | route | quick)
+	release                            chan struct{}
+	unfreezeTags                       [][]string
 }
 
 func newEpochObs(base *stickyFakeObs) *epochObs {
-	return &epochObs{stickyFakeObs: base, started: make(chan string, 32)}
+	return &epochObs{stickyFakeObs: base, started: make(chan string, 32), hung: make(chan string, 32), release: make(chan struct{})}
+}
+
+// hang — висеть, пока не отменят контекст (или не откроют release); так выглядит
+// загрузка, оборванная сменой сети: «провал».
+func (o *epochObs) hang(ctx context.Context, what string) {
+	o.hung <- what
+	select {
+	case <-ctx.Done():
+	case <-o.release:
+	case <-time.After(10 * time.Second):
+	}
+}
+
+// oneShot — взвести блокировку один раз (повторная проверка после отмены уже не виснет).
+func (o *epochObs) oneShot(flag *bool) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	v := *flag
+	*flag = false
+	return v
+}
+
+func (o *epochObs) closeRelease() {
+	select {
+	case <-o.release:
+	default:
+		close(o.release)
+	}
+}
+
+func (o *epochObs) VupenStickyCheckCtx(ctx context.Context, tag string) string {
+	if o.oneShot(&o.blockCheck) {
+		o.hang(ctx, "check")
+		return vupenStickyFailed
+	}
+	return o.VupenStickyCheck(tag)
+}
+
+func (o *epochObs) VupenStickyCheckWithCtx(ctx context.Context, tag string, opt burst.VupenCheckOptions) burst.VupenCheckResult {
+	if o.oneShot(&o.blockRoute) {
+		o.hang(ctx, "route")
+		return burst.VupenCheckResult{Verdict: vupenStickyFailed, Kind: "error", Detail: "cut"}
+	}
+	return o.stickyFakeObs.VupenStickyCheckWith(tag, opt)
+}
+
+func (o *epochObs) VupenStickyQuickProbeCtx(ctx context.Context, tags []string, timeout time.Duration, deadline time.Time,
+	each func(tag string, rtt time.Duration, ok bool) bool) int {
+	if o.oneShot(&o.blockQuick) {
+		o.hang(ctx, "quick")
+		return 0
+	}
+	return o.stickyFakeObs.VupenStickyQuickProbe(tags, timeout, deadline, each)
 }
 
 func (o *epochObs) VupenStickyProbeCtx(ctx context.Context, tags []string) {
@@ -51,6 +111,10 @@ func (o *epochObs) VupenStickyVerifyCtx(ctx context.Context, tag string, hold fu
 }
 
 func (o *epochObs) VupenStickyCheck(tag string) string {
+	if o.oneShot(&o.blockCheck) { // не прерываемая проверка: висит, пока не откроют release
+		o.hang(context.Background(), "check")
+		return vupenStickyFailed
+	}
 	o.mu.Lock()
 	f := o.onCheck
 	o.mu.Unlock()
@@ -60,9 +124,10 @@ func (o *epochObs) VupenStickyCheck(tag string) string {
 	return o.stickyFakeObs.VupenStickyCheck(tag)
 }
 
-func (o *epochObs) VupenStickyUnfreezeSince(since time.Time) []string {
+func (o *epochObs) VupenStickyUnfreezeTags(since time.Time, tags []string) []string {
 	o.mu.Lock()
 	o.unfreeze = append(o.unfreeze, since)
+	o.unfreezeTags = append(o.unfreezeTags, tags)
 	o.mu.Unlock()
 	return []string{"p-x"}
 }
@@ -250,6 +315,7 @@ func TestVupenWhitelistEraUnfreezes(t *testing.T) {
 		t.Fatal("whitelist era not noted")
 	}
 	r.reg.onNetEvent(internet.VupenNetChanged)
+	r.drain() // T-110 (CR-104): снимает обработчик событий, не колбэк
 	if len(eo.unfreeze) != 2 || r.reg.whitelistSince.Load() != 0 {
 		t.Fatalf("unfreeze at the network change: %v", eo.unfreeze)
 	}

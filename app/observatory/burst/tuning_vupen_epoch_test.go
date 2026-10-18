@@ -123,9 +123,11 @@ func TestVupenProbeDropsPreviousNetworkResults(t *testing.T) {
 // CR-003: снять заморозки, поставленные с момента since.
 func TestVupenUnfreezeSince(t *testing.T) {
 	var epoch atomic.Uint64
-	o := epochTestPing(t, &epoch, nil)
+	o := epochTestPing(t, &epoch, suspectProbe(&epoch, false))
 	t0 := time.Now()
-	o.VupenStickyExcludeFor("proxy-1", "test", time.Hour)
+	if got := o.VupenStickyVerifyCtx(context.Background(), "proxy-1", nil); got != VupenStickyFailed {
+		t.Fatalf("verify: %s", got)
+	}
 	if tags := o.VupenStickyUnfreezeSince(t0.Add(time.Hour)); len(tags) != 0 || !o.VupenStickyExcluded("proxy-1") {
 		t.Fatalf("frozen before since stays frozen: %v", tags)
 	}

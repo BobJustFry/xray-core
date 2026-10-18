@@ -128,6 +128,18 @@ func (o *Observer) VupenStickyCheckWith(tag string, opt VupenCheckOptions) Vupen
 	if o.hp == nil {
 		return VupenCheckResult{Verdict: VupenStickyUnknown, Detail: "no observatory"}
 	}
+	return o.VupenStickyCheckWithCtx(o.hp.ctx, tag, opt)
+}
+
+// VupenStickyCheckWithCtx — то же, но проверку можно прервать (ядро 83, T-108, CR-002:
+// смена сети не ждёт загрузки 24 КБ). Прерванная проверка — «не поняли» (unknown), а не
+// провал: оборванная загрузка выглядит как обрыв узла.
+func (o *Observer) VupenStickyCheckWithCtx(ctx context.Context, tag string, opt VupenCheckOptions) VupenCheckResult {
+	if o.hp == nil {
+		return VupenCheckResult{Verdict: VupenStickyUnknown, Detail: "no observatory"}
+	}
+	ctx, cancel := vupenMergeCtx(o.hp.ctx, ctx) // значения контекста ядра - от hp.ctx
+	defer cancel()
 	primary, fallback := opt.URL, opt.FallbackURL
 	if primary == "" {
 		primary, fallback = vupenCheckFiles()
@@ -159,19 +171,22 @@ func (o *Observer) VupenStickyCheckWith(tag string, opt VupenCheckOptions) Vupen
 		return true
 	}
 	limit()
-	res := o.hp.vupenCheckOnce(tag, primary, opt)
-	if res.Verdict == VupenStickyUnknown && fallback != "" && fallback != primary && limit() {
-		fb := o.hp.vupenCheckOnce(tag, fallback, opt)
+	res := o.hp.vupenCheckOnce(ctx, tag, primary, opt)
+	if res.Verdict == VupenStickyUnknown && fallback != "" && fallback != primary && ctx.Err() == nil && limit() {
+		fb := o.hp.vupenCheckOnce(ctx, tag, fallback, opt)
 		fb.Elapsed += res.Elapsed
 		fb.Detail = "fallback after " + res.Detail + ": " + fb.Detail
 		res = fb
 	}
+	if ctx.Err() != nil && o.hp.ctx.Err() == nil {
+		return VupenCheckResult{Verdict: VupenStickyUnknown, Detail: "aborted by the caller (" + res.Detail + ")", Elapsed: res.Elapsed}
+	}
 	return res
 }
 
-func (h *HealthPing) vupenCheckOnce(tag, file string, opt VupenCheckOptions) VupenCheckResult {
-	client := newHTTPClient(h.ctx, h.dispatcher, tag, 0)
-	r := vupenDownloadFB(h.ctx, client, file, opt.Timeout, opt.Stall, opt.FirstByte)
+func (h *HealthPing) vupenCheckOnce(ctx context.Context, tag, file string, opt VupenCheckOptions) VupenCheckResult {
+	client := newHTTPClient(ctx, h.dispatcher, tag, 0)
+	r := vupenDownloadFB(ctx, client, file, opt.Timeout, opt.Stall, opt.FirstByte)
 	v := vupenTspuClassify(r, opt.Bytes)
 	res := VupenCheckResult{Verdict: VupenStickyUnknown, Detail: r.String(), Elapsed: r.elapsed}
 	switch {
@@ -223,7 +238,10 @@ func (o *Observer) VupenStickyExcludeFor(tag, reason string, d time.Duration) {
 	h.tspu.mu.Lock()
 	e := h.tspu.entryLocked(tag)
 	e.frozenUntil = time.Now().Add(d)
-	e.frozenAt = time.Now()
+	// Ядро 83 (T-108, CR-004): явное исключение (провал 24 КБ, heal, сторож) — по
+	// настоящей причине; frozenAt нужен только заморозкам проверки 64 КБ, которые
+	// снимаются с концом БС (VupenStickyUnfreezeTags).
+	e.frozenAt = time.Time{}
 	e.verifiedUntil = time.Time{}
 	h.tspu.mu.Unlock()
 	errors.LogWarning(h.ctx, "[sticky] ", tag, " excluded for ", d, " (", reason, ")")

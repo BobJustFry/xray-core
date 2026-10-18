@@ -56,11 +56,17 @@ func newHTTPClient(ctxv context.Context, dispatcher routing.Dispatcher, handler 
 
 // MeasureDelay returns the delay time of the request to dest
 func (s *pingClient) MeasureDelay(httpMethod string) (time.Duration, error) {
+	return s.MeasureDelayCtx(context.Background(), httpMethod)
+}
+
+// MeasureDelayCtx is MeasureDelay that stops with ctx (core 83: a cancelled search probe
+// must not hold its lane slot until the probe timeout).
+func (s *pingClient) MeasureDelayCtx(ctx context.Context, httpMethod string) (time.Duration, error) {
 	if s.httpClient == nil {
 		panic("pingClient not initialized")
 	}
 
-	req, err := http.NewRequest(httpMethod, s.destination, nil)
+	req, err := http.NewRequestWithContext(ctx, httpMethod, s.destination, nil)
 	if err != nil {
 		return rttFailed, err
 	}

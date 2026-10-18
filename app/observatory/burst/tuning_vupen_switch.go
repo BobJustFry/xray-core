@@ -65,6 +65,14 @@ func (o *Observer) VupenStickyRecent(tags []string, maxAge time.Duration) map[st
 // Итог — сколько узлов ответило.
 func (o *Observer) VupenStickyQuickProbe(tags []string, timeout time.Duration, deadline time.Time,
 	each func(tag string, rtt time.Duration, ok bool) bool) int {
+	if o.hp == nil {
+		return 0
+	}
+	return o.vupenQuickProbe(o.hp.ctx, tags, timeout, deadline, each)
+}
+
+func (o *Observer) vupenQuickProbe(parent context.Context, tags []string, timeout time.Duration, deadline time.Time,
+	each func(tag string, rtt time.Duration, ok bool) bool) int {
 	if o.hp == nil || len(tags) == 0 {
 		return 0
 	}
@@ -75,9 +83,9 @@ func (o *Observer) VupenStickyQuickProbe(tags []string, timeout time.Duration, d
 	var ctx context.Context
 	var cancel context.CancelFunc
 	if deadline.IsZero() {
-		ctx, cancel = context.WithCancel(h.ctx)
+		ctx, cancel = context.WithCancel(parent)
 	} else {
-		ctx, cancel = context.WithDeadline(h.ctx, deadline)
+		ctx, cancel = context.WithDeadline(parent, deadline)
 	}
 	defer cancel()
 	type answer struct {

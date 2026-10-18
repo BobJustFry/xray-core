@@ -276,6 +276,10 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 	}
 	ch := make(chan *rtt, count)
 	timers := make([]*time.Timer, 0, count)
+	// Ядро 83 (T-108, CR-002): пробы живут не дольше раунда и не дольше обсерватории;
+	// отменённый раунд (смена сети) обрывает уже идущие замеры и освобождает слоты полос.
+	pctx, pcancel := vupenMergeCtx(h.ctx, ctx) // значения контекста ядра - от h.ctx
+	defer pcancel()
 	// Vupen (ядро 54): апстрим разбрасывает таймеры по всему окну до следующего
 	// тика, и следующий тик отменяет ещё идущие пробы — последние выборки
 	// каждого окна терялись (за 12 минут ни одного завершённого планового
@@ -287,7 +291,7 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 	for _, tag := range tags {
 		handler := tag
 		client := newPingClient(
-			h.ctx,
+			pctx,
 			h.dispatcher,
 			h.Settings.Destination,
 			h.Settings.Timeout,
@@ -316,12 +320,17 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 					h.lanes.vupenTCPYield(ctx)
 				}
 				errors.LogDebug(h.ctx, "checking ", handler)
-				delay, err := client.MeasureDelay(h.Settings.HttpMethod)
+				delay, err := client.MeasureDelayCtx(pctx, h.Settings.HttpMethod)
 				if err == nil {
 					ch <- &rtt{
 						handler: handler,
 						value:   delay,
 					}
+					return
+				}
+				if pctx.Err() != nil {
+					// Раунд отменён: замер оборван, это не провал узла (ядро 83).
+					ch <- &rtt{handler: handler, value: 0}
 					return
 				}
 				if !h.checkConnectivity() {

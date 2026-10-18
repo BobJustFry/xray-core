@@ -430,7 +430,24 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 		// Рисунок заморозки ТСПУ в check — вердикт сразу, без повтора.
 		resp.Kind, resp.Detail = last.kind, "check: "+last.detail
 	} else {
-		res := ro.VupenStickyCheckWith(tag, q.options())
+		// Ядро 83 (T-108, CR-002): проверка heal бросается при смене сети (результат из
+		// прежней сети ни исключения, ни «ok» не даёт); проверка ставится заново.
+		run := s.beginSearch(vupenNetEpochNow())
+		res := s.checkWithCtx(run, ro, tag, q.options())
+		aborted := res.Verdict != vupenStickyOK && run.aborted()
+		s.endSearch(run)
+		if aborted {
+			select {
+			case <-s.stopCh:
+			default:
+				errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute heal: check of %s aborted, the network changed (epoch %d → %d) → node kept, re-check",
+					s.balancer, tag, run.epoch, vupenNetEpochNow()))
+				s.requestCheck("network changed during heal")
+			}
+			resp.Tried = 1
+			resp.Detail = "the network changed during the check — node kept, re-check queued"
+			return resp
+		}
 		resp.Tried, resp.Kind, resp.Detail = 1, res.Kind, res.Detail
 		switch res.Verdict {
 		case vupenStickyOK:
@@ -554,10 +571,36 @@ func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 		s.setPhase(vupenPhaseSearching) // выдача остаётся prev: он работает, пока новый не проверен
 	}
 	start := time.Now()
-	f := vupenSwitchFind{s: s, obs: obs, ro: ro, deadline: start.Add(VupenSwitchBudget), maxChecks: q.maxSwitches()}
+	// Ядро 83 (T-108, CR-002): switch (до VupenSwitchBudget) бросается при смене сети, как поиск.
+	run := s.beginSearch(vupenNetEpochNow())
+	defer s.endSearch(run)
+	f := vupenSwitchFind{s: s, obs: obs, ro: ro, run: run, deadline: start.Add(VupenSwitchBudget), maxChecks: q.maxSwitches()}
 	recent := ro.VupenStickyRecent(append(append([]string(nil), fresh...), seen...), s.cacheMaxAge())
 	tag, round := f.find(recent, fresh, seen)
 	resp.Tried = f.tried
+	if tag == "" && (f.aborted || (!f.outOfTime && run.aborted())) {
+		if prev != "" {
+			// CR-101 (T-110): рабочий prev был и остаётся — как при прерванном heal: держим его
+			// (фаза Holding, выдача не уходит на запасной), проверку ставим заново.
+			select {
+			case <-s.stopCh:
+			default:
+				errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch: aborted, the network changed (epoch %d → %d, %d checked) → %q kept, re-check",
+					s.balancer, run.epoch, vupenNetEpochNow(), f.tried, prev))
+				s.holdBecause(prev, "switch")
+				s.requestCheck("network changed during the switch")
+			}
+		} else {
+			s.searchAborted("checkRoute switch", "during the switch", run, start, f.tried)
+		}
+		resp.Verdict = vupenRouteUnknown
+		if prev != "" {
+			resp.Detail = "the network changed during the switch — node kept, re-check queued"
+		} else {
+			resp.Detail = "the network changed during the switch — search restarted"
+		}
+		return resp
+	}
 	summary := fmt.Sprintf("%d fresh, %d visited, %d cached alive, %d probed, %d answered, %d checked, %dms",
 		len(fresh), len(seen), f.cached, f.probed, f.answered, f.tried, time.Since(start).Milliseconds())
 	unchecked := f.total - len(f.checked)
@@ -624,11 +667,13 @@ type vupenSwitchFind struct {
 	s         *vupenSticky
 	obs       vupenStickyObservatory
 	ro        vupenStickyRouteObs
+	run       *vupenSearchRun // ядро 83: отмена по смене сети
 	deadline  time.Time
 	maxChecks int
 
 	tried, cached, probed, answered int
 	stop                            bool
+	aborted                         bool // сеть сменилась (run отменён), а не вышел бюджет
 	// CR-002: кончился бюджет (или ядро остановили), а не кандидаты; total —
 	// кандидатов без свежего провала, checked — проверенные 64 КБ или провалившие пробу.
 	outOfTime bool
@@ -750,7 +795,7 @@ func (f *vupenSwitchFind) probeBatch(batch []string, order map[string]time.Durat
 		return found
 	}
 	f.probed += len(toProbe)
-	f.answered += f.ro.VupenStickyQuickProbe(toProbe, 0, f.deadline, func(tag string, _ time.Duration, ok bool) bool {
+	each := func(tag string, _ time.Duration, ok bool) bool {
 		if ok {
 			status[tag] = answered
 		} else {
@@ -765,8 +810,16 @@ func (f *vupenSwitchFind) probeBatch(batch []string, order map[string]time.Durat
 			return f.stop
 		}
 		return walk()
-	})
-	if found == "" && !time.Now().Before(f.deadline) {
+	}
+	if co, isCtx := f.ro.(vupenStickyRouteCtxObs); isCtx {
+		f.answered += co.VupenStickyQuickProbeCtx(f.run.ctx, toProbe, 0, f.deadline, each)
+	} else {
+		f.answered += f.ro.VupenStickyQuickProbe(toProbe, 0, f.deadline, each)
+	}
+	if found == "" && f.run.aborted() {
+		f.aborted, f.stop = true, true
+	}
+	if found == "" && !f.aborted && !time.Now().Before(f.deadline) {
 		f.outOfBudget()
 	}
 	return found
@@ -783,23 +836,42 @@ func (f *vupenSwitchFind) verify(tag string) bool {
 		f.outOfBudget()
 		return false
 	}
+	if f.run.aborted() {
+		f.aborted, f.stop = true, true
+		return false
+	}
 	f.tried++
 	f.markChecked(tag)
 	done := make(chan string, 1)
-	go func() { done <- f.obs.VupenStickyVerify(tag) }()
+	if co, isCtx := f.obs.(vupenStickyCtxObservatory); isCtx {
+		go func() { done <- co.VupenStickyVerifyCtx(f.run.ctx, tag, f.s.whitelistClassNow) }()
+	} else {
+		go func() { done <- f.obs.VupenStickyVerify(tag) }()
+	}
 	t := time.NewTimer(left)
 	defer t.Stop()
 	var v string
 	select {
 	case v = <-done:
 	case <-t.C:
-		// Проверка доходит в фоне (итог запишет обсерватория), switch её не ждёт.
+		// Бюджет switch вышел: endSearch отменяет run.ctx, проверка кончается как «прервана
+		// вызывающим» — Unknown, без отметки «проверен» и без заморозки узла.
 		delete(f.checked, tag)
 		f.outOfBudget()
 		return false
 	case <-f.s.stopCh:
 		delete(f.checked, tag)
 		f.outOfBudget()
+		return false
+	case <-f.run.ctx.Done():
+		delete(f.checked, tag)
+		f.aborted, f.stop = true, true
+		return false
+	}
+	if f.run.aborted() {
+		// Итог из прежней сети: ни успех, ни провал.
+		delete(f.checked, tag)
+		f.aborted, f.stop = true, true
 		return false
 	}
 	if v == vupenStickyOK {

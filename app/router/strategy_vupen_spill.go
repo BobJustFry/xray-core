@@ -297,8 +297,17 @@ func (s *vupenSticky) lteRecheck() {
 	if s.current != "" && slices.Contains(alive, s.current) {
 		alive = append([]string{s.current}, slices.DeleteFunc(alive, func(t string) bool { return t == s.current })...)
 	}
+	// T-110 (CR-103): проверка 24 КБ (до ~6 с) бросается при смене сети, как в checkCurrent:
+	// обработчик не ждёт её, итог из прежней сети ни возврат, ни провал; повтор ставит defer
+	// выше (если перелив остался), а смена сети сама снимает перелив.
+	run := s.beginSearch(vupenNetEpochNow())
+	defer s.endSearch(run)
 	for _, tag := range alive {
-		if obs.VupenStickyCheck(tag) == vupenStickyOK {
+		if v := s.checkCtx(run, obs, tag); v != vupenStickyOK && run.aborted() {
+			errors.LogWarning(s.logCtx(), fmt.Sprintf("[spill] %s: recheck of %s aborted, the network changed (epoch %d → %d)",
+				s.balancer, tag, run.epoch, vupenNetEpochNow()))
+			return
+		} else if v == vupenStickyOK {
 			if s.unspill(tag + " verified") {
 				if sp.stopRecheck != nil {
 					sp.stopRecheck()

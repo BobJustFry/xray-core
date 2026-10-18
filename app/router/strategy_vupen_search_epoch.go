@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xtls/xray-core/app/observatory/burst"
 	"github.com/xtls/xray-core/common/errors"
 )
 
@@ -32,6 +33,31 @@ type vupenStickyCtxObservatory interface {
 type vupenStickyUnfreezer interface {
 	VupenStickyUnfreezeSince(since time.Time) []string
 }
+
+// vupenStickyScopedUnfreezer — то же, но только для узлов пула балансировщика
+// (T-108, CR-004: узлы чужого пула, например LTE, не трогаем).
+type vupenStickyScopedUnfreezer interface {
+	VupenStickyUnfreezeTags(since time.Time, tags []string) []string
+}
+
+// vupenStickyCheckCtxObservatory — проверка 24 КБ, которую можно прервать (T-108, CR-002).
+type vupenStickyCheckCtxObservatory interface {
+	VupenStickyCheckCtx(ctx context.Context, tag string) string
+}
+
+// vupenStickyRouteCtxObs — то же для heal (проверка с параметрами) и быстрых проб switch.
+type vupenStickyRouteCtxObs interface {
+	VupenStickyCheckWithCtx(ctx context.Context, tag string, opt burst.VupenCheckOptions) burst.VupenCheckResult
+	VupenStickyQuickProbeCtx(ctx context.Context, tags []string, timeout time.Duration, deadline time.Time,
+		each func(tag string, rtt time.Duration, ok bool) bool) int
+}
+
+// vupenStickyUnknown — «не поняли» (как burst.VupenStickyUnknown).
+const vupenStickyUnknown = "unknown"
+
+// vupenQueueWaitWarn — дольше этого событие в очереди — аномалия, попадает в журнал
+// предупреждением; обычное ожидание пишется на уровне Debug (T-108, CR-006).
+var vupenQueueWaitWarn = time.Second
 
 // vupenSearchPoll — как часто идущий поиск сверяет эпоху сети сам (дополнительно к
 // событию смены сети).
@@ -62,8 +88,9 @@ func (s *vupenSticky) beginSearch(epoch uint64) *vupenSearchRun {
 	s.searchMu.Lock()
 	s.searchRun = run
 	s.searchMu.Unlock()
+	poll := vupenSearchPoll // читается здесь, не в горутине: тест подменяет его между запусками
 	go func() {
-		t := time.NewTicker(vupenSearchPoll)
+		t := time.NewTicker(poll)
 		defer t.Stop()
 		for {
 			select {
@@ -216,12 +243,44 @@ func (s *vupenSticky) flushDeferred() {
 
 // ── журнал очереди ──────────────────────────────────────────────────────────
 
+// noteDequeued — журнал ожидания в очереди: обычное событие — Debug (строка на каждое
+// событие засоряла журнал), только затянувшееся (>= vupenQueueWaitWarn) — Warning.
 func (s *vupenSticky) noteDequeued(ev vupenStickyEvent) {
 	if ev.at.IsZero() {
 		return
 	}
-	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: event %s (%s) waited %s in the queue, epoch %d, uplink %s",
-		s.balancer, ev.kind, ev.reason, time.Since(ev.at).Round(time.Millisecond), vupenNetEpochNow(), vupenUplinkKind()))
+	waited := time.Since(ev.at)
+	msg := fmt.Sprintf("[sticky] %s: event %s (%s) waited %s in the queue, epoch %d, uplink %s",
+		s.balancer, ev.kind, ev.reason, waited.Round(time.Millisecond), vupenNetEpochNow(), vupenUplinkKind())
+	if waited >= vupenQueueWaitWarn {
+		errors.LogWarning(s.logCtx(), msg)
+		return
+	}
+	errors.LogDebug(s.logCtx(), msg)
+}
+
+// checkCtx — проверка 24 КБ, прерываемая вместе с run; прервана — unknown.
+func (s *vupenSticky) checkCtx(run *vupenSearchRun, obs vupenStickyObservatory, tag string) string {
+	if co, ok := obs.(vupenStickyCheckCtxObservatory); ok {
+		return co.VupenStickyCheckCtx(run.ctx, tag)
+	}
+	v, ok := vupenUntil(run.ctx, func() string { return obs.VupenStickyCheck(tag) })
+	if !ok {
+		return vupenStickyUnknown
+	}
+	return v
+}
+
+// checkWithCtx — то же с параметрами (heal); прервана — unknown.
+func (s *vupenSticky) checkWithCtx(run *vupenSearchRun, ro vupenStickyRouteObs, tag string, opt burst.VupenCheckOptions) burst.VupenCheckResult {
+	if co, ok := ro.(vupenStickyRouteCtxObs); ok {
+		return co.VupenStickyCheckWithCtx(run.ctx, tag, opt)
+	}
+	res, ok := vupenUntil(run.ctx, func() burst.VupenCheckResult { return ro.VupenStickyCheckWith(tag, opt) })
+	if !ok {
+		return burst.VupenCheckResult{Verdict: vupenStickyUnknown, Detail: "aborted"}
+	}
+	return res
 }
 
 // ── заморозки БС ────────────────────────────────────────────────────────────
@@ -241,8 +300,30 @@ func (s *vupenSticky) noteWhitelist() {
 
 // unfreezeWhitelistEra — БС кончилась или сеть сменилась: узлы, замороженные за время
 // БС (и поиском, начатым до неё), снова годятся.
+//
+// Вызывается только из обработчика событий: снимок пула (SelectOutbounds) и обращение к
+// обсерватории не должны блокировать колбэк смены сети (см. queueUnfreezeWhitelistEra).
 func (s *vupenSticky) unfreezeWhitelistEra(why string) {
+	s.unfreezeEraSince(s.whitelistSince.Swap(0), why)
+}
+
+// queueUnfreezeWhitelistEra — то же из onNetEvent (горутина VupenSetUplink / таймера, колбэки
+// не должны блокироваться): здесь только атомарно забираем отметку эпохи БС и ставим событие
+// в очередь, снятие заморозок выполнит обработчик (T-110, CR-104). Очередь полна — отметка
+// возвращается (если новой БС за это время не было) и снимется при следующем случае.
+// Крайний случай: пока очередь полна, старые заморозки остаются до следующей эры БС или
+// смены сети (приемлемо: узлы всё равно перепроверяются, поведение не меняется).
+func (s *vupenSticky) queueUnfreezeWhitelistEra(why string) {
 	ns := s.whitelistSince.Swap(0)
+	if ns == 0 {
+		return
+	}
+	if !s.send(vupenStickyEvent{kind: "unfreeze-era", reason: why, eraSince: ns}) {
+		s.whitelistSince.CompareAndSwap(0, ns)
+	}
+}
+
+func (s *vupenSticky) unfreezeEraSince(ns int64, why string) {
 	if ns == 0 {
 		return
 	}
@@ -250,9 +331,22 @@ func (s *vupenSticky) unfreezeWhitelistEra(why string) {
 	if obs == nil {
 		return
 	}
-	if u, ok := obs.(vupenStickyUnfreezer); ok {
-		if tags := u.VupenStickyUnfreezeSince(time.Unix(0, ns)); len(tags) > 0 {
-			errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": unfroze ", tags, " (frozen during the whitelist era; ", why, ")")
+	// T-108, CR-004: только заморозки проверки 64 КБ (она, а не исключения по настоящей
+	// причине, ставит frozenAt) и только узлы пула этого балансировщика. Начало эпохи —
+	// смена сети, а не момент, когда БС определена: проверки поиска, шедшие во время
+	// определения класса, замораживали узлы раньше момента определения.
+	var tags []string
+	switch u := obs.(type) {
+	case vupenStickyScopedUnfreezer:
+		cands, err := s.b.SelectOutbounds()
+		if err != nil || len(cands) == 0 {
+			return
 		}
+		tags = u.VupenStickyUnfreezeTags(time.Unix(0, ns), cands)
+	case vupenStickyUnfreezer:
+		tags = u.VupenStickyUnfreezeSince(time.Unix(0, ns))
+	}
+	if len(tags) > 0 {
+		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": unfroze ", tags, " (frozen during the whitelist era; ", why, ")")
 	}
 }

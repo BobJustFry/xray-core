@@ -127,6 +127,8 @@ type vupenStickyEvent struct {
 	kind   string // start | check | search | retry | net-stable | current-excluded | wake | sleep | heal …
 	reason string
 	heal   *vupenHealReq // kind "heal" (ядро 78, VupenCheckRoute heal; ядро 79 — и switch)
+	// Ядро 83 (T-110, CR-104): kind "unfreeze-era" — начало эпохи БС (UnixNano), заморозки с него снять.
+	eraSince int64
 	// Ядро 83 (T-102): когда событие поставлено в очередь - для журнала ожидания.
 	at time.Time
 }
@@ -343,14 +345,16 @@ func (s *vupenSticky) onNetEvent(ev internet.VupenNetEvent) {
 		s.signals.netChangedAt = vupenStickyNow()
 		s.signals.fails = nil
 		s.signals.mu.Unlock()
+		// Ядро 83 (CR-003): заморозки, поставленные в сети-БС, больше не действуют. T-110
+		// (CR-104): колбэк не блокируется — снимет обработчик; событие ставится первым, до
+		// netClassOnChanged/net-changed, чтобы отложенные поиски уже не видели старых заморозок.
+		s.queueUnfreezeWhitelistEra("network changed")
 		s.visitedReset.Store(true)                                 // ядро 79: перебор switch — заново
 		s.setReport(func(r *vupenStickyReport) { r.network = "" }) // ядро 78: сеть новая — не проверена
 		s.netClassOnChanged()                                      // ядро 82: класс сети — заново
 		// Ядро 83 (CR-001): идущий поиск прежней сети бросить — после netClassOnChanged,
 		// чтобы повтор поиска уже видел «класс определяется».
 		s.cancelSearch()
-		// Ядро 83 (CR-003): заморозки, поставленные в сети-БС, больше не действуют.
-		s.unfreezeWhitelistEra("network changed")
 		// Ядро 77: сменилась сеть — вердикт «обычный мёртв» сброшен сразу:
 		// новые соединения идут в REG (R4, D-12).
 		if s.unspill("network changed") {
@@ -546,6 +550,8 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 			// проверить так и не проверенный узел.
 			s.requestCheck("after whitelist spill")
 		}
+	case "unfreeze-era":
+		s.unfreezeEraSince(ev.eraSince, ev.reason)
 	case "net-changed":
 		s.onUnspilledByNetwork()
 	case "lte-recheck":
@@ -607,16 +613,27 @@ func (s *vupenSticky) checkCurrent(tag, reason string) (requeued bool) {
 	if obs == nil || tag == "" {
 		return false
 	}
+	// Ядро 83 (T-108, CR-002): загрузка 24 КБ (до ~6 с, с запасным файлом дольше) бросается
+	// при смене сети, как и поиск: обработчик не ждёт её, оборванная загрузка не провал.
 	epoch := vupenNetEpochNow()
-	verdict := obs.VupenStickyCheck(tag)
-	if reason == "start" {
+	run := s.beginSearch(epoch)
+	verdict := s.checkCtx(run, obs, tag)
+	aborted := verdict != vupenStickyOK && run.aborted()
+	s.endSearch(run)
+	if reason == "start" && !aborted {
 		s.setReport(func(r *vupenStickyReport) { r.startVerdict = verdict })
 	}
-	if now := vupenNetEpochNow(); verdict == vupenStickyFailed && now != epoch {
-		// Ядро 83 (CR-003): провал в другой сети, чем та, где проверка началась, —
-		// не повод исключать узел на 15 минут. Проверить заново, когда класс сети известен.
-		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: %s %s check failed, but the network changed during it (epoch %d → %d) → not excluded, re-check",
-			s.balancer, reason, tag, epoch, now))
+	if aborted {
+		// Ядро 83 (CR-003, T-108 CR-002): проверка прервана или провалилась в другой сети, чем
+		// та, где началась, — не повод исключать узел на 15 минут. Проверить заново, когда
+		// класс сети известен.
+		select {
+		case <-s.stopCh:
+			return false
+		default:
+		}
+		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: %s %s check %s, but the network changed during it (epoch %d → %d) → not excluded, re-check",
+			s.balancer, reason, tag, verdict, epoch, vupenNetEpochNow()))
 		s.hold(tag)
 		s.checkPending.Store(true) // повтор — тоже «проверка в очереди»: сигналы не плодят вторую
 		if !s.send(vupenStickyEvent{kind: "check", reason: "network changed during the check"}) {
@@ -730,11 +747,10 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 		}
 		if verdict == vupenStickyOK {
 			from := s.current
-			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q)",
-				s.balancer, reason, len(pool), len(alive), tag, from))
+			// T-108, CR-006: итог поиска — одна строка (раньше две: «switch» и «search end»).
+			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q; epoch %d, uplink %s, ran %s)",
+				s.balancer, reason, len(pool), len(alive), tag, from, run.epoch, vupenUplinkKind(), time.Since(started).Round(time.Millisecond)))
 			s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
-			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search end (%s): epoch %d, uplink %s, ran %s, %s verified",
-				s.balancer, reason, run.epoch, vupenUplinkKind(), time.Since(started).Round(time.Millisecond), tag))
 			s.holdBecause(tag, "search")
 			return i + 1
 		}
@@ -743,10 +759,8 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 			r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "verify", detail: tag}
 		})
 	}
-	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %d checked → nothing works",
-		s.balancer, reason, len(pool), len(alive), len(picks)))
-	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search end (%s): epoch %d, uplink %s, ran %s, nothing works",
-		s.balancer, reason, run.epoch, vupenUplinkKind(), time.Since(started).Round(time.Millisecond)))
+	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %d checked → nothing works (epoch %d, uplink %s, ran %s)",
+		s.balancer, reason, len(pool), len(alive), len(picks), run.epoch, vupenUplinkKind(), time.Since(started).Round(time.Millisecond)))
 	s.setPhase(vupenPhaseNoWorking)
 	s.publish(s.fallbackPick(cands))
 	// Ядро 77: на сотовой — перелив в LTE (если можно); иначе — повтор по графику.

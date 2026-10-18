@@ -77,12 +77,14 @@ func (o *Observer) VupenStickyProbe(tags []string) {
 
 // VupenStickyVerify — проверка загрузкой 64 КБ (ядро 71) синхронно; итог тот же,
 // что у проверки ядра 71: прошёл — «проверен», заморозка подтвердилась — узел
-// исключён на VupenTspuFrozenFor.
+// исключён на VupenTspuFrozenFor. Ядро 83 (T-108, CR-005): с защитой от смены сети —
+// проверка, прошедшая через неё, заморозку не ставит (так что брошенная вызывающим
+// проверка, дожившая в фоне, не замораживает узел уже после того, как её бросили).
 func (o *Observer) VupenStickyVerify(tag string) string {
 	if o.hp == nil {
 		return VupenStickyUnknown
 	}
-	return o.hp.vupenTspuVerifyNow(tag, "search")
+	return o.hp.vupenTspuVerifyNowCtx(o.hp.ctx, tag, "search", nil, true)
 }
 
 // VupenStickyCheck — загрузка 24 КБ через узел tag мимо правил маршрутизации
@@ -91,7 +93,16 @@ func (o *Observer) VupenStickyCheck(tag string) string {
 	if o.hp == nil {
 		return VupenStickyUnknown
 	}
-	r := o.VupenStickyCheckWith(tag, VupenCheckOptions{})
+	return o.VupenStickyCheckCtx(o.hp.ctx, tag)
+}
+
+// VupenStickyCheckCtx — то же, но прерывается вместе с ctx (ядро 83, T-108, CR-002):
+// прерванная проверка — unknown, провалом не считается.
+func (o *Observer) VupenStickyCheckCtx(ctx context.Context, tag string) string {
+	if o.hp == nil {
+		return VupenStickyUnknown
+	}
+	r := o.VupenStickyCheckWithCtx(ctx, tag, VupenCheckOptions{})
 	errors.LogWarning(o.hp.ctx, fmt.Sprintf("[sticky] check %s: %s (%s)", tag, r.Verdict, r.Detail))
 	return r.Verdict
 }
@@ -212,14 +223,9 @@ func vupenDirectDialer(ohm outbound.Manager) (vupenDialer, string) {
 	return nil, ""
 }
 
-// vupenTspuVerifyNow — проверка 64 КБ синхронно; итог — этой проверки, а не
+// vupenTspuVerifyNowCtx — проверка 64 КБ синхронно; итог — этой проверки, а не
 // прежней отметки «проверен». Если узел уже проверяется (ядро 71 заказало
-// проверку), ждём её и берём её итог, второй раз не качаем.
-func (h *HealthPing) vupenTspuVerifyNow(tag, reason string) string {
-	return h.vupenTspuVerifyNowCtx(h.ctx, tag, reason, nil, false)
-}
-
-// vupenTspuVerifyNowCtx — то же с контекстом вызывающего и защитой от смены сети
+// проверку), ждём её и берём её итог, второй раз не качаем. С контекстом вызывающего и защитой от смены сети
 // (guard, ядро 83: см. vupenTspuVerifyCtx).
 func (h *HealthPing) vupenTspuVerifyNowCtx(ctx context.Context, tag, reason string, hold func() bool, guard bool) string {
 	waited := false
