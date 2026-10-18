@@ -668,9 +668,10 @@ func TestVupenNetClassIsPerNetworkEpoch(t *testing.T) {
 	}
 }
 
-// Проверка текущего провалилась, платформа говорит «сеть есть», а прямые адреса молчат:
-// узел не виноват — не исключаем и не ищем.
-func TestVupenNetClassFailedCheckWithoutNetworkKeepsNode(t *testing.T) {
+// CR-006: проверка текущего провалилась, устройство подтвердило сеть (devNet up), а
+// прямые адреса молчат — «нет сети» от пробы не перекрывает проверку устройства:
+// узел исключается и поиск идёт как раньше.
+func TestVupenNetClassNoNetworkDoesNotOverrideDeviceNetworkUp(t *testing.T) {
 	f := installNetClassFake(t)
 	r := newSpillRig(t, []string{"cellular"}, []string{"p-1", "p-2"}, []string{"lte-1"})
 	r.alive(map[string]int64{"p-1": 10, "p-2": 20})
@@ -689,8 +690,30 @@ func TestVupenNetClassFailedCheckWithoutNetworkKeepsNode(t *testing.T) {
 	r.obs.mu.Unlock()
 	r.reg.requestCheck("signal freeze")
 	r.drain()
+	if !r.obs.excluded["p-1"] || !ncRegSearched(r) {
+		t.Fatalf("device network is up: the failed node is excluded and REG searched (excl=%v probes=%v)", r.obs.excluded, r.obs.probes)
+	}
+	r.expectHolding(t, "p-2")
+}
+
+// Контроль: устройство говорит «сети нет» — узел не трогаем, как раньше.
+func TestVupenNetClassDeviceNetworkDownKeepsNode(t *testing.T) {
+	f := installNetClassFake(t)
+	r := newSpillRig(t, []string{"cellular"}, []string{"p-1", "p-2"}, []string{"lte-1"})
+	r.alive(map[string]int64{"p-1": 10, "p-2": 20})
+	r.reg.initial = "p-1"
+	r.pick()
+	r.drain()
+	f.down()
+	r.clock.Advance(time.Minute)
+	r.obs.mu.Lock()
+	r.obs.check["p-1"] = vupenStickyFailed
+	r.obs.network = vupenNetDown
+	r.obs.mu.Unlock()
+	r.reg.requestCheck("signal freeze")
+	r.drain()
 	if ncRegExcluded(r) || ncRegSearched(r) {
-		t.Fatalf("nothing answers: the node is not at fault (excl=%v probes=%v)", r.obs.excluded, r.obs.probes)
+		t.Fatalf("no device network: node untouched (excl=%v)", r.obs.excluded)
 	}
 	r.expectHolding(t, "p-1")
 }

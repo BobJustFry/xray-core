@@ -497,9 +497,15 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 			s.search("retry")
 		}
 	case "net-stable":
-		if s.getPhase() == vupenPhaseNoWorking && !s.spilledNow() {
+		switch {
+		case s.getPhase() == vupenPhaseNoWorking && !s.spilledNow():
+			s.netClassForgetNoNetwork() // CR-002: замер при подъёме сети не мешает поиску
 			s.retryIdx = 0
 			s.search("network settled")
+		case s.getPhase() == vupenPhaseChecking && !s.spilledNow():
+			// CR-001: старт прошёл при БС (проверка пропущена), перелив снят сменой сети —
+			// проверить так и не проверенный узел.
+			s.requestCheck("after whitelist spill")
 		}
 	case "net-changed":
 		s.onUnspilledByNetwork()
@@ -584,14 +590,14 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 	case vupenNetUp:
 		// Ядро 82: прежде чем винить узел — не БС и не обрыв сети ли (один повторный
 		// прямой замер, не чаще VupenNetClassMinGap).
-		if s.netClassGate(reason + ": " + tag + " failed") {
+		if s.netClassGate(reason+": "+tag+" failed", true) {
 			s.hold(tag)
 			return
 		}
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
 			" check failed (net ok) → excluded 15m, search ", s.balancer)
 		obs.VupenStickyExclude(tag, "24 KB check failed ("+reason+")")
-		s.search(reason + ": " + tag + " failed")
+		s.searchN(reason+": "+tag+" failed", VupenStickySearchMaxChecks) // вентиль уже прошли
 	case vupenNetDown:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
 			" check failed, but the device has no network → keep")
@@ -606,7 +612,7 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 // search — поиск по пулу: пробы → порядок стратегии → до N проверок 64 КБ.
 func (s *vupenSticky) search(reason string) {
 	// Ядро 82: БС — перелив без поиска; нет сети — без поиска и смены узла.
-	if s.netClassGate(reason) {
+	if s.netClassGate(reason, false) {
 		return
 	}
 	s.searchN(reason, VupenStickySearchMaxChecks)

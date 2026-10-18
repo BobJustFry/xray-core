@@ -104,8 +104,26 @@ type vupenNetClassState struct {
 
 // vupenDirectConnect — прямое TCP-соединение (процесс не в туннеле); viaTunnel —
 // локальный адрес сокета принадлежит интерфейсу туннеля.
+//
+// Тот же путь, что у узлов (CR-005): обычный net.Dialer + внешние контроллеры сокета
+// из internet.Controllers (на Android это protect/bind платформы, если приложение
+// его зарегистрировало). Сам internet.DialSystem не берём: он ещё записывает
+// соединение в учёт эпохи сети и сторожа заморозки — пробе это не нужно.
 func vupenDirectConnect(ctx context.Context, hostport string) (viaTunnel bool, err error) {
-	var d net.Dialer
+	d := net.Dialer{Timeout: VupenNetClassTimeout}
+	internet.ControllersLock.Lock()
+	ctls := append([]func(network, address string, c syscall.RawConn) error(nil), internet.Controllers...)
+	internet.ControllersLock.Unlock()
+	if len(ctls) > 0 {
+		d.Control = func(network, address string, c syscall.RawConn) error {
+			for _, ctl := range ctls {
+				if err := ctl(network, address, c); err != nil {
+					xerrors.LogInfoInner(ctx, err, "[netclass] failed to apply external controller")
+				}
+			}
+			return nil
+		}
+	}
 	c, err := d.DialContext(ctx, "tcp", hostport)
 	if err != nil {
 		return false, err
@@ -190,7 +208,7 @@ func vupenNetClassRun() vupenNetClassResult {
 			ch <- out{i, tun, err}
 		}()
 	}
-	var foreignOK, yandexOK, tunnel, local, failed int
+	var foreignOK, foreignFail, yandexOK, tunnel, local int
 	done := false
 	for n := 0; n < len(all) && !done; n++ {
 		o := <-ch
@@ -201,7 +219,9 @@ func vupenNetClassRun() vupenNetClassResult {
 			local++
 		case o.err != nil:
 			h.state = "fail"
-			failed++
+			if h.foreign {
+				foreignFail++
+			}
 		case o.tunnel:
 			h.state = "tunnel"
 			tunnel++
@@ -220,10 +240,14 @@ func vupenNetClassRun() vupenNetClassResult {
 		res.class = vupenNetClassUnknown
 	case foreignOK > 0:
 		res.class = vupenNetClassNormal
-	case local > 0 && yandexOK == 0 && failed == 0:
-		res.class = vupenNetClassUnknown // везде локальная ошибка сокета
+	case local > 0:
+		// Локальная ошибка сокета (нет дескрипторов, нет прав) — не ответ сети: ни «БС»,
+		// ни «нет сети» из такого замера не вывести (CR-004).
+		res.class = vupenNetClassUnknown
+	case yandexOK > 0 && foreignFail == len(VupenNetClassForeign):
+		res.class = vupenNetClassWhitelist // БС — только при трёх настоящих отказах
 	case yandexOK > 0:
-		res.class = vupenNetClassWhitelist
+		res.class = vupenNetClassUnknown
 	default:
 		res.class = vupenNetClassNoNetwork
 	}
@@ -296,7 +320,11 @@ func (s *vupenSticky) netClassFresh(reason string) string {
 
 // netClassGate — перед автоматическим поиском по REG: true — поиск не нужен
 // (БС: перелито; нет сети: узел не виноват). Остальное — false, всё как раньше.
-func (s *vupenSticky) netClassGate(reason string) bool {
+//
+// devNetUp — платформа/обсерватория только что подтвердила рабочую сеть устройства:
+// тогда «нет сети» от прямой пробы ничего не решает (неокончательный замер) и считается
+// unknown (CR-006).
+func (s *vupenSticky) netClassGate(reason string, devNetUp bool) bool {
 	switch s.netClassFresh(reason) {
 	case vupenNetClassWhitelist:
 		if s.spillWhitelist(reason) {
@@ -304,12 +332,17 @@ func (s *vupenSticky) netClassGate(reason string) bool {
 			return true
 		}
 	case vupenNetClassNoNetwork:
+		if devNetUp {
+			xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": direct probe says no network, but the device network check is up — treated as unknown (", reason, ")")
+			return false
+		}
 		xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": no network — search and node change skipped (", reason, ")")
 		if s.getPhase() != vupenPhaseHolding {
-			// Узла нет и искать нечем: «ничего не работает» — повтор по графику и по
-			// событию сети (net-stable); новая проверка — не чаще VupenNetClassMinGap.
+			// Узла нет и искать нечем: «ничего не работает» — повтор с растущей паузой
+			// (30 с, 1, 2, 5 мин: CR-003, без вечных замеров на батарее); быстрый выход —
+			// по событию сети (net-stable). Новая проверка — не чаще VupenNetClassMinGap.
 			s.setPhase(vupenPhaseNoWorking)
-			s.scheduleRetry(false)
+			s.scheduleRetry(true)
 		}
 		return true
 	}
@@ -354,12 +387,32 @@ func (s *vupenSticky) runNetClass(reason string) {
 			return
 		}
 	}
+	prev, _ := s.netClassNow()
 	switch s.netClassProbe(reason) {
 	case vupenNetClassWhitelist:
 		s.spillWhitelist(reason)
 	case vupenNetClassNormal:
-		s.whitelistEnded(reason)
+		if s.whitelistEnded(reason) {
+			return
+		}
+		// CR-002: сеть была «нет сети» (замер в момент подъёма сети), теперь есть, а узла
+		// нет — не ждать график повторов.
+		if prev == vupenNetClassNoNetwork && s.getPhase() == vupenPhaseNoWorking && !s.spilledNow() {
+			s.retryIdx = 0
+			s.search("network is back")
+		}
 	}
+}
+
+// netClassForgetNoNetwork — окончательное событие сети (net-stable): замер «нет сети»,
+// сделанный в момент подъёма сети, не считается (CR-002), следующий вопрос — новая проба.
+func (s *vupenSticky) netClassForgetNoNetwork() {
+	c := &s.netcls
+	c.mu.Lock()
+	if c.class == vupenNetClassNoNetwork {
+		c.class = ""
+	}
+	c.mu.Unlock()
 }
 
 // whitelistEnded — иностранные снова отвечают. Если перелив был из-за БС: вернуть
@@ -378,6 +431,12 @@ func (s *vupenSticky) whitelistEnded(reason string) bool {
 	}
 	s.closeLTEConns()
 	s.retryIdx = 0
+	if s.getPhase() == vupenPhaseChecking {
+		// CR-001: на старте при БС текущий узел так и не проверили — проверяем сейчас
+		// (отказ приведёт к поиску там же).
+		s.requestCheck("after whitelist spill")
+		return true
+	}
 	s.search("whitelist ended")
 	return true
 }
