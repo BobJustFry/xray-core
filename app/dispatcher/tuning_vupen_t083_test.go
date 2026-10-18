@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/quic"
@@ -20,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/pipe"
 )
 
 // Vupen (T-083): S0, S3, S4, S7. T-087: review fixes CR-001..008.
@@ -323,6 +325,10 @@ func TestVupenRouteMemoryNotLeakedIntoNestedDispatch(t *testing.T) {
 	if _, ok := d.vupenRouteRecall(seen[0], t083Dst); ok {
 		t.Fatal("a routed ctx must not recall again")
 	}
+	// CR-101: вложенный диспатч (ушёл в direct) не перезаписал внешний маршрут.
+	if got := d.vupenRoutes.get(vupenRouteKey(ctx, t083Dst), time.Now()); got != "proxy-3" {
+		t.Fatalf("remembered route after nested dispatch = %q, want proxy-3 (outer route overwritten)", got)
+	}
 }
 
 // CR-002/CR-004: память — только если снифф не дал имени и адрес не из FakeDNS.
@@ -378,6 +384,15 @@ func TestVupenRouteForcedTagBeatsMemory(t *testing.T) {
 	d.routedDispatch(rctx, &transport.Link{}, t083Dst)
 	if viaForced != 1 || viaMem != 0 {
 		t.Fatalf("forced=%d memory=%d", viaForced, viaMem)
+	}
+	// CR-103: платформенный тег не решение маршрутизации — не запоминается.
+	fctx := session.SetForcedOutboundTagToContext(t083CtxTo(50121, t083Dst, true), "forced")
+	d.routedDispatch(fctx, &transport.Link{}, t083Dst)
+	if viaForced != 2 {
+		t.Fatalf("forced handler calls = %d, want 2", viaForced)
+	}
+	if got := d.vupenRoutes.get(vupenRouteKey(fctx, t083Dst), time.Now()); got != "" {
+		t.Fatalf("a platform-forced tag was remembered: %q", got)
 	}
 }
 
@@ -525,5 +540,103 @@ func TestVupenQUICNotQUICBySentinel(t *testing.T) {
 		if got := session.ContentFromContext(ctx).Attribute(vupenQUICLastAttr); got != c.want {
 			t.Fatalf("%v → %q, want %q", c.err, got, c.want)
 		}
+	}
+}
+
+// ── T-089: CR-102 — recall after sniff in Dispatch / DispatchLink ───────────
+
+// t089ClientHello — ClientHello (как t083ClientHelloNoSNI), но с SNI, если name != "".
+func t089ClientHello(name string) []byte {
+	body := append([]byte{0x03, 0x03}, make([]byte, 32)...)
+	body = append(body, 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00)
+	var ext []byte
+	if name != "" {
+		n := len(name)
+		ext = append(ext, 0x00, 0x00, byte((n+5)>>8), byte(n+5), byte((n+3)>>8), byte(n+3), 0x00, byte(n>>8), byte(n))
+		ext = append(ext, name...)
+	}
+	ext = append(ext, 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04)
+	pad := make([]byte, 1400)
+	ext = append(ext, 0xfe, 0x0d, byte(len(pad)>>8), byte(len(pad)))
+	ext = append(ext, pad...)
+	body = append(body, byte(len(ext)>>8), byte(len(ext)))
+	body = append(body, ext...)
+	return append([]byte{0x01, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)
+}
+
+// t089Run — поток со снифом QUIC и уже запомненным маршрутом proxy-3; роутер
+// отправляет в direct. Возвращает, кто принял поток, и что видел PickRoute.
+func t089Run(t *testing.T, viaDispatch bool, name string, port uint16) (tag string, router *t083Router) {
+	t.Helper()
+	d := t083Dispatcher()
+	router = &t083Router{tag: "direct"}
+	d.router = router
+	got := make(chan string, 1)
+	rec := func(tag string) *t083Handler {
+		return &t083Handler{tag: tag, typ: "xray.proxy.vless.outbound.Config", onDispatch: func(context.Context, *transport.Link) { got <- tag }}
+	}
+	d.ohm = &t083Ohm{m: map[string]outbound.Handler{"proxy-3": rec("proxy-3"), "direct": rec("direct")}}
+
+	ctx := t083CtxTo(port, t083Dst, true)
+	session.ContentFromContext(ctx).SniffingRequest.OverrideDestinationForProtocol = []string{"quic"}
+	d.vupenRouteRemember(ctx, "proxy-3", internet.VupenRouteGeneration())
+
+	ch := t089ClientHello(name)
+	half := len(ch) / 2
+	pkts := [][]byte{t083Initial(t, 0, ch[:half], 0), t083Initial(t, half, ch[half:], 1)}
+	if viaDispatch {
+		link, err := d.Dispatch(ctx, t083Dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range pkts {
+			if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(p)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	} else {
+		r, w := pipe.New(pipe.WithoutSizeLimit())
+		for _, p := range pkts {
+			if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(p)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := d.DispatchLink(ctx, t083Dst, &transport.Link{Reader: r, Writer: w}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case tag = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no handler received the flow")
+	}
+	return tag, router
+}
+
+func TestVupenRouteRecallAfterSniffInDispatch(t *testing.T) {
+	for name, viaDispatch := range map[string]bool{"Dispatch": true, "DispatchLink": false} {
+		viaDispatch := viaDispatch
+		t.Run(name+"/domain sniffed: memory not used", func(t *testing.T) {
+			tag, rt := t089Run(t, viaDispatch, "example.com", 50200)
+			rt.mu.Lock()
+			defer rt.mu.Unlock()
+			if rt.calls != 1 || len(rt.domains) != 1 || rt.domains[0] != "example.com" {
+				t.Fatalf("PickRoute calls=%d domains=%v, want one call with example.com", rt.calls, rt.domains)
+			}
+			if tag != "direct" {
+				t.Fatalf("flow went to %q, want the router's choice direct, not the memory", tag)
+			}
+		})
+		t.Run(name+"/unrecognised payload: memory used", func(t *testing.T) {
+			tag, rt := t089Run(t, viaDispatch, "", 50201)
+			rt.mu.Lock()
+			defer rt.mu.Unlock()
+			if rt.calls != 0 {
+				t.Fatalf("PickRoute called %d times, want 0 (memory must be used)", rt.calls)
+			}
+			if tag != "proxy-3" {
+				t.Fatalf("flow went to %q, want the remembered proxy-3", tag)
+			}
+		})
 	}
 }
