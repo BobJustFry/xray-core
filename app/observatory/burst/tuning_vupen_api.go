@@ -223,6 +223,7 @@ func (o *Observer) VupenStickyExcludeFor(tag, reason string, d time.Duration) {
 	h.tspu.mu.Lock()
 	e := h.tspu.entryLocked(tag)
 	e.frozenUntil = time.Now().Add(d)
+	e.frozenAt = time.Now()
 	e.verifiedUntil = time.Time{}
 	h.tspu.mu.Unlock()
 	errors.LogWarning(h.ctx, "[sticky] ", tag, " excluded for ", d, " (", reason, ")")

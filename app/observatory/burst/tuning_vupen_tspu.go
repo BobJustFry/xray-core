@@ -68,8 +68,11 @@ const (
 type vupenTspuEntry struct {
 	verifiedUntil time.Time
 	frozenUntil   time.Time
-	checking      bool
-	lastCheck     time.Time
+	// Ядро 83 (T-102): когда узел заморожен — чтобы снять заморозки, поставленные в
+	// сети, которая потом оказалась не тем, чем казалась (VupenStickyUnfreezeSince).
+	frozenAt  time.Time
+	checking  bool
+	lastCheck time.Time
 	// Ядро 75: итог последней проверки — для того, кто ждал её (vupenTspuVerifyNow).
 	lastVerdict vupenTspuVerdict
 }
@@ -184,9 +187,38 @@ func (h *HealthPing) vupenTspuAfterRound(tags []string) {
 }
 
 func (h *HealthPing) vupenTspuVerify(tag, reason string) (verdict vupenTspuVerdict) {
+	return h.vupenTspuVerifyCtx(h.ctx, tag, reason, nil, false)
+}
+
+// vupenTspuVerifyCtx — проверка 64 КБ. guard (ядро 83, T-102; поиск АВТО 4.1): итог
+// «заморожен» не ставит заморозку, если сеть сменилась за время проверки (эпоха) или
+// hold() говорит, что сейчас БС; прерванная вызывающим (callerCtx) проверка — «не
+// поняли»; проверка, прошедшая через смену сети, не считается проверенной.
+func (h *HealthPing) vupenTspuVerifyCtx(callerCtx context.Context, tag, reason string, hold func() bool, guard bool) (verdict vupenTspuVerdict) {
 	verdict = vupenTspuUnknown
 	detail := ""
+	epoch0 := vupenBurstEpochNow()
+	vctx, vcancel := vupenMergeCtx(callerCtx, h.ctx)
+	defer vcancel()
 	defer func() {
+		if guard {
+			why := ""
+			switch {
+			case h.ctx.Err() == nil && callerCtx.Err() != nil:
+				why = "aborted by the caller"
+			case vupenBurstEpochNow() != epoch0:
+				why = "the network changed during the check"
+			case verdict == vupenTspuSuspect && hold != nil && hold():
+				why = "whitelist network"
+			}
+			if why != "" {
+				if verdict != vupenTspuUnknown {
+					errors.LogWarning(h.ctx, fmt.Sprintf("[tspu] %s: verify result dropped, node not marked (%s; epoch %d→%d)",
+						tag, why, epoch0, vupenBurstEpochNow()))
+				}
+				verdict = vupenTspuUnknown
+			}
+		}
 		now := time.Now()
 		h.tspu.mu.Lock()
 		e := h.tspu.entryLocked(tag)
@@ -198,6 +230,7 @@ func (h *HealthPing) vupenTspuVerify(tag, reason string) (verdict vupenTspuVerdi
 			e.frozenUntil = time.Time{}
 		case vupenTspuSuspect:
 			e.frozenUntil = now.Add(VupenTspuFrozenFor)
+			e.frozenAt = now
 			e.verifiedUntil = time.Time{}
 		}
 		h.tspu.mu.Unlock()
@@ -216,7 +249,7 @@ func (h *HealthPing) vupenTspuVerify(tag, reason string) (verdict vupenTspuVerdi
 
 	select {
 	case h.tspuSem <- struct{}{}:
-	case <-h.ctx.Done():
+	case <-vctx.Done():
 		return
 	}
 	defer func() { <-h.tspuSem }()
@@ -228,7 +261,7 @@ func (h *HealthPing) vupenTspuVerify(tag, reason string) (verdict vupenTspuVerdi
 		lane = h.laneOf(tag)
 	}
 	sem := h.lanes.sem(lane)
-	if !vupenAcquire(h.ctx, sem) {
+	if !vupenAcquire(vctx, sem) {
 		return
 	}
 	defer vupenRelease(sem)
@@ -246,16 +279,16 @@ func (h *HealthPing) vupenTspuVerify(tag, reason string) (verdict vupenTspuVerdi
 	if probe == nil {
 		probe = h.vupenTspuProbeOnce
 	}
-	v1, d1 := probe(h.ctx, tag, stall)
+	v1, d1 := probe(vctx, tag, stall)
 	if v1 != vupenTspuSuspect {
 		verdict, detail = v1, d1
 		return
 	}
 	// ТСПУ срабатывает непостоянно, а сбой бывает и случайным: подтверждаем.
-	if !vupenSleep(h.ctx, VupenTspuRetryPause) {
+	if !vupenSleep(vctx, VupenTspuRetryPause) {
 		return
 	}
-	v2, d2 := probe(h.ctx, tag, stall)
+	v2, d2 := probe(vctx, tag, stall)
 	detail = "1) " + d1 + "; 2) " + d2
 	if v2 == vupenTspuSuspect {
 		verdict = vupenTspuSuspect

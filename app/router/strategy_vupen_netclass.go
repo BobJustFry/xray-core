@@ -100,6 +100,9 @@ type vupenNetClassState struct {
 	last       vupenNetClassResult
 	probes     int
 	stopSettle func() bool
+	// Ядро 83 (T-102): со смены сети до разбора события проверки класса - поиски и
+	// проверки ждут (strategy_vupen_search_epoch.go).
+	settling bool
 }
 
 // vupenDirectConnect — прямое TCP-соединение (процесс не в туннеле); viaTunnel —
@@ -355,6 +358,7 @@ func (s *vupenSticky) spillWhitelist(reason string) bool {
 	if sp == nil {
 		return false
 	}
+	s.noteWhitelist() // ядро 83: с этого момента заморозки узлов не показатель
 	if sp.spilled.Load() {
 		sp.byWhitelist.Store(true)
 		return true
@@ -425,6 +429,7 @@ func (s *vupenSticky) whitelistEnded(reason string) bool {
 	if !s.unspill("whitelist ended: foreign DNS answers (" + reason + ")") {
 		return false
 	}
+	s.unfreezeWhitelistEra("whitelist ended")
 	if sp.stopRecheck != nil {
 		sp.stopRecheck()
 		sp.stopRecheck = nil
@@ -475,11 +480,35 @@ func (s *vupenSticky) netClassOnChanged() {
 		c.stopSettle()
 		c.stopSettle = nil
 	}
+	wasSettling := c.settling
+	c.settling = false
 	if s.netClassActive() {
+		c.settling = true
 		c.stopSettle = vupenStickyAfter(VupenNetClassSettle, func() {
-			s.send(vupenStickyEvent{kind: "netclass", reason: "network changed"})
+			// Если событие не влезло, очередь полна: цикл всё равно возьмёт следующее
+			// событие, а handle() первым делом выполнит отложенное (flushDeferred).
+			if !s.send(vupenStickyEvent{kind: "netclass", reason: "network changed"}) {
+				s.netClassSettled()
+			}
 		})
 	}
+	settledByChange := wasSettling && !c.settling
+	c.mu.Unlock()
+	if settledByChange {
+		// CR-001 (ядро 83): ожидание класса сети оборвано сменой сети (возврат в Wi-Fi/
+		// проводную), нового ожидания нет. Таймер остановлен, а событий больше может не
+		// быть — отложенный поиск или проверка (и checkPending) зависли бы навсегда.
+		// Холостое событие будит цикл: handle() выполнит flushDeferred. Если очередь
+		// полна, цикл всё равно разбирает события, и handle() сделает то же самое.
+		s.send(vupenStickyEvent{kind: "settled", reason: "network class wait cancelled"})
+	}
+}
+
+// netClassSettled - класс сети разобран (или ждать нечего): отложенное можно выполнять.
+func (s *vupenSticky) netClassSettled() {
+	c := &s.netcls
+	c.mu.Lock()
+	c.settling = false
 	c.mu.Unlock()
 }
 

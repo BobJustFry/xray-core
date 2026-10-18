@@ -56,6 +56,8 @@ type HealthPing struct {
 	vupenSubject  func(tag string) bool
 	// Ядро 76: подписчики на признаки отказа (балансировщики «держать текущий»).
 	vupenListeners vupenSignalListeners
+	// Ядро 83 (T-102): эпоха сети, в которой сняты замеры Results (под access).
+	resultsEpoch uint64
 }
 
 // NewHealthPing creates a new HealthPing with settings

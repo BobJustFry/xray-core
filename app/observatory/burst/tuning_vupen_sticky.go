@@ -216,6 +216,12 @@ func vupenDirectDialer(ohm outbound.Manager) (vupenDialer, string) {
 // прежней отметки «проверен». Если узел уже проверяется (ядро 71 заказало
 // проверку), ждём её и берём её итог, второй раз не качаем.
 func (h *HealthPing) vupenTspuVerifyNow(tag, reason string) string {
+	return h.vupenTspuVerifyNowCtx(h.ctx, tag, reason, nil, false)
+}
+
+// vupenTspuVerifyNowCtx — то же с контекстом вызывающего и защитой от смены сети
+// (guard, ядро 83: см. vupenTspuVerifyCtx).
+func (h *HealthPing) vupenTspuVerifyNowCtx(ctx context.Context, tag, reason string, hold func() bool, guard bool) string {
 	waited := false
 	for {
 		h.tspu.mu.Lock()
@@ -233,11 +239,11 @@ func (h *HealthPing) vupenTspuVerifyNow(tag, reason string) string {
 		}
 		h.tspu.mu.Unlock()
 		waited = true
-		if !vupenSleep(h.ctx, 50*time.Millisecond) {
+		if !vupenSleep(ctx, 50*time.Millisecond) || h.ctx.Err() != nil {
 			return VupenStickyUnknown
 		}
 	}
-	return vupenStickyVerdict(h.vupenTspuVerify(tag, reason))
+	return vupenStickyVerdict(h.vupenTspuVerifyCtx(ctx, tag, reason, hold, guard))
 }
 
 func vupenStickyVerdict(v vupenTspuVerdict) string {
