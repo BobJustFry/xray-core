@@ -829,3 +829,70 @@ func TestVupenStickySignalSwitchOnlyAfterFailedCheck(t *testing.T) {
 		t.Fatalf("failed check + network up → excluded and switched: pick %q excluded %v", got, r.obs.excluded["p-1"])
 	}
 }
+
+// T-087 (CR-003): смена опубликованного тега — в publish(), включая запасной выбор при
+// поиске; тот же тег поколение не трогает.
+func TestVupenStickyPublishBumpsRouteGeneration(t *testing.T) {
+	r := newStickyRig(t, "p-a", "p-b", "p-a", "p-b")
+	g := internet.VupenRouteGeneration()
+	r.s.publish("p-a")
+	if internet.VupenRouteGeneration() == g {
+		t.Fatal("first publish must bump the generation")
+	}
+	g = internet.VupenRouteGeneration()
+	r.s.publish("p-a")
+	if internet.VupenRouteGeneration() != g {
+		t.Fatal("publishing the same tag must not bump")
+	}
+	r.s.publish("p-b")
+	if internet.VupenRouteGeneration() == g {
+		t.Fatal("a changed tag must bump")
+	}
+
+	// Сценарий: держим p-a, поиск ничего не нашёл → запасной выбор p-b.
+	r2 := newStickyRig(t, "p-a", "p-b", "p-a", "p-b")
+	r2.alive(map[string]int64{"p-a": 10})
+	if got := r2.pick(); got != "p-a" {
+		t.Fatalf("pick %q", got)
+	}
+	r2.drain()
+	r2.expectPhase(vupenPhaseHolding)
+	r2.alive(nil)
+	g = internet.VupenRouteGeneration()
+	r2.s.search("test")
+	if got := r2.pick(); got != "p-b" {
+		t.Fatalf("fallback pick %q", got)
+	}
+	if internet.VupenRouteGeneration() == g {
+		t.Fatal("the fallback publish must invalidate remembered flow routes")
+	}
+}
+
+// T-087: runtime AddRule/RemoveRule — запомненные маршруты потоков устарели.
+func TestVupenRouterRuleChangeBumpsRouteGeneration(t *testing.T) {
+	r := &Router{}
+	rules := []*Rule{}
+	r.rules.Store(&rules)
+	g := internet.VupenRouteGeneration()
+	if err := r.RemoveRule("none"); err != nil {
+		t.Fatal(err)
+	}
+	if internet.VupenRouteGeneration() == g {
+		t.Fatal("RemoveRule must bump the route generation")
+	}
+}
+
+func TestVupenRouterReloadRulesBumpsRouteGeneration(t *testing.T) {
+	r := &Router{}
+	rules := []*Rule{}
+	bs := map[string]*Balancer{}
+	r.rules.Store(&rules)
+	r.balancers.Store(&bs)
+	g := internet.VupenRouteGeneration()
+	if err := r.ReloadRules(&Config{}, true); err != nil {
+		t.Fatal(err)
+	}
+	if internet.VupenRouteGeneration() == g {
+		t.Fatal("ReloadRules (AddRule) must bump the route generation")
+	}
+}

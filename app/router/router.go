@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 	routing_dns "github.com/xtls/xray-core/features/routing/dns"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 // Router is an implementation of routing.Router.
@@ -154,6 +155,7 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 		closeWebhooks(oldRules)
 	}
 	vupenStopReplacedSticky(oldBalancers, newBalancers)
+	internet.VupenBumpRouteGeneration() // T-087: new rules — remembered flow routes are stale
 	return nil
 }
 
@@ -178,6 +180,7 @@ func (r *Router) RemoveRule(tag string) error {
 	}
 	r.rules.Store(&newRules)
 	closeWebhooks(removed)
+	internet.VupenBumpRouteGeneration() // T-087: rule removed — remembered flow routes are stale
 	return nil
 }
 

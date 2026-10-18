@@ -228,7 +228,15 @@ func (s *vupenSticky) logCtx() context.Context {
 	return context.Background()
 }
 
-func (s *vupenSticky) publish(tag string) { s.view.Store(&tag) }
+// publish — отдать тег PickOutbound'у. Смена тега (в том числе запасной выбор при
+// поиске) устаревляет запомненные маршруты потоков: поколение растёт после Store
+// (T-087 CR-003), чтобы тот, кто видел новый тег, не получил старое поколение.
+func (s *vupenSticky) publish(tag string) {
+	old := s.view.Swap(&tag)
+	if old == nil || *old != tag {
+		internet.VupenBumpRouteGeneration() // T-083 (S4): повторы потоков — уже через новый узел
+	}
+}
 
 func (s *vupenSticky) setPhase(p vupenStickyPhase) { s.phase.Store(int32(p)) }
 
@@ -503,9 +511,6 @@ func (s *vupenSticky) onWake() {
 func (s *vupenSticky) hold(tag string) { s.holdBecause(tag, "check") }
 
 func (s *vupenSticky) holdBecause(tag, reason string) {
-	if s.current != tag {
-		internet.VupenBumpRouteGeneration() // T-083 (S4): повторы потоков — уже через новый узел
-	}
 	s.setReport(func(r *vupenStickyReport) {
 		now := vupenStickyNow()
 		if r.current != tag {

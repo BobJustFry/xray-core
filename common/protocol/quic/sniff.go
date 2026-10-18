@@ -38,6 +38,12 @@ var (
 	ErrQUICNotFirstInitial = errors.New("quic: flow does not start with an Initial packet")
 )
 
+// Vupen (T-087, CR-008): exported sentinels, so the dispatcher classifies by identity, not by text.
+var (
+	ErrQUICNotQUIC    = errNotQUIC
+	ErrQUICNotInitial = errNotQUICInitial
+)
+
 type quicVersionSpec struct {
 	ver         uint32
 	typeInitial byte

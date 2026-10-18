@@ -21,6 +21,7 @@ import (
 	routing_session "github.com/xtls/xray-core/features/routing/session"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -289,8 +290,6 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled || vupenShouldSkipSniff(destination) {
 		go d.routedDispatch(ctx, outbound, destination)
-	} else if rctx, ok := d.vupenRouteRecall(ctx, destination); ok { // Vupen (T-083, S4): повтор UDP-потока
-		go d.routedDispatch(rctx, outbound, destination)
 	} else {
 		go func() {
 			cReader := &cachedReader{
@@ -321,7 +320,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				}
 			}
 			vupenMarkSniffMissIfNoDomain(content, destination, sniffingRequest.Enabled)
-			d.routedDispatch(ctx, outbound, destination)
+			d.routedDispatch(d.vupenRouteRecallAfterSniff(ctx, content, ob.OriginalTarget, destination), outbound, destination) // Vupen (T-087): память маршрута только если снифф не дал имени
 		}()
 	}
 	return inbound, nil
@@ -349,8 +348,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled || vupenShouldSkipSniff(destination) {
 		d.routedDispatch(ctx, outbound, destination)
-	} else if rctx, ok := d.vupenRouteRecall(ctx, destination); ok { // Vupen (T-083, S4): повтор UDP-потока
-		d.routedDispatch(rctx, outbound, destination)
 	} else {
 		cReader := &cachedReader{
 			reader: outbound.Reader.(buf.TimeoutReader),
@@ -380,7 +377,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			}
 		}
 		vupenMarkSniffMissIfNoDomain(content, destination, sniffingRequest.Enabled)
-		d.routedDispatch(ctx, outbound, destination)
+		d.routedDispatch(d.vupenRouteRecallAfterSniff(ctx, content, ob.OriginalTarget, destination), outbound, destination) // Vupen (T-087)
 	}
 
 	return nil
@@ -564,9 +561,14 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	inTag := routingLink.GetInboundTag()
 	isPickRoute := 0
 	fromMemory := false
-	if h := d.vupenRouteMemoryHandler(ctx, destination); h != nil { // Vupen (T-083, S4)
-		isPickRoute, handler, fromMemory = 2, h, true
-	} else if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
+	// Vupen (T-083, S4; T-087 CR-001/003/007): память маршрута читается из ctx один раз;
+	// ctx получает пустое значение, и вложенный диспатч (loopback outbound → DispatchLink
+	// с тем же ctx) не вспоминает и не запоминает. Поколение читается до PickRoute.
+	memTag, routedBefore := ctx.Value(vupenRouteMemKey{}).(string)
+	ctx = context.WithValue(ctx, vupenRouteMemKey{}, "")
+	rememberGen := internet.VupenRouteGeneration()
+	remember := !routedBefore && vupenRouteWanted(session.ContentFromContext(ctx), ob.OriginalTarget)
+	if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
 		ctx = session.SetForcedOutboundTagToContext(ctx, "")
 		if h := d.ohm.GetHandler(forcedOutboundTag); h != nil {
 			isPickRoute = 1
@@ -578,6 +580,8 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			common.Interrupt(link.Reader)
 			return
 		}
+	} else if h := d.vupenRouteMemoryHandler(ctx, destination, memTag); h != nil { // forced tag wins (CR-005)
+		isPickRoute, handler, fromMemory = 2, h, true
 	} else if d.router != nil {
 		if route, err := d.router.PickRoute(routingLink); err == nil {
 			outTag := route.GetOutboundTag()
@@ -613,7 +617,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 
 	ob.Tag = handler.Tag()
 	if !fromMemory {
-		d.vupenRouteRemember(ctx, handler.Tag())
+		if remember && isPickRoute != 1 { // a platform-forced tag is not a routing decision
+			d.vupenRouteRemember(ctx, handler.Tag(), rememberGen)
+		}
 		d.vupenMaybeLogDirectMiss(ctx, destination, handler)
 	}
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/quic"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
 	routing_session "github.com/xtls/xray-core/features/routing/session"
 	"github.com/xtls/xray-core/transport/internet"
@@ -49,8 +50,8 @@ func vupenRecordQUICResult(ctx context.Context, res SniffResult, err error) {
 		reason = "notfirst"
 	case stderrors.Is(err, protocol.ErrProtoNeedMoreData):
 		reason = "more"
-	case err != nil && strings.HasPrefix(err.Error(), "not "):
-		reason = "notquic" // not quic / not initial packet
+	case stderrors.Is(err, quic.ErrQUICNotQUIC), stderrors.Is(err, quic.ErrQUICNotInitial):
+		reason = "notquic" // not quic / not initial packet (T-087 CR-008: by sentinel)
 	}
 	content.SetAttribute(vupenQUICLastAttr, reason)
 }
@@ -166,6 +167,14 @@ func (d *DefaultDispatcher) vupenRouteTagForDomain(ctx context.Context, domain s
 	ob := *obs[len(obs)-1]
 	ob.RouteTarget = net.Destination{Network: ob.Target.Network, Address: net.DomainAddress(domain), Port: ob.Target.Port}
 	rctx := session.ContextWithOutbounds(ctx, []*session.Outbound{&ob})
+	// T-087 CR-006: only for a log line — PickRoute must not trigger DNS (IPIfNonMatch).
+	// Shallow copy of Content: the original flow keeps its own flag.
+	var c session.Content
+	if cur := session.ContentFromContext(ctx); cur != nil {
+		c = *cur
+	}
+	c.SkipDNSResolve = true
+	rctx = session.ContextWithContent(rctx, &c)
 	route, err := d.router.PickRoute(routing_session.AsRoutingContext(rctx))
 	if err != nil {
 		return ""
@@ -204,6 +213,10 @@ func newVupenRouteMemory() *vupenRouteMemory {
 	return &vupenRouteMemory{m: map[string]*list.Element{}, lru: list.New()}
 }
 
+// vupenRouteMemKey — ключ в ctx. Нет значения: поток ещё не маршрутизировался.
+// Есть значение (даже пустое): routedDispatch уже отработал для этого ctx — память
+// использована один раз и не должна течь во вложенный диспатч (loopback outbound →
+// DispatchLink с тем же ctx): ни recall, ни remember там не делаются (T-087 CR-001).
 type vupenRouteMemKey struct{}
 
 func vupenRouteKey(ctx context.Context, destination net.Destination) string {
@@ -235,10 +248,11 @@ func (m *vupenRouteMemory) get(key string, now time.Time) string {
 	return e.tag
 }
 
-func (m *vupenRouteMemory) put(key, tag string, now time.Time) {
+// put — gen это поколение, прочитанное ДО PickRoute (T-087 CR-003): если выбор узла
+// сменился во время маршрутизации, запись уже устарела и при чтении промахнётся.
+func (m *vupenRouteMemory) put(key, tag string, gen uint64, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	gen := internet.VupenRouteGeneration()
 	if el, ok := m.m[key]; ok {
 		e := el.Value.(*vupenRouteEntry)
 		e.tag, e.until, e.gen = tag, now.Add(VupenRouteMemoryTTL), gen
@@ -259,10 +273,21 @@ func (m *vupenRouteMemory) size() int {
 	return m.lru.Len()
 }
 
+// vupenIsFakeIP — адрес из пула FakeDNS: по нему имя домена известно только движку
+// FakeDNS, память маршрута к такому адресу не применяется (T-087 CR-002).
+func (d *DefaultDispatcher) vupenIsFakeIP(addr net.Address) bool {
+	fk, ok := d.fdns.(dns.FakeDNSEngineRev0)
+	return ok && fk.IsIPInIPPool(addr)
+}
+
 // vupenRouteRecall — этот UDP-поток уже был недавно: контекст с запомненным
-// outbound'ом (снифф не нужен) и true.
+// outbound'ом и true. Вызывается ПОСЛЕ снифа и только если он не дал имени
+// (vupenRouteRecallAfterSniff). Не работает во вложенном диспатче и для fake-IP.
 func (d *DefaultDispatcher) vupenRouteRecall(ctx context.Context, destination net.Destination) (context.Context, bool) {
-	if d.vupenRoutes == nil {
+	if d.vupenRoutes == nil || ctx.Value(vupenRouteMemKey{}) != nil {
+		return ctx, false
+	}
+	if d.vupenIsFakeIP(destination.Address) {
 		return ctx, false
 	}
 	key := vupenRouteKey(ctx, destination)
@@ -276,9 +301,23 @@ func (d *DefaultDispatcher) vupenRouteRecall(ctx context.Context, destination ne
 	return context.WithValue(ctx, vupenRouteMemKey{}, tag), true
 }
 
-// vupenRouteMemoryHandler — outbound из памяти маршрута (для routedDispatch).
-func (d *DefaultDispatcher) vupenRouteMemoryHandler(ctx context.Context, destination net.Destination) outbound.Handler {
-	tag, _ := ctx.Value(vupenRouteMemKey{}).(string)
+// vupenRouteRecallAfterSniff — снифф закончен. Память берётся, только если он не дал
+// имени (current всё ещё IP, подсказки домена нет): имя всегда точнее памяти (T-087 CR-002).
+// origin — исходный адрес назначения (до подмены на домен).
+func (d *DefaultDispatcher) vupenRouteRecallAfterSniff(ctx context.Context, content *session.Content, origin, current net.Destination) context.Context {
+	if current.Address.Family().IsDomain() {
+		return ctx
+	}
+	if content != nil && content.Attribute(vupenSniffDomainAttr) != "" {
+		return ctx
+	}
+	rctx, _ := d.vupenRouteRecall(ctx, origin)
+	return rctx
+}
+
+// vupenRouteMemoryHandler — outbound из памяти маршрута (для routedDispatch);
+// tag прочитан routedDispatch из ctx один раз.
+func (d *DefaultDispatcher) vupenRouteMemoryHandler(ctx context.Context, destination net.Destination, tag string) outbound.Handler {
 	if tag == "" {
 		return nil
 	}
@@ -289,8 +328,15 @@ func (d *DefaultDispatcher) vupenRouteMemoryHandler(ctx context.Context, destina
 	return h
 }
 
-// vupenRouteRemember — запомнить решение для этого UDP-потока.
-func (d *DefaultDispatcher) vupenRouteRemember(ctx context.Context, tag string) {
+// vupenRouteWanted — поток запрашивал снифф (не порт-53/DoT/резолвер): только такие
+// запоминаем (T-087 CR-007).
+func vupenRouteWanted(content *session.Content, origin net.Destination) bool {
+	return content != nil && content.SniffingRequest.Enabled && !vupenShouldSkipSniff(origin)
+}
+
+// vupenRouteRemember — запомнить решение для этого UDP-потока; gen — поколение
+// маршрутов, прочитанное до PickRoute.
+func (d *DefaultDispatcher) vupenRouteRemember(ctx context.Context, tag string, gen uint64) {
 	if d.vupenRoutes == nil || tag == "" {
 		return
 	}
@@ -299,6 +345,6 @@ func (d *DefaultDispatcher) vupenRouteRemember(ctx context.Context, tag string) 
 		return
 	}
 	if key := vupenRouteKey(ctx, obs[len(obs)-1].OriginalTarget); key != "" {
-		d.vupenRoutes.put(key, tag, time.Now())
+		d.vupenRoutes.put(key, tag, gen, time.Now())
 	}
 }
