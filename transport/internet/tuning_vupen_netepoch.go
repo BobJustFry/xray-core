@@ -205,6 +205,7 @@ func (s *vupenNetState) setUplink(kind, sig string) bool {
 	old := s.current
 	s.current = id
 	s.epoch++
+	vupenRouteGen.Add(1) // T-083: решения маршрута прежней сети не повторять
 	s.changedAt = now
 	epoch := s.epoch
 	hadPending := s.stopPending != nil

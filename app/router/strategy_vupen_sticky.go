@@ -503,6 +503,9 @@ func (s *vupenSticky) onWake() {
 func (s *vupenSticky) hold(tag string) { s.holdBecause(tag, "check") }
 
 func (s *vupenSticky) holdBecause(tag, reason string) {
+	if s.current != tag {
+		internet.VupenBumpRouteGeneration() // T-083 (S4): повторы потоков — уже через новый узел
+	}
 	s.setReport(func(r *vupenStickyReport) {
 		now := vupenStickyNow()
 		if r.current != tag {

@@ -34,7 +34,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,6 +84,9 @@ type vupenSniffTrace struct {
 	lastErr error
 	reads   int   // сколько раз буфер вырос (≈ датаграмм/сегментов)
 	bytes   int32 // накоплено байт
+	// T-083 (S0): когда пришли данные (от начала снифа, не больше 8 раз).
+	start    time.Time
+	arrivals []time.Duration
 }
 
 // vupenSniffStats — исходы sniff для heartbeat NE (через libXray TunStats).
@@ -101,7 +103,10 @@ var vupenSniffStats struct {
 // ждать ещё столько. Задерживать нечего — пакетов нет; а за ночь 2026-09-10 241
 // такое соединение (гоночные TCP Apple, Telegram) ушло по IP через прокси вместо
 // direct. Порты, где первым говорит сервер, исключены (vupenSniffServerFirstPorts).
-var VupenSniffEmptyTCPWait = 1300 * time.Millisecond
+//
+// Ядро 81 (T-083, S7): выключено — за два лога 0 успехов из 53, а поток ждал 1,3 с.
+// Ручка оставлена: > 0 включает обратно.
+var VupenSniffEmptyTCPWait = time.Duration(0)
 
 var vupenSniffServerFirstPorts = map[net.Port]bool{
 	21: true, 22: true, 23: true, 25: true, 110: true, 143: true,
@@ -122,10 +127,10 @@ func vupenSniffEmptyWaitAllowed(network net.Network, port net.Port, trace *vupen
 
 // VupenSniffStats — одна строка для heartbeat: `p1ok= p2ok= timeout= early=`.
 func VupenSniffStats() string {
-	return fmt.Sprintf("p1ok=%d p2ok=%d timeout=%d early=%d emptyOk=%d emptyTo=%d",
+	return fmt.Sprintf("p1ok=%d p2ok=%d timeout=%d early=%d emptyOk=%d emptyTo=%d %s",
 		vupenSniffStats.p1Ok.Load(), vupenSniffStats.p2Ok.Load(),
 		vupenSniffStats.timeout.Load(), vupenSniffStats.earlyExit.Load(),
-		vupenSniffStats.emptyOk.Load(), vupenSniffStats.emptyTo.Load())
+		vupenSniffStats.emptyOk.Load(), vupenSniffStats.emptyTo.Load(), vupenQUICStatsString())
 }
 
 // vupenSniffPayloadHint — первый пакет глазами человека: для UDP — QUIC long/short
@@ -322,6 +327,7 @@ func vupenLogSniffSecondRoundTimeout(ctx context.Context, phase int, budget time
 		" last=" + last +
 		" reads=" + strconv.Itoa(reads) +
 		" bytes=" + strconv.FormatInt(int64(bytes), 10) +
+		" " + vupenSniffGaps(trace) +
 		" first=" + vupenSniffPayloadHint(network, payload) +
 		", " + vupenSniffMissDomainForLog(ctx) + ", " + dest
 	vupenAppendSniffRoutingMissLog(line)
@@ -460,28 +466,4 @@ func vupenAppendSniffRoutingMissLog(line string) {
 	defer f.Close()
 	ts := time.Now().Format("2006/01/02 15:04:05.000000")
 	_, _ = f.WriteString(ts + " [SniffError] " + line + "\n")
-}
-
-func vupenMaybeLogDirectMissToProxy(ctx context.Context, destination net.Destination, outTag string) {
-	content := session.ContentFromContext(ctx)
-	if content == nil || content.Attribute(vupenSniffMissAttr) != "1" {
-		return
-	}
-	if destination.Address.Family().IsDomain() {
-		return
-	}
-	if outTag != "proxy" {
-		return
-	}
-	detail := strings.Join([]string{
-		"sniff не распознал домен",
-		vupenSniffMissDomainForLog(ctx),
-		destination.String() + " → detour [" + outTag + "] (должен был direct по домену)",
-	}, ", ")
-	vupenAppendSniffRoutingMissLog(vupenDirectMissLogMarker + " " + detail)
-	errors.LogError(ctx,
-		vupenDirectMissLogMarker,
-		" ",
-		detail,
-	)
 }

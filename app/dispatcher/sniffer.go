@@ -86,7 +86,15 @@ func vupenBuildTCPSniffers(destOverride []string, port net.Port) []protocolSniff
 
 func NewSniffer(ctx context.Context, destOverride []string, port net.Port) *Sniffer {
 	quicS := protocolSnifferWithMetadata{
-		func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) },
+		func(c context.Context, b []byte) (SniffResult, error) {
+			h, err := quic.SniffQUIC(b)
+			var res SniffResult
+			if h != nil {
+				res = h
+			}
+			vupenRecordQUICResult(c, res, err) // Vupen (T-083, S0): итог снифа QUIC по потоку
+			return res, err
+		},
 		false,
 		net.Network_UDP,
 	}

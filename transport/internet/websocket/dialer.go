@@ -33,7 +33,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	} else {
 		var err error
 		if conn, err = dialWebSocket(ctx, dest, streamSettings, nil); err != nil {
-			return nil, errors.New("failed to dial WebSocket").Base(err)
+			return nil, vupenWSDialError(ctx, dest, err) // Vupen (T-083, S3)
 		}
 	}
 	return stat.Connection(conn), nil
@@ -206,7 +206,7 @@ func (d *delayDialConn) Write(b []byte) (int, error) {
 		var err error
 		if d.Conn, err = dialWebSocket(d.ctx, d.dest, d.streamSettings, ed); err != nil {
 			d.Close()
-			return 0, errors.New("failed to dial WebSocket").Base(err)
+			return 0, vupenWSDialError(d.ctx, d.dest, err) // Vupen (T-083, S3)
 		}
 		d.dialed <- true
 		if ed != nil {

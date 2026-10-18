@@ -98,6 +98,8 @@ type DefaultDispatcher struct {
 	policy policy.Manager
 	stats  stats.Manager
 	fdns   dns.FakeDNSEngine
+	// Vupen (T-083, S4): память маршрута UDP-потоков (tuning_vupen_t083.go).
+	vupenRoutes *vupenRouteMemory
 }
 
 func init() {
@@ -121,6 +123,7 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.router = router
 	d.policy = pm
 	d.stats = sm
+	d.vupenRoutes = newVupenRouteMemory()
 	return nil
 }
 
@@ -286,6 +289,8 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled || vupenShouldSkipSniff(destination) {
 		go d.routedDispatch(ctx, outbound, destination)
+	} else if rctx, ok := d.vupenRouteRecall(ctx, destination); ok { // Vupen (T-083, S4): повтор UDP-потока
+		go d.routedDispatch(rctx, outbound, destination)
 	} else {
 		go func() {
 			cReader := &cachedReader{
@@ -344,6 +349,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled || vupenShouldSkipSniff(destination) {
 		d.routedDispatch(ctx, outbound, destination)
+	} else if rctx, ok := d.vupenRouteRecall(ctx, destination); ok { // Vupen (T-083, S4): повтор UDP-потока
+		d.routedDispatch(rctx, outbound, destination)
 	} else {
 		cReader := &cachedReader{
 			reader: outbound.Reader.(buf.TimeoutReader),
@@ -409,6 +416,7 @@ func vupenSniffOnePhase(
 			if trace != nil {
 				if payload.Len() > prevLen {
 					trace.reads++
+					trace.noteArrival()
 					prevLen = payload.Len()
 				}
 				trace.bytes = payload.Len()
@@ -461,7 +469,7 @@ func vupenSniffContentTwoPhase(
 	payload *buf.Buffer,
 ) (SniffResult, error) {
 	sniffStarted := time.Now()
-	trace := &vupenSniffTrace{}
+	trace := &vupenSniffTrace{start: sniffStarted}
 	result, err, timedOut := vupenSniffOnePhase(ctx, cReader, payload, network, sniffer, VupenSniffPhase1Deadline, 1, trace)
 	phase1Elapsed := time.Since(sniffStarted)
 	if err == nil && result != nil {
@@ -532,6 +540,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, sniffingRequest session
 	}
 
 	contentResult, contentErr := vupenSniffContentTwoPhase(ctx, cReader, destination.Network, destination.Port, sniffer, payload)
+	vupenCountQUICFlow(ctx) // Vupen (T-083, S0)
 	if contentErr != nil && metadataErr == nil {
 		vupenRecordSniffDomainHint(ctx, metaresult)
 		return metaresult, nil
@@ -554,7 +563,10 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	routingLink := routing_session.AsRoutingContext(ctx)
 	inTag := routingLink.GetInboundTag()
 	isPickRoute := 0
-	if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
+	fromMemory := false
+	if h := d.vupenRouteMemoryHandler(ctx, destination); h != nil { // Vupen (T-083, S4)
+		isPickRoute, handler, fromMemory = 2, h, true
+	} else if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
 		ctx = session.SetForcedOutboundTagToContext(ctx, "")
 		if h := d.ohm.GetHandler(forcedOutboundTag); h != nil {
 			isPickRoute = 1
@@ -600,7 +612,10 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	ob.Tag = handler.Tag()
-	vupenMaybeLogDirectMissToProxy(ctx, destination, handler.Tag())
+	if !fromMemory {
+		d.vupenRouteRemember(ctx, handler.Tag())
+		d.vupenMaybeLogDirectMiss(ctx, destination, handler)
+	}
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
 		if tag := handler.Tag(); tag != "" {
 			if inTag == "" {

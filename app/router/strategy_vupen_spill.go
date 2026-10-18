@@ -162,6 +162,7 @@ func (s *vupenSticky) trySpill(reason string) bool {
 		return true
 	}
 	sp.lastSpillAt = vupenStickyNow()
+	internet.VupenBumpRouteGeneration() // T-083 (S4)
 	if sp.cancelClose != nil {
 		sp.cancelClose() // снова на LTE до закрытия его соединений — не закрываем
 		sp.cancelClose = nil
@@ -200,6 +201,7 @@ func (s *vupenSticky) unspill(reason string) bool {
 	if sp == nil || !sp.spilled.CompareAndSwap(true, false) {
 		return false
 	}
+	internet.VupenBumpRouteGeneration() // T-083 (S4)
 	if t := sp.target.Load(); t != nil && t.vupen != nil {
 		t.vupen.feeders.Add(-1)
 		t.vupen.send(vupenStickyEvent{kind: "sleep"}) // CR-501: без перелива LTE не ищет

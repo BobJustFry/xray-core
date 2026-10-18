@@ -77,7 +77,14 @@ func (t *stackGVisor) Start() error {
 			ep, err := r.CreateEndpoint(&wq)
 			if err != nil {
 				tunStats.tcpHandshakeFail.Add(1)
-				errors.LogError(t.ctx, err.String())
+				if _, refused := err.(*tcpip.ErrConnectionRefused); refused {
+					// Vupen (T-083, S3): приложение само сбросило лишнюю параллельную
+					// попытку (RST до конца рукопожатия) — безвредно, только счётчик.
+					tunStats.tcpRefused.Add(1)
+					errors.LogDebug(t.ctx, err.String())
+				} else {
+					errors.LogError(t.ctx, err.String())
+				}
 				r.Complete(true)
 				return
 			}

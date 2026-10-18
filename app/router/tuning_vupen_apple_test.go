@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	routing_session "github.com/xtls/xray-core/features/routing/session"
 )
 
-// Vupen (T-079): «Apple через VPN при белых списках».
+// Vupen (T-079, T-084): «Apple через VPN при белых списках», режимы 0/1/2.
 
 type vupenAlways struct{}
 
@@ -26,9 +27,30 @@ func appleCtx() routing.Context {
 
 func setAppleViaVpn(t *testing.T, on bool) {
 	t.Helper()
-	prev := VupenAppleViaVpnOnLte()
-	VupenSetAppleViaVpnOnLte(on)
-	t.Cleanup(func() { VupenSetAppleViaVpnOnLte(prev) })
+	mode := VupenAppleModeOff
+	if on {
+		mode = VupenAppleModeOnLte
+	}
+	setAppleMode(t, mode)
+}
+
+func setAppleMode(t *testing.T, mode int) {
+	t.Helper()
+	prev := VupenAppleViaVpnMode()
+	VupenSetAppleViaVpnMode(mode)
+	t.Cleanup(func() { VupenSetAppleViaVpnMode(prev) })
+}
+
+// regularRig — АВТО 4.1 в обычной группе (держит p-1).
+func regularRig(t *testing.T) *spillRig {
+	r := newSpillRig(t, []string{"cellular"}, []string{"p-1"}, []string{"lte-1"})
+	r.alive(map[string]int64{"p-1": 10})
+	r.obs.mu.Lock()
+	r.obs.verify["p-1"] = vupenStickyOK
+	r.obs.mu.Unlock()
+	r.pick()
+	r.drain()
+	return r
 }
 
 // appleRouter — правила как у приложения: «Apple напрямую» (с меткой или без) и
@@ -66,53 +88,69 @@ func spilledRig(t *testing.T) *spillRig {
 	return r
 }
 
-// Решение: настройка × мобильная группа × метка правила.
+// Решение (T-084): режим × группа АВТО × сеть × метка правила.
 func TestVupenAppleViaVpnDecision(t *testing.T) {
-	for _, c := range []struct {
-		name      string
-		on        bool
-		spilled   bool
-		uplink    string
-		ruleTag   string
-		wantProxy bool
-	}{
-		{"off, regular", false, false, "cellular", VupenAppleDirectRuleTag, false},
-		{"off, LTE", false, true, "cellular", VupenAppleDirectRuleTag, false},
-		{"on, regular", true, false, "cellular", VupenAppleDirectRuleTag, false},
-		{"on, LTE", true, true, "cellular", VupenAppleDirectRuleTag, true},
-		{"on, spilled but Wi-Fi now", true, true, "wifi", VupenAppleDirectRuleTag, false},
-		{"on, LTE, rule without marker", true, true, "cellular", "", false},
-		{"on, LTE, other ruleTag", true, true, "cellular", "apple", false},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			setAppleViaVpn(t, c.on)
-			var r *spillRig
-			if c.spilled {
-				r = spilledRig(t)
-			} else {
-				r = newSpillRig(t, []string{"cellular"}, []string{"p-1"}, []string{"lte-1"})
-				r.alive(map[string]int64{"p-1": 10})
-				r.obs.mu.Lock()
-				r.obs.verify["p-1"] = vupenStickyOK
-				r.obs.mu.Unlock()
-				r.pick()
-				r.drain()
+	for _, mode := range []int{VupenAppleModeOff, VupenAppleModeOnLte, VupenAppleModeAlways} {
+		for _, spilled := range []bool{false, true} {
+			for _, uplink := range []string{"cellular", "wifi"} {
+				for _, ruleTag := range []string{VupenAppleDirectRuleTag, "", "apple"} {
+					onLte := spilled && uplink == "cellular"
+					active := mode == VupenAppleModeAlways || (mode == VupenAppleModeOnLte && onLte)
+					wantProxy := active && ruleTag == VupenAppleDirectRuleTag
+					name := fmt.Sprintf("mode=%d spilled=%v %s rule=%q", mode, spilled, uplink, ruleTag)
+					t.Run(name, func(t *testing.T) {
+						setAppleMode(t, mode)
+						var r *spillRig
+						if spilled {
+							r = spilledRig(t)
+						} else {
+							r = regularRig(t)
+						}
+						r.kind = uplink
+						rt := appleRouter(r, ruleTag)
+						got := pickTag(t, rt)
+						if proxied := got != "direct"; proxied != wantProxy {
+							t.Fatalf("route %q, want via VPN=%v", got, wantProxy)
+						}
+						st := autoState(t, rt)
+						if st.AppleViaVpnMode != mode || st.AppleViaVpnOnLte != (mode != VupenAppleModeOff) || st.AppleViaVpnActive != active {
+							t.Fatalf("state: mode=%d onLte=%v active=%v", st.AppleViaVpnMode, st.AppleViaVpnOnLte, st.AppleViaVpnActive)
+						}
+					})
+				}
 			}
-			r.kind = c.uplink
-			rt := appleRouter(r, c.ruleTag)
-			got := pickTag(t, rt)
-			if proxied := got != "direct"; proxied != c.wantProxy {
-				t.Fatalf("route %q, want via VPN=%v", got, c.wantProxy)
-			}
-			st := autoState(t, rt)
-			if st.AppleViaVpnOnLte != c.on || st.AppleViaVpnActive != (c.on && c.spilled && c.uplink == "cellular") {
-				t.Fatalf("state: setting=%v active=%v", st.AppleViaVpnOnLte, st.AppleViaVpnActive)
-			}
-		})
+		}
 	}
 }
 
-// Без АВТО 4.1 («Вручную», обычный балансировщик): мобильной группы нет — напрямую.
+// T-084: прежний вызов — синоним режимов 1/0; неверный режим ничего не меняет.
+func TestVupenAppleViaVpnModeAPI(t *testing.T) {
+	setAppleMode(t, VupenAppleModeOff)
+	if !VupenSetAppleViaVpnOnLte(true) || VupenAppleViaVpnMode() != VupenAppleModeOnLte || !VupenAppleViaVpnOnLte() {
+		t.Fatal("alias true must set mode 1")
+	}
+	if VupenSetAppleViaVpnOnLte(true) {
+		t.Fatal("same value must report no change")
+	}
+	if !VupenSetAppleViaVpnMode(VupenAppleModeAlways) || !VupenAppleViaVpnOnLte() {
+		t.Fatal("mode 2")
+	}
+	gen := vupenAppleGen.Load()
+	for _, bad := range []int{-1, 3, 100} {
+		if VupenSetAppleViaVpnMode(bad) || VupenAppleViaVpnMode() != VupenAppleModeAlways {
+			t.Fatalf("invalid mode %d changed the setting", bad)
+		}
+	}
+	if vupenAppleGen.Load() != gen {
+		t.Fatal("invalid mode bumped the generation")
+	}
+	if !VupenSetAppleViaVpnOnLte(false) || VupenAppleViaVpnMode() != VupenAppleModeOff || VupenAppleViaVpnOnLte() {
+		t.Fatal("alias false must set mode 0")
+	}
+}
+
+// Без АВТО 4.1 («Вручную», обычный балансировщик): мобильной группы нет — в
+// режиме 1 напрямую; в режиме 2 (вручную выбран узел мобильной группы) — через VPN.
 func TestVupenAppleViaVpnManualStaysDirect(t *testing.T) {
 	setAppleViaVpn(t, true)
 	plain := &Balancer{selectors: []string{"p"}, strategy: &LeastPingStrategy{}, ohm: &stickyFakeOhm{tags: []string{"p-1"}}}
@@ -124,6 +162,17 @@ func TestVupenAppleViaVpnManualStaysDirect(t *testing.T) {
 	rt.rules.Store(&rules)
 	if got := pickTag(t, rt); got != "direct" {
 		t.Fatalf("manual: %q", got)
+	}
+	VupenSetAppleViaVpnMode(VupenAppleModeAlways)
+	if got := pickTag(t, rt); got != "p-1" {
+		t.Fatalf("manual whitelist node, mode 2: %q", got)
+	}
+	if st := autoState(t, rt); !st.AppleViaVpnActive || st.AppleViaVpnMode != VupenAppleModeAlways {
+		t.Fatalf("state: %+v", st)
+	}
+	VupenSetAppleViaVpnMode(VupenAppleModeOff)
+	if got := pickTag(t, rt); got != "direct" {
+		t.Fatalf("mode 0: %q", got)
 	}
 }
 
@@ -191,8 +240,8 @@ func TestVupenAppleViaVpnConcurrent(t *testing.T) {
 			}
 		}()
 	}
-	for i := 0; i < 200; i++ {
-		VupenSetAppleViaVpnOnLte(i%2 == 0)
+	for i := 0; i < 300; i++ {
+		VupenSetAppleViaVpnMode(i % 3)
 	}
 	wg.Wait()
 }
@@ -220,5 +269,16 @@ func TestVupenAppleDecisionLogPerRouter(t *testing.T) {
 	}
 	if s, g := spilled.vupenAppleLog.Load()%4, regular.vupenAppleLog.Load()%4; s != 2 || g != 1 {
 		t.Fatalf("log state spilled=%d regular=%d, want 2 and 1", s, g)
+	}
+	// Режим 2: обоим — через VPN; состояние журнала нового поколения настройки.
+	VupenSetAppleViaVpnMode(VupenAppleModeAlways)
+	gen := vupenAppleGen.Load()
+	for _, rt := range []*Router{spilled, regular} {
+		if got := pickTag(t, rt); got == "direct" {
+			t.Fatalf("mode 2: %q", got)
+		}
+		if v := rt.vupenAppleLog.Load(); v != gen*4+2 {
+			t.Fatalf("log state %d, want %d", v, gen*4+2)
+		}
 	}
 }

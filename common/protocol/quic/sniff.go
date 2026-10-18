@@ -30,6 +30,12 @@ func (s SniffHeader) Domain() string {
 var (
 	errNotQUIC        = errors.New("not quic")
 	errNotQUICInitial = errors.New("not initial packet")
+	// Vupen (T-083, S2): быстрые вердикты «домена не будет» — без ожидания бюджета.
+	// ErrQUICNoSNI — ClientHello собран целиком, а SNI в нём нет (звонки FaceTime,
+	// «Сообщения», подключения по IP-адресу). ErrQUICNotFirstInitial — поток начался
+	// не с Initial (0-RTT/Handshake продолжения соединения): Initial уже прошёл.
+	ErrQUICNoSNI           = errors.New("quic: complete ClientHello without SNI")
+	ErrQUICNotFirstInitial = errors.New("quic: flow does not start with an Initial packet")
 )
 
 type quicVersionSpec struct {
@@ -73,6 +79,11 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 
 	// Crypto data separated across packets
 	cryptoLen := int32(0)
+	// Vupen (T-083, S2): какие байты CRYPTO реально пришли (кадры могут идти не
+	// по порядку, промежутки в буфере — нули): ClientHello «собран целиком»,
+	// только если покрыт без дыр от 0 до конца сообщения.
+	var covered vupenCryptoCoverage
+	first := true
 	cryptoDataBuf := buf.NewWithSize(32767)
 	defer cryptoDataBuf.Release()
 	cache := buf.New()
@@ -146,6 +157,16 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		}
 
 		restPayload := b[hdrLen+int(packetLen):]
+		// cachedReader can concatenate zero-padded UDP datagrams (upstream #6882).
+		for len(restPayload) > 0 && restPayload[0] == 0 {
+			restPayload = restPayload[1:]
+		}
+		if !isQUICInitial && first {
+			// Vupen (T-083, S2): первым идёт не Initial — это продолжение соединения,
+			// ClientHello в этом потоке не будет.
+			return nil, ErrQUICNotFirstInitial
+		}
+		first = false
 		if !isQUICInitial { // Skip this packet if it's not initial packet
 			b = restPayload
 			continue
@@ -250,6 +271,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 				if _, err := buffer.Read(cryptoDataBuf.BytesRange(offset, currentCryptoLen)); err != nil { // Field: Crypto Data
 					return nil, io.ErrUnexpectedEOF
 				}
+				covered.add(offset, currentCryptoLen)
 			case 0x1c: // CONNECTION_CLOSE frame, only 0x1c is permitted in initial packet
 				if _, err = readShortQUICVarint(buffer); err != nil { // Field: Error Code
 					return nil, io.ErrUnexpectedEOF
@@ -273,6 +295,10 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 
 		tlsHdr := &ptls.SniffHeader{}
 		err = ptls.ReadClientHello(cryptoDataBuf.BytesRange(0, cryptoLen), tlsHdr)
+		if err != nil && vupenClientHelloComplete(cryptoDataBuf.BytesRange(0, cryptoLen), &covered) {
+			// Vupen (T-083, S2): сообщение целиком, а имени нет — ждать нечего.
+			return nil, ErrQUICNoSNI
+		}
 		if err != nil {
 			// The crypto data may have not been fully recovered in current packets,
 			// So we continue to sniff rest packets.
@@ -314,4 +340,42 @@ func readShortQUICVarint(reader io.ByteReader) (int32, error) {
 		return 0, errNotQUICInitial
 	}
 	return int32(v), nil
+}
+
+// vupenCryptoCoverage — пришедшие диапазоны байт CRYPTO [from, to).
+type vupenCryptoCoverage struct{ spans [][2]int32 }
+
+func (c *vupenCryptoCoverage) add(from, to int32) {
+	if to <= from {
+		return
+	}
+	c.spans = append(c.spans, [2]int32{from, to})
+}
+
+// contiguous — сколько байт подряд от 0 пришло.
+func (c *vupenCryptoCoverage) contiguous() int32 {
+	end := int32(0)
+	for changed := true; changed; {
+		changed = false
+		for _, sp := range c.spans {
+			if sp[0] <= end && sp[1] > end {
+				end = sp[1]
+				changed = true
+			}
+		}
+	}
+	return end
+}
+
+// vupenClientHelloComplete — в CRYPTO целое TLS-сообщение ClientHello (тип 1,
+// длина из заголовка), пришедшее без дыр.
+func vupenClientHelloComplete(data []byte, c *vupenCryptoCoverage) bool {
+	if len(data) < 4 || data[0] != 0x01 {
+		return false
+	}
+	need := 4 + (int32(data[1])<<16 | int32(data[2])<<8 | int32(data[3]))
+	if need > int32(len(data)) {
+		return false
+	}
+	return c.contiguous() >= need
 }

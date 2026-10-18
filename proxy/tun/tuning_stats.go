@@ -26,6 +26,7 @@ var tunStats struct {
 	tcpLive          atomic.Int32  // соединений в HandleConnection прямо сейчас
 	tcpAccepted      atomic.Uint64 // рукопожатий завершено
 	tcpHandshakeFail atomic.Uint64 // CreateEndpoint вернул ошибку (таймаут ACK и т.п.)
+	tcpRefused       atomic.Uint64 // из них сброс самим приложением (T-083), в журнал — Debug
 	udpSessions      atomic.Int32
 	udpCapDrops      atomic.Uint64 // пакетов отброшено по лимиту UDP-сессий
 	udpEvicted       atomic.Uint64 // сессий вытеснено при полной таблице (ядро 72)
@@ -56,7 +57,7 @@ func Stats() string {
 	}
 	tunStackMu.Unlock()
 	return fmt.Sprintf(
-		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d udpEvict=%d dnsReap=%d udpQ=%dKB udpQDrop=%d",
+		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d udpEvict=%d dnsReap=%d udpQ=%dKB udpQDrop=%d hsRefused=%d",
 		tunStats.readerAlive.Load(),
 		tunStats.readPackets.Load(),
 		tunStats.readErrors.Load(),
@@ -74,6 +75,7 @@ func Stats() string {
 		tunStats.udpDNSReaped.Load(),
 		tunStats.udpQueued.Load()>>10,
 		tunStats.udpQueueDrops.Load(),
+		tunStats.tcpRefused.Load(),
 	)
 }
 
