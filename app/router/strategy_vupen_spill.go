@@ -48,6 +48,8 @@ type vupenSpill struct {
 	invalid   string // причина, по которой перелив выключен ("" — настройка верна)
 	target    atomic.Pointer[Balancer]
 	spilled   atomic.Bool
+	// Ядро 82 (T-091): перелив держится из-за белых списков (проверка netclass).
+	byWhitelist atomic.Bool
 
 	// Только в горутине обработчика.
 	lastSpillAt time.Time
@@ -136,7 +138,11 @@ func (s *vupenSticky) spillTarget() *Balancer {
 }
 
 // trySpill — поиск по REG ничего не нашёл: перелить в LTE, если можно.
-func (s *vupenSticky) trySpill(reason string) bool {
+func (s *vupenSticky) trySpill(reason string) bool { return s.trySpillOpt(reason, false) }
+
+// trySpillOpt — force (ядро 82, белые списки): без паузы VupenSpillMinGap между
+// переливами; остальные запреты (сеть не сотовая, настройки) остаются.
+func (s *vupenSticky) trySpillOpt(reason string, force bool) bool {
 	sp := s.spill
 	if sp == nil {
 		return false
@@ -149,7 +155,7 @@ func (s *vupenSticky) trySpill(reason string) bool {
 		blocked = "vupenSpill.uplink has no cellular"
 	case kind != vupenSpillOnlyOnUplinkKind:
 		blocked = "uplink " + kind // D-21: на Wi-Fi/проводной/неизвестной — никогда
-	case !sp.lastSpillAt.IsZero() && vupenStickyNow().Sub(sp.lastSpillAt) < VupenSpillMinGap:
+	case !force && !sp.lastSpillAt.IsZero() && vupenStickyNow().Sub(sp.lastSpillAt) < VupenSpillMinGap:
 		blocked = fmt.Sprintf("last spill %s ago (limit %s)", vupenStickyNow().Sub(sp.lastSpillAt).Round(time.Second), VupenSpillMinGap)
 	}
 	s.setReport(func(r *vupenStickyReport) { r.spillBlocked = blocked })
@@ -201,6 +207,7 @@ func (s *vupenSticky) unspill(reason string) bool {
 	if sp == nil || !sp.spilled.CompareAndSwap(true, false) {
 		return false
 	}
+	sp.byWhitelist.Store(false)
 	internet.VupenBumpRouteGeneration() // T-083 (S4)
 	if t := sp.target.Load(); t != nil && t.vupen != nil {
 		t.vupen.feeders.Add(-1)
@@ -238,6 +245,14 @@ func (s *vupenSticky) dormant() bool {
 func (s *vupenSticky) lteRecheck() {
 	sp := s.spill
 	if sp == nil || !sp.spilled.Load() {
+		return
+	}
+	// Ядро 82: БС / нет сети — дешёвая проверка прямыми соединениями вместо поиска по
+	// REG через туннель; возврат и поиск — если иностранные снова отвечают.
+	if s.netClassRecheck() {
+		if sp.spilled.Load() {
+			s.scheduleRecheck()
+		}
 		return
 	}
 	obs := s.observatory()

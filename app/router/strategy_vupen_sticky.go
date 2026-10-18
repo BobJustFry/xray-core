@@ -164,6 +164,8 @@ type vupenSticky struct {
 
 	// Ядро 77: перелив REG → LTE (strategy_vupen_spill.go); nil — без vupenSpill.
 	spill *vupenSpill
+	// Ядро 82: класс сотовой сети (strategy_vupen_netclass.go); только при spill != nil.
+	netcls vupenNetClassState
 	// Ядро 77 (CR-501): этот балансировщик — цель перелива; feeders — сколько
 	// балансировщиков сейчас в него переливают.
 	spillTargetOf atomic.Bool
@@ -284,6 +286,10 @@ func (s *vupenSticky) start(cands []string) {
 		s.setPhase(vupenPhaseHolding)
 		return
 	}
+	// Ядро 82: на сотовой сначала узнаём, не БС ли (раньше проверки initial и поиска).
+	if s.netClassActive() {
+		s.send(vupenStickyEvent{kind: "netclass", reason: "core start"})
+	}
 	if s.initial != "" && slices.Contains(cands, s.initial) {
 		s.setPhase(vupenPhaseChecking)
 		s.publish(s.initial)
@@ -306,6 +312,9 @@ func (s *vupenSticky) start(cands []string) {
 		switch ev {
 		case internet.VupenNetStable:
 			s.send(vupenStickyEvent{kind: "net-stable"})
+			if s.spill != nil {
+				s.send(vupenStickyEvent{kind: "netclass", reason: "net-stable"})
+			}
 		case internet.VupenNetChanged:
 			s.signals.mu.Lock()
 			s.signals.netChangedAt = vupenStickyNow()
@@ -313,6 +322,7 @@ func (s *vupenSticky) start(cands []string) {
 			s.signals.mu.Unlock()
 			s.visitedReset.Store(true)                                 // ядро 79: перебор switch — заново
 			s.setReport(func(r *vupenStickyReport) { r.network = "" }) // ядро 78: сеть новая — не проверена
+			s.netClassOnChanged()                                      // ядро 82: класс сети — заново
 			// Ядро 77: сменилась сеть — вердикт «обычный мёртв» сброшен сразу:
 			// новые соединения идут в REG (R4, D-12).
 			if s.unspill("network changed") {
@@ -469,6 +479,11 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 		}
 	case "check":
 		defer s.checkPending.Store(false)
+		if s.whitelistHolds() {
+			// Ядро 82: БС, перелито — REG не проверяем и не исключаем.
+			errors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": whitelist holds — REG check skipped (", ev.reason, ")")
+			return
+		}
 		switch s.getPhase() {
 		case vupenPhaseChecking:
 			s.checkCurrent(s.initial, ev.reason)
@@ -490,6 +505,8 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 		s.onUnspilledByNetwork()
 	case "lte-recheck":
 		s.lteRecheck()
+	case "netclass":
+		s.runNetClass(ev.reason)
 	case "current-excluded":
 		if s.getPhase() == vupenPhaseHolding {
 			cur := s.current
@@ -565,6 +582,12 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 	s.setReport(func(r *vupenStickyReport) { r.network = devNet })
 	switch devNet {
 	case vupenNetUp:
+		// Ядро 82: прежде чем винить узел — не БС и не обрыв сети ли (один повторный
+		// прямой замер, не чаще VupenNetClassMinGap).
+		if s.netClassGate(reason + ": " + tag + " failed") {
+			s.hold(tag)
+			return
+		}
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
 			" check failed (net ok) → excluded 15m, search ", s.balancer)
 		obs.VupenStickyExclude(tag, "24 KB check failed ("+reason+")")
@@ -581,7 +604,13 @@ func (s *vupenSticky) checkCurrent(tag, reason string) {
 }
 
 // search — поиск по пулу: пробы → порядок стратегии → до N проверок 64 КБ.
-func (s *vupenSticky) search(reason string) { s.searchN(reason, VupenStickySearchMaxChecks) }
+func (s *vupenSticky) search(reason string) {
+	// Ядро 82: БС — перелив без поиска; нет сети — без поиска и смены узла.
+	if s.netClassGate(reason) {
+		return
+	}
+	s.searchN(reason, VupenStickySearchMaxChecks)
+}
 
 // searchN — поиск с пределом проверок maxChecks (VupenCheckRoute: maxSwitches);
 // возвращает, сколько узлов проверено загрузкой.

@@ -905,6 +905,15 @@ type vupenAutoJSON struct {
 	AppleViaVpnMode   int  `json:"appleViaVpnMode"`
 	AppleViaVpnOnLte  bool `json:"appleViaVpnOnLte"`
 	AppleViaVpnActive bool `json:"appleViaVpnActive"`
+	// T-091/ядро 82: класс сотовой сети по прямой проверке DNS: "" (не проверялась в этой
+	// сети / не сотовая / нет перелива в конфиге) | normal | whitelist | noNetwork |
+	// unknown; время последней проверки (мс Unix UTC, 0 — не было); итог по адресам
+	// «1.1.1.1=ok 8.8.8.8=fail … 77.88.8.8=ok» (ok | fail | tunnel | local | skip);
+	// перелив держится из-за БС.
+	NetClass          string `json:"netClass"`
+	NetClassAtMs      int64  `json:"netClassAtMs"`
+	NetClassHosts     string `json:"netClassHosts"`
+	NetClassWhitelist bool   `json:"netClassWhitelist"`
 }
 
 func vupenMs(t time.Time) int64 {
@@ -961,6 +970,8 @@ func (r *Router) vupenAutoState() vupenAutoJSON {
 	out.LastCheckRoute = vupenAutoRouteJSON{AtMs: vupenMs(st.LastRoute.at), Mode: st.LastRoute.kind, Verdict: st.LastRoute.detail,
 		From: st.LastRoute.from, To: st.LastRoute.to, Reason: st.LastRoute.reason}
 	out.Spills, out.Returns, out.SpillBlocked = st.Spills, st.Returns, st.SpillBlocked
+	out.NetClass, out.NetClassAtMs, out.NetClassHosts = root.netClassJSON()
+	out.NetClassWhitelist = root.spill != nil && root.spill.byWhitelist.Load()
 	out.Notice = vupenAutoNotice(out)
 	return out
 }
