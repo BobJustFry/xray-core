@@ -368,7 +368,17 @@ func vupenFreezeWrap(ctx context.Context, conn net.Conn, dest net.Destination) n
 	if len(outbounds) == 0 {
 		return conn
 	}
-	tag := outbounds[len(outbounds)-1].Tag
+	last := outbounds[len(outbounds)-1]
+	// T-127 (F1): с xtls-rprx-vision-udp443 каждый UDP-поток (QUIC) идёт по
+	// своему TCP-соединению к узлу. Когда QUIC-поток затихает, соединение молчит
+	// по обычной причине (простой), а не из-за ТСПУ: 31 ложная тревога за 48 мин
+	// (бандл iPhone 2026-10-19). Сеть цели потока — session.Outbound.Target,
+	// диспетчер ставит её до обработчика outbound'а. Целевой TCP по-прежнему
+	// наблюдается; неизвестная сеть (пусто) — тоже.
+	if last.Target.Network == net.Network_UDP {
+		return conn
+	}
+	tag := last.Tag
 	if tag == "" {
 		return conn
 	}

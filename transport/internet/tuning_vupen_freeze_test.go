@@ -435,6 +435,70 @@ func TestVupenFreezeSkipsUnwatchedAndNonTCP(t *testing.T) {
 	}
 }
 
+// targetCtx — контекст с целью потока пользователя: сеть цели несёт
+// session.Outbound.Target (T-127, F1).
+func targetCtx(tag string, target net.Destination) context.Context {
+	return session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Tag: tag, Target: target}})
+}
+
+// T-127 (F1): xtls-rprx-vision-udp443 — каждый QUIC-поток идёт по своему
+// TCP-соединению к узлу; его простой не заморозка. Соединение потока с целью UDP
+// не наблюдается, а то же самое с целью TCP по-прежнему.
+func TestVupenFreezeSkipsUDPTargetFlow(t *testing.T) {
+	freezeTestHooks(t, true)
+	client, server := stdnet.Pipe()
+	defer server.Close()
+	defer client.Close()
+	quic := net.UDPDestination(net.DomainAddress("example.org"), 443)
+	if c := vupenFreezeWrap(targetCtx("proxy-22", quic), client, tcpDest); c != client {
+		t.Fatal("a connection that carries a UDP flow (QUIC) must stay unwrapped")
+	}
+	web := net.TCPDestination(net.DomainAddress("example.org"), 443)
+	w := vupenFreezeWrap(targetCtx("proxy-22", web), client, tcpDest)
+	if _, ok := w.(*vupenFreezeConn); !ok {
+		t.Fatal("a connection that carries a TCP flow must be watched")
+	}
+	w.Close() // leaves the watch set; the loop must not outlive the test
+}
+
+// T-127 (F1): две замолчавшие UDP-целевые соединения не дают тревогу; такие же
+// TCP-целевые — дают (настоящая заморозка не потеряна).
+func TestVupenFreezeIdleUDPFlowsNotReportedTCPStillFrozen(t *testing.T) {
+	hits := freezeTestHooks(t, true)
+	quic := net.UDPDestination(net.DomainAddress("example.org"), 443)
+	web := net.TCPDestination(net.DomainAddress("example.org"), 443)
+	idle := func(ctx context.Context) {
+		client, server := stdnet.Pipe()
+		t.Cleanup(func() { server.Close() })
+		go func() {
+			buf := make([]byte, 2048)
+			if _, err := io.ReadFull(server, buf); err != nil {
+				return
+			}
+			_, _ = server.Write(buf)
+			_, _ = io.Copy(io.Discard, server)
+		}()
+		c := vupenFreezeWrap(ctx, client, tcpDest)
+		t.Cleanup(func() { c.Close() })
+		_, _ = c.Write(make([]byte, 2048))
+		_, _ = io.ReadFull(c, make([]byte, 2048))
+		_, _ = c.Write(make([]byte, 16<<10))
+	}
+	idle(targetCtx("proxy-22", quic))
+	idle(targetCtx("proxy-22", quic))
+	expectNoHit(t, hits, 4*VupenFreezeSilence, "idle UDP-target flows")
+	silentConn(t, targetCtx("proxy-22", web))
+	silentConn(t, targetCtx("proxy-22", web))
+	select {
+	case h := <-hits:
+		if h.tag != "proxy-22" {
+			t.Fatalf("unexpected tag %q", h.tag)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("two silent TCP-target connections must still be reported")
+	}
+}
+
 // Ядро 76: соединение с ошибкой чтения (EOF, сброс) уходит из наблюдения сразу,
 // даже если его не закрыли (рукопожатие TLS с ошибкой сырое соединение не закрывает).
 func TestVupenFreezeReadErrorStopsWatching(t *testing.T) {

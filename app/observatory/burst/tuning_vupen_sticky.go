@@ -22,9 +22,10 @@ import (
 // работает. Пробы, проверка 64 КБ и проверка 24 КБ идут только по запросу
 // балансировщика. Остальные обсерватории (без поля) работают как раньше.
 var (
-	// VupenStickyCheckURL — файл проверки 24 КБ по умолчанию; платформа задаёт
-	// свой через VupenSetCheckURL (ядро 78, tuning_vupen_api.go).
-	VupenStickyCheckURL       = "https://speed.cloudflare.com/__down?bytes=24576"
+	// VupenStickyCheckURL — файл проверки 24 КБ вместо списка по умолчанию
+	// (VupenCheckDefaultURLs, ядро 85); "" — список. Платформа задаёт свой список через
+	// VupenSetCheckURL (tuning_vupen_api.go), он главнее.
+	VupenStickyCheckURL       = ""
 	VupenStickyCheckBytes     = int64(24576)
 	VupenStickyCheckTimeout   = 6 * time.Second
 	VupenStickyCheckStall     = 1500 * time.Millisecond
@@ -88,7 +89,7 @@ func (o *Observer) VupenStickyVerify(tag string) string {
 }
 
 // VupenStickyCheck — загрузка 24 КБ через узел tag мимо правил маршрутизации
-// (файлы VupenSetCheckURL; основной «не понял» — запасной).
+// (список VupenSetCheckURL, правила перебора — tuning_vupen_checklist.go).
 func (o *Observer) VupenStickyCheck(tag string) string {
 	if o.hp == nil {
 		return VupenStickyUnknown

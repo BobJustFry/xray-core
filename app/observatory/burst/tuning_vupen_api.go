@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"slices"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -48,26 +48,27 @@ func vupenOnNetEvent(ev internet.VupenNetEvent) {
 	}
 }
 
-// VupenStickyCheckFallbackURL — запасной файл проверки 24 КБ: им проверяем, когда
-// основной «не понял» (HTTP ≠ 200). "" — без запасного.
+// VupenStickyCheckFallbackURL — запасной файл проверки 24 КБ вместе с VupenStickyCheckURL
+// (прежний путь: тесты и вызывающие без VupenSetCheckURL). В нём можно перечислить
+// несколько адресов через пробел. "" — без запасного.
 var VupenStickyCheckFallbackURL = ""
 
-var vupenCheckURLs atomic.Pointer[[2]string]
-
-// VupenSetCheckURL — основной и запасной файл проверки 24 КБ (экспорт libXray,
-// ADR-0001 §4.4 (6) В2). Только https с именем узла; запасной можно не
-// задавать (""). Ошибка — текст, адреса не меняются; "" — принято.
+// VupenSetCheckURL — файлы проверки 24 КБ (экспорт libXray, ADR-0001 §4.4 (6) В2).
+// Сигнатура прежняя (primary, fallback), чтобы мосты Kotlin/Swift/Windows не менялись; с ядра 85
+// fallback может нести СПИСОК адресов через пробел или перевод строки — порядок списка
+// [primary, fallback...] и есть порядок проверки (tuning_vupen_checklist.go). Только https
+// с именем узла; запасных можно не задавать (""). Ошибка — текст, адреса не меняются;
+// "" — принято.
 func VupenSetCheckURL(primary, fallback string) string {
 	if err := VupenCheckURLError(primary); err != "" {
 		return "primary: " + err
 	}
-	if fallback != "" {
-		if err := VupenCheckURLError(fallback); err != "" {
-			return "fallback: " + err
-		}
+	urls := vupenURLsOf(primary, fallback)
+	if err := vupenValidURLs(urls); err != "" {
+		return err
 	}
-	vupenCheckURLs.Store(&[2]string{primary, fallback})
-	errors.LogWarning(context.Background(), "[sticky] check file ", primary, " (fallback ", fallback, ")")
+	vupenCheckURLs.store(urls)
+	errors.LogWarning(context.Background(), "[sticky] check files ", strings.Join(urls, " "))
 	return ""
 }
 
@@ -91,24 +92,28 @@ func VupenCheckURLError(raw string) string {
 	return ""
 }
 
-// vupenCheckFiles — файлы проверки сейчас: заданные VupenSetCheckURL или по умолчанию.
+// vupenCheckFiles — первый и второй адрес списка 24 КБ сейчас (для тестов и журнала).
 func vupenCheckFiles() (primary, fallback string) {
-	if p := vupenCheckURLs.Load(); p != nil {
-		return p[0], p[1]
+	l := vupenCheckList()
+	if len(l) > 0 {
+		primary = l[0]
 	}
-	return VupenStickyCheckURL, VupenStickyCheckFallbackURL
+	if len(l) > 1 {
+		fallback = l[1]
+	}
+	return
 }
 
 // VupenCheckOptions — параметры одной проверки 24 КБ (VupenCheckRoute). Нули —
 // значения ядра (VupenStickyCheck*, VupenSetCheckURL).
 type VupenCheckOptions struct {
-	URL, FallbackURL string // URL "" — файлы VupenSetCheckURL (запасной — тоже оттуда)
+	URL, FallbackURL string // URL "" — список VupenSetCheckURL; FallbackURL — один адрес или несколько через пробел
 	Bytes            int64
 	Stall            time.Duration
 	FirstByte        time.Duration
 	Timeout          time.Duration
-	// Budget — предел на обе загрузки вместе (основной + запасной; CR-704):
-	// каждая не дольше остатка, запасной не начинается, если остатка нет. 0 — без предела.
+	// Budget — предел на все загрузки проверки вместе (до двух адресов; CR-704):
+	// каждая не дольше остатка, следующая не начинается, если остатка нет. 0 — без предела.
 	Budget time.Duration
 }
 
@@ -140,9 +145,13 @@ func (o *Observer) VupenStickyCheckWithCtx(ctx context.Context, tag string, opt 
 	}
 	ctx, cancel := vupenMergeCtx(o.hp.ctx, ctx) // значения контекста ядра - от hp.ctx
 	defer cancel()
-	primary, fallback := opt.URL, opt.FallbackURL
-	if primary == "" {
-		primary, fallback = vupenCheckFiles()
+	// Без URL — список платформы с памятью выигравшего; с URL — адреса вызывающего, без памяти.
+	var list *vupenURLList
+	var urls []string
+	if opt.URL == "" {
+		list, urls = &vupenCheckURLs, vupenCheckList()
+	} else {
+		urls = vupenURLsOf(opt.URL, opt.FallbackURL)
 	}
 	if opt.Bytes <= 0 {
 		opt.Bytes = VupenStickyCheckBytes
@@ -171,12 +180,23 @@ func (o *Observer) VupenStickyCheckWithCtx(ctx context.Context, tag string, opt 
 		return true
 	}
 	limit()
-	res := o.hp.vupenCheckOnce(ctx, tag, primary, opt)
-	if res.Verdict == VupenStickyUnknown && fallback != "" && fallback != primary && ctx.Err() == nil && limit() {
-		fb := o.hp.vupenCheckOnce(ctx, tag, fallback, opt)
-		fb.Elapsed += res.Elapsed
-		fb.Detail = "fallback after " + res.Detail + ": " + fb.Detail
-		res = fb
+	run := vupenRunList(ctx, list, urls, limit, func() bool { return o.hp.vupenNodeAlive(tag) },
+		func(r vupenDownloadResult) bool { return vupenTspuClassify(r, opt.Bytes) == vupenTspuOK },
+		func(u string) vupenDownloadResult { return o.hp.vupenDownloadCheck(ctx, tag, u, opt) })
+	var res VupenCheckResult
+	if len(run.tries) == 0 {
+		res = VupenCheckResult{Verdict: VupenStickyUnknown, Detail: "no check url"}
+	} else {
+		res = vupenCheckResultOf(run.last().r, opt.Bytes)
+		res.Elapsed = run.elapsed()
+		for i := len(run.tries) - 2; i >= 0; i-- {
+			res.Detail = "fallback after " + run.tries[i].r.String() + ": " + res.Detail
+		}
+		if run.hostDead && !run.ok {
+			// Ни один адрес не открылся одним и тем же образом: виноват хост проверки, а не узел.
+			res.Verdict = VupenStickyUnknown
+			res.Detail += " (check hosts unreachable: not the node)"
+		}
 	}
 	if ctx.Err() != nil && o.hp.ctx.Err() == nil {
 		return VupenCheckResult{Verdict: VupenStickyUnknown, Detail: "aborted by the caller (" + res.Detail + ")", Elapsed: res.Elapsed}
@@ -184,10 +204,15 @@ func (o *Observer) VupenStickyCheckWithCtx(ctx context.Context, tag string, opt 
 	return res
 }
 
-func (h *HealthPing) vupenCheckOnce(ctx context.Context, tag, file string, opt VupenCheckOptions) VupenCheckResult {
+// vupenDownloadCheck — одна загрузка файла проверки 24 КБ через узел tag.
+func (h *HealthPing) vupenDownloadCheck(ctx context.Context, tag, file string, opt VupenCheckOptions) vupenDownloadResult {
 	client := newHTTPClient(ctx, h.dispatcher, tag, 0)
-	r := vupenDownloadFB(ctx, client, file, opt.Timeout, opt.Stall, opt.FirstByte)
-	v := vupenTspuClassify(r, opt.Bytes)
+	return vupenDownloadFB(ctx, client, file, opt.Timeout, opt.Stall, opt.FirstByte)
+}
+
+// vupenCheckResultOf — итог одной загрузки файла проверки 24 КБ.
+func vupenCheckResultOf(r vupenDownloadResult, want int64) VupenCheckResult {
+	v := vupenTspuClassify(r, want)
 	res := VupenCheckResult{Verdict: VupenStickyUnknown, Detail: r.String(), Elapsed: r.elapsed}
 	switch {
 	case v == vupenTspuOK:
@@ -197,10 +222,11 @@ func (h *HealthPing) vupenCheckOnce(ctx context.Context, tag, file string, opt V
 	case r.status == 0 && r.err != nil:
 		// Ответа узла нет вовсе (соединение отвергнуто, сброшено, рукопожатие не
 		// прошло): для проверки текущего это провал — исключать или нет, решит
-		// проверка сети. «Не поняли» — только HTTP ≠ 200 (ответ был). У проверки
-		// 64 КБ (ядро 71) классификация прежняя.
+		// проверка сети. «Не поняли» — только HTTP ≠ 200 (ответ был). Ядро 85: если так
+		// провалились и этот, и запасной адрес одним образом, итог станет unknown выше
+		// (vupenRunList.hostDead). У проверки 64 КБ (ядро 71) классификация прежняя.
 		res.Verdict = VupenStickyFailed
-	case r.status == 200 && r.bytes < vupenStickyExpectedN(r, opt.Bytes) && r.err != nil:
+	case r.status == 200 && r.bytes < vupenStickyExpectedN(r, want) && r.err != nil:
 		// Заголовки пришли, а тело оборвалось ошибкой (сброс посреди файла) — тоже провал.
 		res.Verdict = VupenStickyFailed
 	}
@@ -220,7 +246,7 @@ func (h *HealthPing) vupenCheckOnce(ctx context.Context, tag, file string, opt V
 }
 
 func vupenStickyExpectedN(r vupenDownloadResult, want int64) int64 {
-	if r.expected > 0 {
+	if r.expected > want {
 		return r.expected
 	}
 	return want

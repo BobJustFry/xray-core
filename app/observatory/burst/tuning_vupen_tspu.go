@@ -38,8 +38,10 @@ import (
 // Трафик: 64 КБ на кандидата раз в 30 минут и по тревоге сторожа, а не на
 // каждый узел каждый раунд.
 var (
-	VupenTspuEnabled      = true
-	VupenTspuURL          = "https://speed.cloudflare.com/__down?bytes=65536"
+	VupenTspuEnabled = true
+	// VupenTspuURL — один файл 64 КБ вместо списка по умолчанию (VupenTspuDefaultURLs,
+	// ядро 85); "" — список. Список платформе: VupenSetTspuURLs.
+	VupenTspuURL          = ""
 	VupenTspuBytes        = int64(64 << 10)
 	VupenTspuTimeout      = 15 * time.Second
 	VupenTspuStall        = 5 * time.Second
@@ -53,6 +55,14 @@ var (
 	VupenTspuRecheckAfter = 3 * time.Minute
 	VupenTspuRetryPause   = 2 * time.Second
 )
+
+// VupenTspuBudget — потолок на всю проверку 64 КБ по списку адресов (ядро 85, T-131):
+// второй адрес пробуем, только если осталось не меньше vupenTspuMinTry, и с остатком
+// бюджета как сроком. 0 — без потолка. Результат первого адреса бюджет не меняет.
+var VupenTspuBudget = 20 * time.Second
+
+// vupenTspuMinTry — меньше этого остатка бюджета на следующий адрес не берём.
+var vupenTspuMinTry = 3 * time.Second
 
 type vupenTspuVerdict int
 
@@ -297,11 +307,39 @@ func (h *HealthPing) vupenTspuVerifyCtx(callerCtx context.Context, tag, reason s
 	return verdict
 }
 
-// vupenTspuProbeOnce — одна загрузка через узел tag.
+// vupenTspuProbeOnce — одна проверка 64 КБ через узел tag: файл списка (ядро 85), при
+// провале «со стороны хоста» — следующий (правила — tuning_vupen_checklist.go).
 func (h *HealthPing) vupenTspuProbeOnce(ctx context.Context, tag string, stall time.Duration) (vupenTspuVerdict, string) {
-	client := newHTTPClient(h.ctx, h.dispatcher, tag, 0)
-	r := vupenDownload(ctx, client, VupenTspuURL, VupenTspuTimeout, stall)
-	return vupenTspuClassify(r, VupenTspuBytes), r.String()
+	// Бюджет на весь список (T-131, CR-005): без него худший случай — 2 × VupenTspuTimeout.
+	// Первый адрес получает полный срок, следующий — остаток бюджета.
+	begin := time.Now()
+	left := func() time.Duration { return VupenTspuBudget - time.Since(begin) }
+	run := vupenRunList(ctx, &vupenTspuURLs, vupenTspuList(),
+		func() bool { return VupenTspuBudget <= 0 || left() >= vupenTspuMinTry },
+		func() bool { return h.vupenNodeAlive(tag) },
+		func(r vupenDownloadResult) bool { return vupenTspuClassify(r, VupenTspuBytes) == vupenTspuOK },
+		func(u string) vupenDownloadResult {
+			timeout := VupenTspuTimeout
+			if VupenTspuBudget > 0 && left() < timeout {
+				timeout = left()
+			}
+			client := newHTTPClient(h.ctx, h.dispatcher, tag, 0)
+			return vupenDownload(ctx, client, u, timeout, stall)
+		})
+	if len(run.tries) == 0 {
+		return vupenTspuUnknown, "no check url"
+	}
+	last := run.last().r
+	detail := last.String()
+	for i := len(run.tries) - 2; i >= 0; i-- {
+		detail = "fallback after " + run.tries[i].r.String() + ": " + detail
+	}
+	// Хост проверки недоступен (и не только по HTTP) — это не заморозка узла.
+	v := vupenTspuClassify(last, VupenTspuBytes)
+	if run.hostDead && !run.ok {
+		v = vupenTspuUnknown
+	}
+	return v, detail
 }
 
 type vupenDownloadResult struct {
@@ -320,8 +358,13 @@ func (r vupenDownloadResult) String() string {
 	switch {
 	case r.status == 200 && r.bytes >= r.expected && r.expected > 0:
 		return fmt.Sprintf("%d KB in %d ms", r.bytes>>10, r.elapsed.Milliseconds())
-	case r.stalled:
+	case r.status == 200 && r.expected <= 0 && r.err == nil && r.bytes > 0:
+		// Без Content-Length (chunked: jsDelivr) — ожидаемого размера нет, печатаем полученное.
+		return fmt.Sprintf("%d KB in %d ms (no Content-Length)", r.bytes>>10, r.elapsed.Milliseconds())
+	case r.stalled && r.expected > 0:
 		return fmt.Sprintf("stalled at %d KB of %d (%s silence)", r.bytes>>10, r.expected>>10, r.stallWait)
+	case r.stalled:
+		return fmt.Sprintf("stalled at %d KB (no Content-Length, %s silence)", r.bytes>>10, r.stallWait)
 	case !r.started && r.timedOut:
 		return fmt.Sprintf("the file never started in %s", r.elapsed.Round(time.Second))
 	case r.status != 0 && r.status != 200:
@@ -329,13 +372,18 @@ func (r vupenDownloadResult) String() string {
 	case r.err != nil:
 		return fmt.Sprintf("error after %d KB: %v", r.bytes>>10, r.err)
 	}
-	return fmt.Sprintf("%d KB of %d", r.bytes>>10, r.expected>>10)
+	if r.expected <= 0 {
+		return fmt.Sprintf("%d KB (no Content-Length)", r.bytes>>10)
+	}
+	return fmt.Sprintf("%d KB of %d KB", r.bytes>>10, r.expected>>10)
 }
 
 // vupenTspuClassify — итог одной загрузки. Чистая функция, под тест.
 func vupenTspuClassify(r vupenDownloadResult, want int64) vupenTspuVerdict {
+	// Пол — want (T-131, CR-006): Content-Length меньше want не даёт «проверить» узел
+	// меньшим объёмом, чем нужно; больше want — сверяем с Content-Length (файл целиком).
 	expected := r.expected
-	if expected <= 0 {
+	if expected < want {
 		expected = want
 	}
 	if r.status == 200 && r.bytes >= expected {

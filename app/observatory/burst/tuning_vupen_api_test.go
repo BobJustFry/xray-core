@@ -78,8 +78,8 @@ func TestVupenGraceArmedBeforeConnectionsClose(t *testing.T) {
 }
 
 func TestVupenSetCheckURL(t *testing.T) {
-	t.Cleanup(func() { vupenCheckURLs.Store(nil) })
-	vupenCheckURLs.Store(nil)
+	t.Cleanup(func() { vupenCheckURLs.reset() })
+	vupenCheckURLs.reset()
 	def, defFB := vupenCheckFiles()
 	for _, c := range [][2]string{
 		{"", ""}, {"http://vupen.fun/24k.bin", ""}, {"https://", ""}, {"https://user:pw@vupen.fun/x", ""},
