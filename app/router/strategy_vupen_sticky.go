@@ -131,6 +131,8 @@ type vupenStickyEvent struct {
 	eraSince int64
 	// Ядро 83 (T-102): когда событие поставлено в очередь - для журнала ожидания.
 	at time.Time
+	// Ядро 86 (T-168): kind "netclass" от таймера повторной проверки - поколение таймера.
+	gen uint64
 }
 
 type vupenSticky struct {
@@ -443,6 +445,7 @@ func (s *vupenSticky) stop() {
 		unsub, unsubSignals := s.unsub, s.unsubSignals
 		s.life.Unlock()
 		close(s.stopCh)
+		s.netClassCancelRetry() // ядро 86: повторных проверок класса сети больше нет
 		if unsub != nil {
 			unsub()
 		}
@@ -557,6 +560,14 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 	case "lte-recheck":
 		s.lteRecheck()
 	case "netclass":
+		if ev.reason == vupenNetClassRetryReason {
+			// Ядро 86 (T-168): повторная проверка после «нет сети» на сотовой, в любой фазе;
+			// устаревшее событие (сеть сменилась, цепочка снята) отбрасывается.
+			if s.netClassRetryDue(ev.gen) {
+				s.runNetClass(ev.reason)
+			}
+			break
+		}
 		s.runNetClass(ev.reason)
 		if ev.reason == "network changed" || ev.reason == "net-stable" {
 			s.netClassSettled()

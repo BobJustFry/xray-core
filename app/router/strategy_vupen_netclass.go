@@ -103,7 +103,17 @@ type vupenNetClassState struct {
 	// Ядро 83 (T-102): со смены сети до разбора события проверки класса - поиски и
 	// проверки ждут (strategy_vupen_search_epoch.go).
 	settling bool
+	// Ядро 86 (T-168): повторная проверка после «нет сети» на сотовой (netClassRearm).
+	// retryOn - цепочка идёт; retryIdx - следующая пауза из VupenStickyRetry; retryGen -
+	// поколение таймера (устаревшее событие отбрасывается).
+	retryOn   bool
+	retryIdx  int
+	retryGen  uint64
+	retryStop func() bool
 }
+
+// vupenNetClassRetryReason - причина события "netclass" от таймера повторной проверки.
+const vupenNetClassRetryReason = "noNetwork retry"
 
 // vupenDirectConnect — прямое TCP-соединение (процесс не в туннеле); viaTunnel —
 // локальный адрес сокета принадлежит интерфейсу туннеля.
@@ -296,9 +306,105 @@ func (s *vupenSticky) netClassProbe(reason string) string {
 	prev := c.class
 	c.class, c.epoch, c.last = res.class, epoch, res
 	c.probes++
+	s.netClassRearmLocked(res.class)
 	c.mu.Unlock()
 	xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": ", res.class, " (", reason, "; was ", orDash(prev), ") ", res.short())
 	return res.class
+}
+
+// netClassRearmLocked - ядро 86 (T-168): итог «нет сети» на сотовой (netClassProbe работает
+// только на ней) в ЛЮБОЙ фазе, в том числе при удержании узла, взводит повторную проверку
+// с растущей паузой VupenStickyRetry (30 с, 1, 2, 5 мин; последняя повторяется). Раньше
+// график взводил только netClassGate и только не при Holding: ядро с мёртвым узлом так и
+// не узнавало, что сеть стала БС (инцидент iOS 4.1.666: 4 минуты на мёртвом узле).
+// whitelist/normal - цепочка снята; unknown - цепочка, если шла, продолжается.
+// Вызывается под c.mu из netClassProbe (горутина обработчика).
+func (s *vupenSticky) netClassRearmLocked(class string) {
+	c := &s.netcls
+	switch class {
+	case vupenNetClassNoNetwork:
+	case vupenNetClassUnknown:
+		if !c.retryOn {
+			return
+		}
+	default:
+		s.netClassCancelRetryLocked()
+		return
+	}
+	select {
+	case <-s.stopCh:
+		return // ядро остановлено: таймеров больше не ставим
+	default:
+	}
+	if c.retryStop != nil {
+		c.retryStop()
+	}
+	i := c.retryIdx
+	if i >= len(VupenStickyRetry) {
+		i = len(VupenStickyRetry) - 1
+	}
+	d := VupenStickyRetry[i]
+	if c.retryIdx < len(VupenStickyRetry)-1 {
+		c.retryIdx++
+	}
+	c.retryOn = true
+	c.retryGen++
+	gen := c.retryGen
+	c.retryStop = vupenStickyAfter(d, func() {
+		s.send(vupenStickyEvent{kind: "netclass", reason: vupenNetClassRetryReason, gen: gen})
+	})
+	xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": ", class, " on cellular — re-probe in ", d)
+}
+
+func (s *vupenSticky) netClassCancelRetryLocked() {
+	c := &s.netcls
+	if c.retryStop != nil {
+		c.retryStop()
+		c.retryStop = nil
+	}
+	c.retryOn, c.retryIdx = false, 0
+	c.retryGen++ // уже поставленное в очередь событие устарело
+}
+
+// netClassCancelRetry - остановка ядра: повторных проверок больше нет.
+func (s *vupenSticky) netClassCancelRetry() {
+	c := &s.netcls
+	c.mu.Lock()
+	s.netClassCancelRetryLocked()
+	c.mu.Unlock()
+}
+
+// netClassRetryDue - событие таймера повторной проверки актуально: то же поколение, цепочка
+// идёт, сеть та же и всё ещё сотовая. Иначе цепочка снимается.
+func (s *vupenSticky) netClassRetryDue(gen uint64) bool {
+	c := &s.netcls
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.retryOn || c.retryGen != gen {
+		return false
+	}
+	if !s.netClassActive() || c.epoch != vupenNetEpochNow() {
+		s.netClassCancelRetryLocked()
+		return false
+	}
+	return true
+}
+
+// netClassHealGate - ядро 86 (T-168): путь, запущенный приложением (VupenCheckRoute heal),
+// спрашивает класс сети до исключения узла и поиска по REG. БС - перелив в LTE сразу
+// (true: поиск не нужен); остальное, в том числе «нет сети» (приложение само увидело отказ),
+// - false, всё как раньше. Не меняет результата netClassGate. Wi-Fi/проводная -
+// netClassActive выдаёт пусто, ожидания нет; на сотовой не дольше VupenNetClassTimeout, и
+// только если класс в этой сети ещё не определён или старше VupenNetClassMinGap.
+func (s *vupenSticky) netClassHealGate(reason string) bool {
+	if s.netClassFresh(reason) != vupenNetClassWhitelist {
+		return false
+	}
+	if !s.spillWhitelist(reason) {
+		return false
+	}
+	xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": whitelist — REG search skipped (", reason, ")")
+	return true
 }
 
 func orDash(s string) string {
@@ -476,6 +582,7 @@ func (s *vupenSticky) netClassOnChanged() {
 	c := &s.netcls
 	c.mu.Lock()
 	c.class = ""
+	s.netClassCancelRetryLocked() // ядро 86: новая сеть - новая цепочка повторных проверок
 	if c.stopSettle != nil {
 		c.stopSettle()
 		c.stopSettle = nil

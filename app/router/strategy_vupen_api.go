@@ -411,6 +411,11 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 	case vupenPhaseNoWorking:
 		// Рабочих не было: поискать сразу (как повтор по графику).
 		s.retryIdx = 0
+		// Ядро 86 (T-168): на сотовой сначала класс сети - БС значит сразу в LTE, без
+		// поиска по REG (31 узел, ~55 с).
+		if s.netClassHealGate("checkRoute heal") {
+			return s.healOutcome(resp)
+		}
 		resp.Tried = s.searchN("checkRoute heal", q.maxSwitches())
 		return s.healOutcome(resp)
 	default:
@@ -469,6 +474,14 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 		default:
 			return resp
 		}
+	}
+	// Ядро 86 (T-168): прежде чем винить узел и искать по REG - не БС ли (на Wi-Fi ожидания нет).
+	// БС: перелив в LTE, узел не исключается (как в проверке самого ядра), его соединения закрыты.
+	if s.netClassHealGate("checkRoute: " + tag + " failed") {
+		if q.closeConns() {
+			resp.Closed = ro.VupenStickyCloseConns(tag)
+		}
+		return s.healOutcome(resp)
 	}
 	exclude := time.Duration(q.ExcludeMin) * time.Minute
 	ro.VupenStickyExcludeFor(tag, "checkRoute ("+q.Reason+")", exclude)
