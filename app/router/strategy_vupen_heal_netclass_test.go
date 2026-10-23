@@ -574,3 +574,26 @@ func TestVupenNetClassRetryRearmsWhenQueueFull(t *testing.T) {
 		t.Fatal("the chain continues after the probe (still no network)")
 	}
 }
+
+// CR-401: NoWorking, сеть сменилась внутри замера класса и net-stable не пришёл (возврат на
+// базовую сеть шлёт Changed без Stable): heal сам ставит повтор ~30 с, и поиск идёт по нему.
+func TestVupenHealNoWorkingEpochChangeInsideProbeSchedulesRetry(t *testing.T) {
+	r, f := healHolding(t)
+	r.reg.setPhase(vupenPhaseNoWorking)
+	f.whitelist()
+	bumpEpochInProbe(f)
+	resp := r.reg.healRoute(healReqNow())
+	if resp.Verdict != vupenRouteNoWorking || resp.Tried != 0 || ncRegSearched(r) {
+		t.Fatalf("no immediate search: %+v", resp)
+	}
+	pend := r.retryPending()
+	if len(pend) != 1 || pend[0] != 30*time.Second {
+		t.Fatalf("one ~30s retry timer expected, got %v", pend)
+	}
+	f.normal() // в новой сети класс обычный: поиск по REG
+	r.clock.Advance(30 * time.Second)
+	r.drain()
+	if !ncRegSearched(r) {
+		t.Fatalf("the search must run after the retry: probes=%v", r.obs.probes)
+	}
+}

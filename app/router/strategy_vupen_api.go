@@ -422,6 +422,9 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 			// новой сети до определения её класса не нужен: net-stable запустит его сам.
 			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute heal: the network changed during the netclass probe (epoch %d → %d) → search left to the network event",
 				s.balancer, epoch, vupenNetEpochNow()))
+			// CR-401: net-stable may never come (a flap back to the base network sends Changed
+			// without Stable; the queue may be full) - the retry timer (~30 s, retryIdx=0) guarantees a search.
+			s.scheduleRetry(false)
 			resp.Detail = "the network changed during the network class probe — the search is left to the network event"
 			return s.healOutcome(resp)
 		}
