@@ -413,7 +413,16 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 		s.retryIdx = 0
 		// Ядро 86 (T-168): на сотовой сначала класс сети - БС значит сразу в LTE, без
 		// поиска по REG (31 узел, ~55 с).
+		epoch := vupenNetEpochNow()
 		if s.netClassHealGate("checkRoute heal") {
+			return s.healOutcome(resp)
+		}
+		if vupenNetEpochNow() != epoch {
+			// CR-301: сеть сменилась внутри замера класса (результат выброшен). Поиск по REG в
+			// новой сети до определения её класса не нужен: net-stable запустит его сам.
+			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute heal: the network changed during the netclass probe (epoch %d → %d) → search left to the network event",
+				s.balancer, epoch, vupenNetEpochNow()))
+			resp.Detail = "the network changed during the network class probe — the search is left to the network event"
 			return s.healOutcome(resp)
 		}
 		resp.Tried = s.searchN("checkRoute heal", q.maxSwitches())
@@ -477,11 +486,26 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 	}
 	// Ядро 86 (T-168): прежде чем винить узел и искать по REG - не БС ли (на Wi-Fi ожидания нет).
 	// БС: перелив в LTE, узел не исключается (как в проверке самого ядра), его соединения закрыты.
+	epoch := vupenNetEpochNow()
 	if s.netClassHealGate("checkRoute: " + tag + " failed") {
 		if q.closeConns() {
 			resp.Closed = ro.VupenStickyCloseConns(tag)
 		}
 		return s.healOutcome(resp)
+	}
+	if now := vupenNetEpochNow(); now != epoch {
+		// CR-301: сеть сменилась внутри замера класса (результат выброшен): провал - в старой
+		// сети, узел не исключается, как в checkCurrent; проверка ставится заново.
+		select {
+		case <-s.stopCh:
+		default:
+			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute heal: %s failed, but the network changed during the netclass probe (epoch %d → %d) → node kept, re-check",
+				s.balancer, tag, epoch, now))
+			s.requestCheck("network changed during heal")
+		}
+		resp.Kind = ""
+		resp.Detail = "the network changed during the check — node kept, re-check queued"
+		return resp
 	}
 	exclude := time.Duration(q.ExcludeMin) * time.Minute
 	ro.VupenStickyExcludeFor(tag, "checkRoute ("+q.Reason+")", exclude)

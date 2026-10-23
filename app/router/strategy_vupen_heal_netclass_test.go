@@ -1,6 +1,8 @@
 package router
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -303,17 +305,272 @@ func TestVupenNetClassRetryStoppedWithTheCore(t *testing.T) {
 	}
 }
 
-// noNetwork при отсутствии узла (no-working): цепочка и график поиска не удваивают замеры.
+// noNetwork при отсутствии узла (no-working): цепочка и график поиска не удваивают замеры
+// на нескольких интервалах подряд (30 с, 1, 2, 5 мин): ровно один замер на интервал.
 func TestVupenNetClassRetryNoWorkingNoDoubleProbes(t *testing.T) {
 	r, f := healHolding(t)
 	r.reg.setPhase(vupenPhaseNoWorking)
 	f.down()
 	r.reg.search("test") // вентиль: нет сети → график поиска (scheduleRetry)
 	r.drain()
-	base := f.probes()
-	r.clock.Advance(30 * time.Second)
+	for i, d := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute} {
+		base := f.probes()
+		r.clock.Advance(d)
+		r.drain()
+		if got := f.probes() - base; got != 1 {
+			t.Fatalf("interval %d (%v): one probe expected, got %d", i, d, got)
+		}
+	}
+}
+
+// ── CR-301: смена сети внутри замера класса в пути heal ──────────────────────
+
+// bumpEpochInProbe - первый же прямой замер класса меняет эпоху сети (тип сети остаётся
+// сотовым): замер выбрасывается как устаревший.
+func bumpEpochInProbe(f *ncFake) {
+	orig := vupenNetClassConnect
+	var once sync.Once
+	vupenNetClassConnect = func(ctx context.Context, hostport string) (bool, error) {
+		once.Do(f.newEpoch)
+		return orig(ctx, hostport)
+	}
+}
+
+// queuedEvents - события в очереди ядра (без разбора).
+func (r *spillRig) queuedEvents() []vupenStickyEvent {
+	var out []vupenStickyEvent
+	for {
+		select {
+		case ev := <-r.reg.events:
+			out = append(out, ev)
+		default:
+			return out
+		}
+	}
+}
+
+// Узел не прошёл проверку heal, сеть сменилась внутри замера класса: провал случился в старой
+// сети - узел не исключается, поиска по REG нет, проверка ставится заново (как в checkCurrent).
+func TestVupenHealNetClassEpochChangeInsideProbeKeepsNode(t *testing.T) {
+	r, f := healHolding(t)
+	f.whitelist() // в новой сети был бы ответ БС, но он выброшен
+	r.obs.setRoute("p-1", vupenStickyFailed, "stall")
+	bumpEpochInProbe(f)
+	resp := r.reg.healRoute(healReqNow())
+	if resp.Verdict != vupenRouteUnknown || resp.Kind != "" {
+		t.Fatalf("node kept, verdict unknown: %+v", resp)
+	}
+	if r.excludedForCount() != 0 || r.obs.excluded["p-1"] {
+		t.Fatal("the node must not be excluded: the failure belongs to the old network")
+	}
+	if ncRegSearched(r) || len(r.obs.closedTags) != 0 {
+		t.Fatalf("no REG probes and no closed connections: probes=%v verifies=%v closed=%v", r.obs.probes, r.obs.verifies, r.obs.closedTags)
+	}
+	if r.reg.spilledNow() {
+		t.Fatal("no spill: the class of the new network is not known yet")
+	}
+	if !r.reg.checkPending.Load() {
+		t.Fatal("the re-check must be pending")
+	}
+	evs := r.queuedEvents()
+	if len(evs) != 1 || evs[0].kind != "check" || evs[0].reason != "network changed during heal" {
+		t.Fatalf("one re-check event expected: %+v", evs)
+	}
+	if r.reg.getPhase() != vupenPhaseHolding || r.reg.current != "p-1" {
+		t.Fatalf("the node is held: %v %q", r.reg.getPhase(), r.reg.current)
+	}
+}
+
+// То же для no-working: поиска по REG в новой сети до определения её класса нет, исключать нечего.
+func TestVupenHealNetClassEpochChangeInsideProbeFromNoWorking(t *testing.T) {
+	r, f := healHolding(t)
+	r.reg.setPhase(vupenPhaseNoWorking)
+	f.whitelist()
+	bumpEpochInProbe(f)
+	resp := r.reg.healRoute(healReqNow())
+	if resp.Verdict != vupenRouteNoWorking || resp.Tried != 0 {
+		t.Fatalf("no search on the new network: %+v", resp)
+	}
+	if ncRegSearched(r) || ncRegProbed(r) || r.excludedForCount() != 0 {
+		t.Fatalf("no REG probes, no exclusion: probes=%v verifies=%v", r.obs.probes, r.obs.verifies)
+	}
+	if r.reg.spilledNow() || r.reg.getPhase() != vupenPhaseNoWorking {
+		t.Fatal("nothing changed: the network event decides")
+	}
+	if evs := r.queuedEvents(); len(evs) != 0 {
+		t.Fatalf("no events queued by heal itself: %+v", evs)
+	}
+}
+
+// После поставленной проверки (новая сеть, БС) цепочка доходит до перелива, узел не исключён.
+func TestVupenHealNetClassEpochChangeThenRecheckSpillsWithoutExclusion(t *testing.T) {
+	r, f := healHolding(t)
+	f.whitelist()
+	r.obs.setRoute("p-1", vupenStickyFailed, "stall")
+	r.obs.mu.Lock()
+	r.obs.check["p-1"] = vupenStickyFailed
+	r.obs.mu.Unlock()
+	bumpEpochInProbe(f)
+	r.reg.healRoute(healReqNow())
+	r.drain() // повторная проверка p-1 в новой эпохе: провал → класс (БС) → перелив
+	if !r.reg.spilledNow() || !r.reg.spill.byWhitelist.Load() {
+		t.Fatal("the re-check sees the whitelist and spills")
+	}
+	if r.excludedForCount() != 0 || r.obs.excluded["p-1"] || ncRegSearched(r) {
+		t.Fatal("still no exclusion and no REG sweep")
+	}
+}
+
+// ── устаревшее поколение, перелив, переход БС → нормальная ───────────────────
+
+// (b) событие повтора старого поколения при идущей цепочке отбрасывается: второй цепочки нет.
+func TestVupenNetClassStaleGenRetryEventIgnoredWhileChainOn(t *testing.T) {
+	r, f := retryHolding(t)
+	r.clock.Advance(30 * time.Second) // замер, новое поколение
 	r.drain()
-	if got := f.probes() - base; got != 1 {
+	gen := r.reg.netcls.retryGen
+	idx := r.reg.netcls.retryIdx
+	if !r.reg.netcls.retryOn || gen < 2 {
+		t.Fatalf("setup: chain on, gen %d", gen)
+	}
+	before, pending := f.probes(), len(r.retryPending())
+	r.reg.send(vupenStickyEvent{kind: "netclass", reason: vupenNetClassRetryReason, gen: gen - 1})
+	r.drain()
+	if f.probes() != before {
+		t.Fatalf("a stale event must not probe: %d", f.probes()-before)
+	}
+	if !r.reg.netcls.retryOn || r.reg.netcls.retryGen != gen || r.reg.netcls.retryIdx != idx || len(r.retryPending()) != pending {
+		t.Fatalf("the live chain is untouched: on=%v gen %d→%d idx %d→%d timers %d→%d", r.reg.netcls.retryOn,
+			gen, r.reg.netcls.retryGen, idx, r.reg.netcls.retryIdx, pending, len(r.retryPending()))
+	}
+	// и дальше ровно один замер на интервал
+	r.clock.Advance(time.Minute)
+	r.drain()
+	if got := f.probes() - before; got != 1 {
 		t.Fatalf("one probe per interval, got %d", got)
+	}
+}
+
+// (c) heal, когда уже перелито по БС и класс в памяти: без нового замера, без поиска, без исключения.
+func TestVupenHealNetClassWhileAlreadySpilledWithCachedWhitelist(t *testing.T) {
+	r, f := healHolding(t)
+	f.whitelist()
+	r.reg.runNetClass("test")
+	r.drain()
+	if !r.reg.spilledNow() || !r.reg.spill.byWhitelist.Load() {
+		t.Fatal("setup: spilled by whitelist")
+	}
+	r.obs.setRoute("p-1", vupenStickyFailed, "stall")
+	before := f.probes()
+	resp := r.reg.healRoute(healReqNow())
+	if resp.Verdict != vupenRouteSpilledLTE {
+		t.Fatalf("already spilled: %+v", resp)
+	}
+	if f.probes() != before {
+		t.Fatalf("the cached class is reused: %d probes", f.probes()-before)
+	}
+	if ncRegSearched(r) || r.excludedForCount() != 0 || r.obs.excluded["p-1"] {
+		t.Fatal("no REG sweep and no exclusion")
+	}
+}
+
+// (d) БС → нормальная после спилла из heal: мёртвый, но удержанный (не исключённый) узел
+// проверяется снова обычным путём whitelistEnded → search.
+func TestVupenHealNetClassWhitelistThenNormalChecksHeldNodeAgain(t *testing.T) {
+	r, f := healHolding(t)
+	f.whitelist()
+	r.obs.setRoute("p-1", vupenStickyFailed, "stall")
+	resp := r.reg.healRoute(healReqNow())
+	if resp.Verdict != vupenRouteSpilledLTE || r.obs.excluded["p-1"] {
+		t.Fatalf("setup: spilled, node held: %+v", resp)
+	}
+	r.drain()
+	r.obs.mu.Lock()
+	r.obs.verifies = nil
+	r.obs.mu.Unlock()
+	f.normal()
+	r.clock.Advance(VupenNetClassMinGap + time.Second) // класс устарел - замер заново
+	r.reg.runNetClass("test")
+	r.drain()
+	if r.reg.spilledNow() {
+		t.Fatal("foreign hosts answer again: back to REG")
+	}
+	if !ncRegSearched(r) {
+		t.Fatal("whitelistEnded → search over REG")
+	}
+	r.obs.mu.Lock()
+	defer r.obs.mu.Unlock()
+	found := false
+	for _, v := range r.obs.verifies {
+		found = found || v == "p-1"
+	}
+	if !found {
+		t.Fatalf("the held node p-1 is verified again: %v", r.obs.verifies)
+	}
+}
+
+// (e) смена эпохи при той же сотовой сети (тип сети не менялся): цепочка снята, событие
+// старого поколения ничего не меряет. Вариант без netClassOnChanged: просроченный таймер
+// сам видит новую эпоху.
+func TestVupenNetClassRetryCancelledByEpochChangeOnCellular(t *testing.T) {
+	t.Run("onChanged", func(t *testing.T) {
+		r, f := retryHolding(t)
+		staleGen := r.reg.netcls.retryGen
+		f.newEpoch() // uplink остаётся cellular
+		r.reg.netClassOnChanged()
+		r.drain()
+		if r.reg.netcls.retryOn || r.reg.netcls.retryGen == staleGen {
+			t.Fatal("the chain is cancelled and its generation is outdated")
+		}
+		before := f.probes()
+		r.reg.send(vupenStickyEvent{kind: "netclass", reason: vupenNetClassRetryReason, gen: staleGen})
+		r.drain() // до срока settle: ни стале-событие, ни старая цепочка не меряют
+		if f.probes() != before {
+			t.Fatalf("no re-probe from the old chain: %d", f.probes()-before)
+		}
+	})
+	t.Run("timerSeesNewEpoch", func(t *testing.T) {
+		r, f := retryHolding(t)
+		f.newEpoch() // netClassOnChanged не вызывался
+		before := f.probes()
+		r.clock.Advance(30 * time.Second)
+		r.drain()
+		if f.probes() != before || r.reg.netcls.retryOn {
+			t.Fatalf("a due timer from the old epoch cancels the chain: probes %d, on=%v", f.probes()-before, r.reg.netcls.retryOn)
+		}
+		r.clock.Advance(10 * time.Minute)
+		r.drain()
+		if f.probes() != before {
+			t.Fatal("and nothing follows")
+		}
+	})
+}
+
+// (f) CR-303: очередь событий полна в момент срока - цепочка не обрывается, таймер взводится
+// заново и замер всё же выполняется.
+func TestVupenNetClassRetryRearmsWhenQueueFull(t *testing.T) {
+	r, f := retryHolding(t)
+	for len(r.reg.events) < cap(r.reg.events) {
+		r.reg.events <- vupenStickyEvent{kind: "settled"}
+	}
+	before := f.probes()
+	r.clock.Advance(30 * time.Second) // send не влезает
+	if !r.reg.netcls.retryOn {
+		t.Fatal("the chain must stay on")
+	}
+	if p := r.retryPending(); len(p) != 1 || p[0] != 30*time.Second {
+		t.Fatalf("a re-armed timer expected: %v", p)
+	}
+	r.drain() // очередь освободилась
+	if f.probes() != before {
+		t.Fatal("the dropped event did not probe")
+	}
+	r.clock.Advance(30 * time.Second) // повтор той же паузы
+	r.drain()
+	if got := f.probes() - before; got != 1 {
+		t.Fatalf("the re-armed timer probes once, got %d", got)
+	}
+	if !r.reg.netcls.retryOn {
+		t.Fatal("the chain continues after the probe (still no network)")
 	}
 }

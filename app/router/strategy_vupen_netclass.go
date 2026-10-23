@@ -350,10 +350,33 @@ func (s *vupenSticky) netClassRearmLocked(class string) {
 	c.retryOn = true
 	c.retryGen++
 	gen := c.retryGen
-	c.retryStop = vupenStickyAfter(d, func() {
-		s.send(vupenStickyEvent{kind: "netclass", reason: vupenNetClassRetryReason, gen: gen})
-	})
+	c.retryStop = s.netClassArmRetry(d, gen)
 	xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": ", class, " on cellular — re-probe in ", d)
+}
+
+// netClassArmRetry - таймер повторной проверки. Если событие не влезло в очередь (она
+// полна), цепочка не должна оборваться: таймер взводится заново на ту же паузу (CR-303), пока
+// цепочка того же поколения идёт и ядро не остановлено. Как и таймер settle, не держит c.mu
+// при вызове send.
+func (s *vupenSticky) netClassArmRetry(d time.Duration, gen uint64) func() bool {
+	return vupenStickyAfter(d, func() {
+		if s.send(vupenStickyEvent{kind: "netclass", reason: vupenNetClassRetryReason, gen: gen}) {
+			return
+		}
+		c := &s.netcls
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if !c.retryOn || c.retryGen != gen {
+			return
+		}
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		c.retryStop = s.netClassArmRetry(d, gen)
+		xerrors.LogWarning(s.logCtx(), "[netclass] ", s.balancer, ": event queue full — re-probe re-armed in ", d)
+	})
 }
 
 func (s *vupenSticky) netClassCancelRetryLocked() {
