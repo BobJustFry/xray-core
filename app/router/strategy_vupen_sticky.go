@@ -197,6 +197,16 @@ type vupenSticky struct {
 	deferred       []vupenStickyEvent
 	dropped        atomic.Int64
 	whitelistSince atomic.Int64
+
+	// Ядро 87 (T-189): узел, который проходил проверку последним (показывается, пока поиск
+	// не подтвердил новый); повторная проверка после окна смены сети (strategy_vupen_settle.go).
+	lastAlive   atomic.Pointer[string]
+	settleMu    sync.Mutex
+	settleArmed bool
+	settleStop  func() bool
+	// T-192 (CR-707): запомненный временный узел для pick(), пока текущий исключён.
+	interimMu   sync.Mutex
+	interimMemo *vupenInterimMemo
 }
 
 func newVupenSticky(br *BalancingRule, b *Balancer) *vupenSticky {
@@ -271,7 +281,8 @@ func (s *vupenSticky) pick(cands []string) string {
 				if s.excludedSent.CompareAndSwap(false, true) && !s.send(vupenStickyEvent{kind: "current-excluded"}) {
 					s.excludedSent.Store(false) // очередь полна — попробуем на следующем соединении
 				}
-				return s.fallbackPick(cands)
+				s.forgetAlive(tag) // исключённый узел - не «последний проверенный» (T-192, CR-702)
+				return s.interimPickCached(cands)
 			}
 		}
 		return tag
@@ -318,7 +329,7 @@ func (s *vupenSticky) start(cands []string) {
 				" is not in the pool → search")
 		}
 		s.setPhase(vupenPhaseSearching)
-		s.publish(s.fallbackPick(cands))
+		s.publish(s.interimPick(cands))
 		s.send(vupenStickyEvent{kind: "search", reason: "no initial"})
 	}
 	s.life.Lock()
@@ -446,6 +457,7 @@ func (s *vupenSticky) stop() {
 		s.life.Unlock()
 		close(s.stopCh)
 		s.netClassCancelRetry() // ядро 86: повторных проверок класса сети больше нет
+		s.stopSettleRecheck()   // ядро 87: и повторной проверки после окна смены сети
 		if unsub != nil {
 			unsub()
 		}
@@ -626,6 +638,16 @@ func (s *vupenSticky) checkCurrent(tag, reason string) (requeued bool) {
 	}
 	// Ядро 83 (T-108, CR-002): загрузка 24 КБ (до ~6 с, с запасным файлом дольше) бросается
 	// при смене сети, как и поиск: обработчик не ждёт её, оборванная загрузка не провал.
+	if reason == vupenSettleRecheckReason {
+		// Ядро 87 (T-189): повторная проверка после окна смены сети; окно ещё идёт (сеть
+		// сменилась снова) - подождать конца, не проверяя.
+		if wait := settleRecheckWait(); wait > 0 {
+			errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": re-check of ", tag, ": the network is still settling → wait ", wait)
+			s.scheduleSettleRecheck()
+			return false
+		}
+	}
+	mark := vupenNetMarkNow()
 	epoch := vupenNetEpochNow()
 	run := s.beginSearch(epoch)
 	verdict := s.checkCtx(run, obs, tag)
@@ -657,9 +679,16 @@ func (s *vupenSticky) checkCurrent(tag, reason string) (requeued bool) {
 	case vupenStickyOK:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", reason, " ", tag, " check ok")
 		s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
+		s.noteAlive(tag)
 		s.hold(tag)
 		return
 	case vupenStickyFailed:
+		// Ядро 87 (T-189, D): провал в окне смены сети (или пока чистильщик эпохи закрывал
+		// соединения) - не вина узла: не исключаем, одна повторная проверка после окна.
+		if s.settleKeep(mark, tag, reason, "24 KB check") {
+			s.hold(tag)
+			return false
+		}
 	default:
 		// «Не поняли» (HTTP ≠ 200, ошибка сразу): узел не трогаем.
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", reason, " ", tag, " check inconclusive → keep")
@@ -683,6 +712,7 @@ func (s *vupenSticky) checkCurrent(tag, reason string) (requeued bool) {
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
 			" check failed (net ok) → excluded 15m, search ", s.balancer)
 		obs.VupenStickyExclude(tag, "24 KB check failed ("+reason+")")
+		s.forgetAlive(tag) // T-192 (CR-702): исключённый узел - не «последний проверенный»
 		s.searchN(reason+": "+tag+" failed", VupenStickySearchMaxChecks) // вентиль уже прошли
 	case vupenNetDown:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
@@ -708,6 +738,12 @@ func (s *vupenSticky) search(reason string) {
 // searchN — поиск с пределом проверок maxChecks (VupenCheckRoute: maxSwitches);
 // возвращает, сколько узлов проверено загрузкой.
 func (s *vupenSticky) searchN(reason string, maxChecks int) int {
+	return s.searchNClose(reason, maxChecks, true)
+}
+
+// searchNClose - searchN; closeOld: после смены узла закрыть соединения прежнего и
+// временного узлов (T-189, C), кроме уже закрытых вызывающим (alreadyClosed).
+func (s *vupenSticky) searchNClose(reason string, maxChecks int, closeOld bool, alreadyClosed ...string) int {
 	obs := s.observatory()
 	if obs == nil {
 		return 0
@@ -725,7 +761,7 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 		return 0
 	}
 	s.setPhase(vupenPhaseSearching)
-	s.publish(s.fallbackPick(cands))
+	s.publish(s.interimPick(cands)) // ядро 87 (T-189, A): трафик не в непроверенный узел
 	var pool []string
 	for _, t := range cands {
 		if !obs.VupenStickyExcluded(t) {
@@ -746,6 +782,8 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 	}
 	alive, _ := s.order(obs, pool)
 	s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
+	s.publish(s.interimPickFresh(cands, true, nil)) // пробы свежие: временный узел - из ответивших в этой сети (T-192, CR-702)
+	var failedVerify, leftBehind []string           // T-192 (CR-703): не прошли 64 КБ в этом поиске; временные узлы, с которых ушли
 	picks := vupenStickyDiverse(alive, s.nodeKey, maxChecks)
 	for i, tag := range picks {
 		if run.aborted() {
@@ -762,13 +800,35 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %s verified → switch (from %q; epoch %d, uplink %s, ran %s)",
 				s.balancer, reason, len(pool), len(alive), tag, from, run.epoch, vupenUplinkKind(), time.Since(started).Round(time.Millisecond)))
 			s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
+			interim := s.viewTag() // на каком узле шёл трафик, пока искали (T-189, C)
+			s.noteAlive(tag)
 			s.holdBecause(tag, "search")
+			old := from
+			if old == "" {
+				old = s.initial // старт: проверка initial провалилась, держать его не успели
+			}
+			if closeOld {
+				s.closeReplaced(obs, tag, slices.DeleteFunc(append([]string{old, interim}, leftBehind...), func(t string) bool { return slices.Contains(alreadyClosed, t) })...)
+			}
 			return i + 1
 		}
 		s.setReport(func(r *vupenStickyReport) {
 			r.failedChecks++
 			r.lastFailure = vupenStickyMark{at: vupenStickyNow(), kind: "verify", detail: tag}
 		})
+		failedVerify = append(failedVerify, tag)
+		if verdict == vupenStickyFailed {
+			s.forgetAlive(tag)
+		}
+		// T-192 (CR-703): трафик шёл через узел, который отвечает на пробу, но не тянет
+		// 64 КБ, - не держим его до конца поиска: временный узел заново, без провалившихся.
+		if s.viewTag() == tag {
+			if next := s.interimPickFresh(cands, true, failedVerify); next != "" && next != tag {
+				errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): interim %s failed the verify → traffic moves to %s", s.balancer, reason, tag, next))
+				leftBehind = append(leftBehind, tag)
+				s.publish(next)
+			}
+		}
 	}
 	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): %d probed, %d alive, %d checked → nothing works (epoch %d, uplink %s, ran %s)",
 		s.balancer, reason, len(pool), len(alive), len(picks), run.epoch, vupenUplinkKind(), time.Since(started).Round(time.Millisecond)))
@@ -780,6 +840,25 @@ func (s *vupenSticky) searchN(reason string, maxChecks int) int {
 	}
 	s.scheduleRetry(true)
 	return len(picks)
+}
+
+// closeReplaced - поиск сменил узел на tag: соединения прежнего и временного узлов
+// закрываются, как при ручной смене (switchRoute: VupenStickyCloseConns); иначе они
+// остаются на мёртвом узле (бандл 14:23 - UDP-связь DNS жила на нём ещё 10 с после смены).
+func (s *vupenSticky) closeReplaced(obs vupenStickyObservatory, tag string, olds ...string) {
+	ro, ok := obs.(vupenStickyRouteObs)
+	if !ok {
+		return
+	}
+	var done []string
+	for _, old := range olds {
+		if old == "" || old == tag || slices.Contains(done, old) {
+			continue
+		}
+		done = append(done, old)
+		n := ro.VupenStickyCloseConns(old)
+		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search switched to %s: %d connections of %q closed", s.balancer, tag, n, old))
+	}
 }
 
 func (s *vupenSticky) scheduleRetry(advance bool) {

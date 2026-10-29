@@ -341,14 +341,16 @@ func TestVupenStickyKeepsNodeWithoutNetworkOrOnInconclusiveCheck(t *testing.T) {
 	}
 }
 
-// Нет initial / тег не из пула → сразу поиск; до его конца — fallbackTag.
+// Нет initial / тег не из пула → сразу поиск; до его конца — отвечавший на пробу узел (ядро 87), иначе fallbackTag.
 func TestVupenStickyNoOrUnknownInitialSearchesAtOnce(t *testing.T) {
 	for _, initial := range []string{"", "proxy-gone"} {
 		r := newStickyRig(t, initial, "p-2", "p-1", "p-2")
 		r.alive(map[string]int64{"p-1": 10, "p-2": 20})
 		r.obs.verify["p-1"] = vupenStickyOK
-		if got := r.pick(); got != "p-2" {
-			t.Fatalf("initial %q: before the search ends traffic goes to fallbackTag, got %q", initial, got)
+		// Ядро 87 (T-189, A): до конца поиска - первый отвечавший на пробу узел (fallbackTag p-2
+		// здесь тоже жив, но порядок стратегии выбирает p-1); fallbackTag - только если никто не отвечал.
+		if got := r.pick(); got != "p-1" {
+			t.Fatalf("initial %q: before the search ends traffic goes to the first ping-alive node, got %q", initial, got)
 		}
 		r.expectPhase(vupenPhaseSearching)
 		r.drain()

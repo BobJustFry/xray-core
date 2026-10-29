@@ -330,13 +330,23 @@ func (s *vupenSticky) checkRoute(q vupenRouteReq) vupenRouteResp {
 	if opt.Budget <= 0 {
 		opt.Budget = time.Second
 	}
+	mark := vupenNetMarkNow()
 	res := ro.VupenStickyCheckWith(tag, opt)
 	resp.Tried, resp.Kind, resp.Detail = 1, res.Kind, res.Detail
 	switch res.Verdict {
 	case vupenStickyOK:
 		resp.Verdict = vupenRouteOK
+		s.noteAlive(tag)
 		s.setReport(func(r *vupenStickyReport) { r.network, r.routeCheck = vupenNetUp, vupenRouteMark{} })
 	case vupenStickyFailed:
+		// Ядро 87 (T-189, D): провал в окне смены сети - не вина узла. Приложению не говорим
+		// «failed» (оно позвало бы heal и исключило узел), отметки для heal нет, проверка
+		// будет повторена после окна.
+		if s.settleKeep(mark, tag, "checkRoute check ("+q.Reason+")", res.Detail) {
+			s.setReport(func(r *vupenStickyReport) { r.routeCheck = vupenRouteMark{} })
+			resp.Detail += "; inside the network settle window - node kept, re-check queued"
+			return resp
+		}
 		devNet := obs.VupenStickyNetwork()
 		now := vupenStickyNow()
 		s.setReport(func(r *vupenStickyReport) {
@@ -449,6 +459,7 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 	} else {
 		// Ядро 83 (T-108, CR-002): проверка heal бросается при смене сети (результат из
 		// прежней сети ни исключения, ни «ok» не даёт); проверка ставится заново.
+		mark := vupenNetMarkNow()
 		run := s.beginSearch(vupenNetEpochNow())
 		res := s.checkWithCtx(run, ro, tag, q.options())
 		aborted := res.Verdict != vupenStickyOK && run.aborted()
@@ -469,9 +480,15 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 		switch res.Verdict {
 		case vupenStickyOK:
 			s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
+			s.noteAlive(tag)
 			resp.Verdict = vupenRouteOK
 			return resp
 		case vupenStickyFailed:
+			// Ядро 87 (T-189, D): то же, что в checkRoute check - провал в окне смены сети не вина узла.
+			if s.settleKeep(mark, tag, "checkRoute heal ("+q.Reason+")", res.Detail) {
+				resp.Detail += "; inside the network settle window - node kept, re-check queued"
+				return resp
+			}
 			devNet := obs.VupenStickyNetwork()
 			s.setReport(func(r *vupenStickyReport) { r.network = devNet })
 			switch devNet {
@@ -521,7 +538,7 @@ func (s *vupenSticky) healRoute(h *vupenHealReq) vupenRouteResp {
 	})
 	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute heal: %s failed (net ok) → excluded, %d connections closed, search %s",
 		s.balancer, tag, resp.Closed, s.balancer))
-	resp.Tried += s.searchN("checkRoute: "+tag+" failed", q.maxSwitches())
+	resp.Tried += s.searchNClose("checkRoute: "+tag+" failed", q.maxSwitches(), q.closeConns(), tag) // tag закрыт выше
 	return s.healOutcome(resp)
 }
 
@@ -649,6 +666,7 @@ func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 	}
 	if tag != "" {
 		s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
+		s.noteAlive(tag)
 		s.holdBecause(tag, "switch")
 		resp.Verdict, resp.To = vupenRouteSwitched, tag
 		if prev != "" {
