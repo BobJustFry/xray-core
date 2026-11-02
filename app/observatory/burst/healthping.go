@@ -58,6 +58,14 @@ type HealthPing struct {
 	vupenListeners vupenSignalListeners
 	// Ядро 83 (T-102): эпоха сети, в которой сняты замеры Results (под access).
 	resultsEpoch uint64
+	// Ядро 88 (T-199): проба поиска (tuning_vupen_search.go); nil - vupenQuickPing. Точка подмены для тестов.
+	vupenSearchPing func(ctx context.Context, tag string, timeout time.Duration) (time.Duration, error)
+	// Горутины проб поиска, ещё не вышедшие (для тестов: дождаться фона).
+	vupenSearchGoroutines atomic.Int32
+	// Пробы, оставленные поиском в фоне после срока (CR-804): их отменяют конец поиска и
+	// начало следующего раунда проб (tuning_vupen_search.go).
+	vupenSearchBGMu sync.Mutex
+	vupenSearchBG   *vupenSearchBG
 }
 
 // NewHealthPing creates a new HealthPing with settings

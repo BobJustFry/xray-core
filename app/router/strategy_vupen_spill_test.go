@@ -238,6 +238,10 @@ func TestVupenSpillReturnOnRecheck(t *testing.T) {
 	r.drain()
 	r.pick()
 	r.drain()
+	// Ядро 88 (D-70 п. 5): поиск LTE-балансировщика тоже ставит повторную проверку нового
+	// LTE-узла через 12 с; пройти её до отсчёта проверок обычных узлов.
+	r.clock.Advance(VupenStickyPostSwitchRecheck)
+	r.drain()
 	checksBefore := r.obs.checkCount()
 	r.obs.mu.Lock()
 	r.obs.check["p-4"] = vupenStickyFailed

@@ -173,13 +173,34 @@ func (s *vupenSticky) interimPickFresh(cands []string, fresh bool, skip []string
 	if obs == nil {
 		return s.fallbackPick(cands)
 	}
+	// CR-811 (T-205): сразу после смены сети в результатах обсерватории ещё лежит прежняя
+	// сеть (она сбрасывается только в начале проб поиска). Пока окно открыто, "ответивший" -
+	// только тот, у кого есть замер этой сети (VupenStickyRecent, d > 0); нет такого источника -
+	// никто не считается ответившим. Пробы поиска (fresh) уже свои.
+	var thisNet map[string]time.Duration
+	gated := false
+	if !fresh {
+		if age, ok := s.sinceNetChange(); ok {
+			gated = true
+			if ro, ok := obs.(vupenStickyRecentObs); ok {
+				thisNet = ro.VupenStickyRecent(cands, age)
+			}
+		}
+	}
 	p := s.lastAlive.Load()
-	usable := p != nil && *p != "" && slices.Contains(cands, *p) && !slices.Contains(skip, *p) && !obs.VupenStickyExcluded(*p)
+	usable := p != nil && *p != "" && slices.Contains(cands, *p) && !slices.Contains(skip, *p) && !obs.VupenStickyExcluded(*p) &&
+		(!gated || thisNet[*p] > 0)
 	if usable && !fresh {
 		return *p
 	}
 	answered := map[string]bool{}
-	if res, err := obs.GetObservation(s.logCtx()); err == nil {
+	if gated {
+		for t, d := range thisNet {
+			if d > 0 {
+				answered[t] = true
+			}
+		}
+	} else if res, err := obs.GetObservation(s.logCtx()); err == nil {
 		answered = vupenAnsweredTags(res)
 	}
 	if usable && answered[*p] {
@@ -192,6 +213,31 @@ func (s *vupenSticky) interimPickFresh(cands []string, fresh bool, skip []string
 		}
 	}
 	return s.fallbackPick(cands)
+}
+
+// sinceNetChange - сколько прошло с последней смены сети, если замеры обсерватории ещё могут
+// быть прежней сети (не дольше VupenSwitchCacheMaxAge); false - сеть не менялась или давно.
+func (s *vupenSticky) sinceNetChange() (time.Duration, bool) {
+	s.signals.mu.Lock()
+	changed := s.signals.netChangedAt
+	s.signals.mu.Unlock()
+	if changed.IsZero() {
+		return 0, false
+	}
+	d := vupenStickyNow().Sub(changed)
+	if d < 0 || d >= VupenSwitchCacheMaxAge {
+		return 0, false
+	}
+	return d, true
+}
+
+// resetInterimOnNetChange - сеть сменилась: "последний проверенный" и запомненный временный
+// узел относятся к прежней сети (CR-811, T-205).
+func (s *vupenSticky) resetInterimOnNetChange() {
+	s.lastAlive.Store(nil)
+	s.interimMu.Lock()
+	s.interimMemo = nil
+	s.interimMu.Unlock()
 }
 
 // vupenInterimCacheTTL — сколько pick() пользуется запомненным временным узлом.

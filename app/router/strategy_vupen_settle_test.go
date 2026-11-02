@@ -302,8 +302,10 @@ func TestVupenSettleStableNetworkFailureStillExcludes(t *testing.T) {
 	if !r.obs.excluded["p-1"] || r.s.current != "p-2" {
 		t.Fatalf("excluded=%v current=%q", r.obs.excluded, r.s.current)
 	}
-	if len(r.clock.pendingIn()) != 0 {
-		t.Fatalf("no re-check timers on a real failure: %v", r.clock.pendingIn())
+	// Ядро 88 (D-70 п. 5): единственный таймер - повторная проверка нового узла через 12 с;
+	// таймера повтора окна смены сети (settle re-check) по-прежнему нет.
+	if p := r.clock.pendingIn(); len(p) != 1 || p[0] != VupenStickyPostSwitchRecheck {
+		t.Fatalf("only the post-switch re-check may be pending on a real failure: %v", p)
 	}
 }
 
@@ -518,5 +520,72 @@ func TestVupenSettleExcludedCurrentCachesTheInterimPick(t *testing.T) {
 	r.pick()
 	if h.obsCalls.Load() == before {
 		t.Fatal("an expired cache entry must be recomputed")
+	}
+}
+
+// ── T-205: CR-811 ───────────────────────────────────────────────────────────
+
+func interimRig(t *testing.T) *stickyRig {
+	t.Helper()
+	r := newStickyRig(t, "p-1", "p-4", "p-1", "p-2", "p-3", "p-4")
+	r.alive(map[string]int64{"p-1": 900, "p-2": 5, "p-3": 10}) // замеры прежней сети: p-2 и p-3 живы
+	r.pick()
+	r.drain()
+	r.expectPhase(vupenPhaseHolding)
+	r.s.noteAlive("p-2") // и «последний проверенный» - тоже прежней сети
+	return r
+}
+
+// CR-811: после смены сети узел, живой только в прежней сети, не достаётся новым соединениям
+// ни как «последний проверенный», ни из старых замеров, ни из запомненного (2 с) выбора.
+// Пока в этой сети никто не ответил - запасной выбор; ответил - берётся он.
+func TestVupenSettlePickNeverReturnsTheOldNetworkNode(t *testing.T) {
+	r := interimRig(t)
+	r.obs.excluded["p-1"] = true // держимый узел исключён, обработчик ещё не искал
+	if got := r.pick(); got != "p-2" {
+		t.Fatalf("setup (no network change): the last verified node is the interim, got %q", got)
+	}
+	r.s.onNetEvent(internet.VupenNetChanged) // сеть сменилась; результаты обсерватории - ещё прежние
+	for i := 0; i < 3; i++ {
+		if got := r.pick(); got != "p-4" {
+			t.Fatalf("pick %d after the network change: %q, want the fallback p-4 (never the old p-2/p-3)", i, got)
+		}
+	}
+	if p := r.s.lastAlive.Load(); p != nil {
+		t.Fatalf("lastAlive must be cleared on a network change, got %q", *p)
+	}
+	// В этой сети ответил p-3: он и берётся (запомненный p-4 живёт 2 с - ждём).
+	r.clock.Advance(3 * time.Second)
+	r.obs.setRecent(map[string]time.Duration{"p-3": 20 * time.Millisecond})
+	if got := r.pick(); got != "p-3" {
+		t.Fatalf("an answerer of this network must be used, got %q", got)
+	}
+}
+
+// То же, но lastAlive записан уже после смены сети проверкой, начатой ещё в прежней (гонка):
+// без замера этой сети он не годится.
+func TestVupenSettlePickIgnoresLastAliveWithoutThisNetworkSample(t *testing.T) {
+	r := interimRig(t)
+	r.obs.excluded["p-1"] = true
+	r.s.onNetEvent(internet.VupenNetChanged)
+	r.s.noteAlive("p-2") // запоздавшая проверка прежней сети
+	if got := r.pick(); got != "p-4" {
+		t.Fatalf("a late last-verified mark of the old network must not be used, got %q", got)
+	}
+	r.clock.Advance(3 * time.Second)
+	r.obs.setRecent(map[string]time.Duration{"p-2": 30 * time.Millisecond})
+	if got := r.pick(); got != "p-2" {
+		t.Fatalf("the same node answering in this network is fine, got %q", got)
+	}
+}
+
+// Давно после смены сети (окно замеров прошло) поведение прежнее: ответившие по обсерватории.
+func TestVupenSettlePickLongAfterNetworkChangeUsesObservation(t *testing.T) {
+	r := interimRig(t)
+	r.obs.excluded["p-1"] = true
+	r.s.onNetEvent(internet.VupenNetChanged)
+	r.clock.Advance(VupenSwitchCacheMaxAge + time.Minute)
+	if got := r.pick(); got != "p-2" {
+		t.Fatalf("after the window the observation is trusted again (fastest alive p-2), got %q", got)
 	}
 }

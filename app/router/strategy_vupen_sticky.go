@@ -207,6 +207,11 @@ type vupenSticky struct {
 	// T-192 (CR-707): запомненный временный узел для pick(), пока текущий исключён.
 	interimMu   sync.Mutex
 	interimMemo *vupenInterimMemo
+	// Ядро 88 (T-199, D-70): повторная проверка нового узла после переключения поиском;
+	// recheckChain - только в горутине обработчика: идёт проверка, поиск после её провала
+	// новой проверки не взводит.
+	recheck      vupenRecheck
+	recheckChain bool
 }
 
 func newVupenSticky(br *BalancingRule, b *Balancer) *vupenSticky {
@@ -358,6 +363,7 @@ func (s *vupenSticky) onNetEvent(ev internet.VupenNetEvent) {
 		s.signals.netChangedAt = vupenStickyNow()
 		s.signals.fails = nil
 		s.signals.mu.Unlock()
+		s.resetInterimOnNetChange() // ядро 88 (CR-811): временный узел прежней сети не переносится
 		// Ядро 83 (CR-003): заморозки, поставленные в сети-БС, больше не действуют. T-110
 		// (CR-104): колбэк не блокируется — снимет обработчик; событие ставится первым, до
 		// netClassOnChanged/net-changed, чтобы отложенные поиски уже не видели старых заморозок.
@@ -368,6 +374,7 @@ func (s *vupenSticky) onNetEvent(ev internet.VupenNetEvent) {
 		// Ядро 83 (CR-001): идущий поиск прежней сети бросить — после netClassOnChanged,
 		// чтобы повтор поиска уже видел «класс определяется».
 		s.cancelSearch()
+		s.cancelPostSwitchRecheck() // ядро 88: новая сеть - прежняя проверка не нужна
 		// Ядро 77: сменилась сеть — вердикт «обычный мёртв» сброшен сразу:
 		// новые соединения идут в REG (R4, D-12).
 		if s.unspill("network changed") {
@@ -456,8 +463,9 @@ func (s *vupenSticky) stop() {
 		unsub, unsubSignals := s.unsub, s.unsubSignals
 		s.life.Unlock()
 		close(s.stopCh)
-		s.netClassCancelRetry() // ядро 86: повторных проверок класса сети больше нет
-		s.stopSettleRecheck()   // ядро 87: и повторной проверки после окна смены сети
+		s.netClassCancelRetry()     // ядро 86: повторных проверок класса сети больше нет
+		s.stopSettleRecheck()       // ядро 87: и повторной проверки после окна смены сети
+		s.cancelPostSwitchRecheck() // ядро 88: и проверки после переключения
 		if unsub != nil {
 			unsub()
 		}
@@ -505,7 +513,7 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 	// CR-501: цель перелива без перелива не ищет и не повторяет.
 	if s.dormant() {
 		switch ev.kind {
-		case "search", "retry", "net-stable", "current-excluded":
+		case "search", "retry", "net-stable", "current-excluded", "recheck":
 			return
 		}
 	}
@@ -548,6 +556,8 @@ func (s *vupenSticky) handle(ev vupenStickyEvent) {
 		case vupenPhaseHolding:
 			requeued = s.checkCurrent(s.current, ev.reason)
 		}
+	case "recheck":
+		s.runPostSwitchRecheck(ev.gen) // ядро 88 (D-70)
 	case "search":
 		s.search(ev.reason)
 	case "retry":
@@ -712,7 +722,7 @@ func (s *vupenSticky) checkCurrent(tag, reason string) (requeued bool) {
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
 			" check failed (net ok) → excluded 15m, search ", s.balancer)
 		obs.VupenStickyExclude(tag, "24 KB check failed ("+reason+")")
-		s.forgetAlive(tag) // T-192 (CR-702): исключённый узел - не «последний проверенный»
+		s.forgetAlive(tag)                                               // T-192 (CR-702): исключённый узел - не «последний проверенный»
 		s.searchN(reason+": "+tag+" failed", VupenStickySearchMaxChecks) // вентиль уже прошли
 	case vupenNetDown:
 		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": ", tag,
@@ -761,7 +771,14 @@ func (s *vupenSticky) searchNClose(reason string, maxChecks int, closeOld bool, 
 		return 0
 	}
 	s.setPhase(vupenPhaseSearching)
-	s.publish(s.interimPick(cands)) // ядро 87 (T-189, A): трафик не в непроверенный узел
+	so, newProbes := obs.(vupenStickySearchProbeObs) // ядро 88: пробы поиска (D-70)
+	if newProbes {
+		defer s.cancelSearchLeftovers(obs) // CR-804: фон проб не переживает поиск
+		// Ядро 88 (D-70 п. 3): до первого ответа на свежую пробу узел из старых замеров не берётся.
+		s.publish(s.searchInterim(cands))
+	} else {
+		s.publish(s.interimPick(cands)) // ядро 87 (T-189, A): трафик не в непроверенный узел
+	}
 	var pool []string
 	for _, t := range cands {
 		if !obs.VupenStickyExcluded(t) {
@@ -777,14 +794,28 @@ func (s *vupenSticky) searchNClose(reason string, maxChecks int, closeOld bool, 
 	if run.aborted() {
 		return s.searchAborted(reason, "before the probe", run, started, 0)
 	}
-	if !s.probeCtx(run, obs, pool) {
-		return s.searchAborted(reason, "during the probe", run, started, 0)
+	var failedVerify, leftBehind []string // T-192 (CR-703): не прошли 64 КБ в этом поиске; временные узлы, с которых ушли
+	var alive, picks []string
+	var answers []vupenAnswer // ядро 88: ответившие на пробы этого поиска, по возрастанию задержки
+	if newProbes {
+		var ok bool
+		if answers, ok = s.probeSearch(run, so, obs, pool, &leftBehind); !ok {
+			return s.searchAborted(reason, "during the probe", run, started, 0)
+		}
+		for _, a := range answers {
+			alive = append(alive, a.tag)
+		}
+		picks = alive[:min(len(alive), maxChecks)] // самый быстрый, затем запасные (D-70 п. 4)
+		s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
+	} else {
+		if !s.probeCtx(run, obs, pool) {
+			return s.searchAborted(reason, "during the probe", run, started, 0)
+		}
+		alive, _ = s.order(obs, pool)
+		s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
+		s.publish(s.interimPickFresh(cands, true, nil)) // пробы свежие: временный узел - из ответивших в этой сети (T-192, CR-702)
+		picks = vupenStickyDiverse(alive, s.nodeKey, maxChecks)
 	}
-	alive, _ := s.order(obs, pool)
-	s.setReport(func(r *vupenStickyReport) { r.alive, r.searched = len(alive), true })
-	s.publish(s.interimPickFresh(cands, true, nil)) // пробы свежие: временный узел - из ответивших в этой сети (T-192, CR-702)
-	var failedVerify, leftBehind []string           // T-192 (CR-703): не прошли 64 КБ в этом поиске; временные узлы, с которых ушли
-	picks := vupenStickyDiverse(alive, s.nodeKey, maxChecks)
 	for i, tag := range picks {
 		if run.aborted() {
 			return s.searchAborted(reason, "before the verify of "+tag, run, started, i)
@@ -810,6 +841,9 @@ func (s *vupenSticky) searchNClose(reason string, maxChecks int, closeOld bool, 
 			if closeOld {
 				s.closeReplaced(obs, tag, slices.DeleteFunc(append([]string{old, interim}, leftBehind...), func(t string) bool { return slices.Contains(alreadyClosed, t) })...)
 			}
+			if !run.aborted() {
+				s.armPostSwitchRecheck(tag, run.epoch) // ядро 88 (D-70 п. 5): перепроверить узел через ~12 с
+			}
 			return i + 1
 		}
 		s.setReport(func(r *vupenStickyReport) {
@@ -823,7 +857,13 @@ func (s *vupenSticky) searchNClose(reason string, maxChecks int, closeOld bool, 
 		// T-192 (CR-703): трафик шёл через узел, который отвечает на пробу, но не тянет
 		// 64 КБ, - не держим его до конца поиска: временный узел заново, без провалившихся.
 		if s.viewTag() == tag {
-			if next := s.interimPickFresh(cands, true, failedVerify); next != "" && next != tag {
+			var next string
+			if newProbes {
+				next = nextFreshInterim(obs, answers, failedVerify) // ядро 88: только из ответивших в этом поиске
+			} else {
+				next = s.interimPickFresh(cands, true, failedVerify)
+			}
+			if next != "" && next != tag {
 				errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: search (%s): interim %s failed the verify → traffic moves to %s", s.balancer, reason, tag, next))
 				leftBehind = append(leftBehind, tag)
 				s.publish(next)

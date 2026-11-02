@@ -447,8 +447,9 @@ func TestVupenStickyNetworkSettledRetriesAtOnce(t *testing.T) {
 	if got := r.pick(); got != "p-7" {
 		t.Fatalf("net-stable must search at once: pick %q", got)
 	}
-	if p := r.clock.pendingIn(); len(p) != 0 {
-		t.Fatalf("retry timer must be stopped after success: %v", p)
+	// Ядро 88 (D-70 п. 5): после успеха остаётся только повторная проверка нового узла (12 с).
+	if p := r.clock.pendingIn(); len(p) != 1 || p[0] != VupenStickyPostSwitchRecheck {
+		t.Fatalf("retry timer must be stopped after success, only the post-switch re-check remains: %v", p)
 	}
 }
 

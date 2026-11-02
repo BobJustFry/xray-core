@@ -334,12 +334,15 @@ func TestVupenLteRecheckAbortsOnEpochChange(t *testing.T) {
 	if !r.reg.spilledNow() {
 		t.Fatal("setup: spilled")
 	}
+	// Ядро 88 (D-70 п. 5): повторная проверка нового LTE-узла (12 с) проходит до блокировки.
+	r.clock.Advance(VupenStickyPostSwitchRecheck)
+	r.drain()
 	r.obs.mu.Lock()
 	r.obs.check["p-4"] = vupenStickyOK
 	r.obs.delay["p-4"] = 5
 	r.obs.mu.Unlock()
 	eo.blockCheck = true
-	r.clock.Advance(VupenLteRegularRecheck)
+	r.clock.Advance(VupenLteRegularRecheck - VupenStickyPostSwitchRecheck)
 	done := make(chan struct{})
 	go func() { r.drain(); close(done) }()
 	waitHung(t, eo, "check")
