@@ -83,7 +83,6 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
-	sockopt := streamSettings.SocketSettings
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
 	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
@@ -125,17 +124,13 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			gctx = session.ContextWithTimeoutOnly(gctx, true)
 			gctx = internet.VupenNetEpochCarry(gctx, ctx) // Vupen (ядро 74): эпохи сети АВТО 4.1
 
-			c, err := internet.DialSystem(gctx, net.TCPDestination(address, port), sockopt)
+			var c net.Conn
+			if streamSettings.FinalMask != nil {
+				c, err = streamSettings.FinalMask.DialTCP(gctx, net.TCPDestination(address, port))
+			} else {
+				c, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+			}
 			if err == nil {
-				if streamSettings.TcpmaskManager != nil {
-					newConn, err := streamSettings.TcpmaskManager.WrapConnClient(c)
-					if err != nil {
-						c.Close()
-						return nil, errors.New("mask err").Base(err)
-					}
-					c = newConn
-				}
-
 				if tlsConfig != nil {
 					config := tlsConfig.GetTLSConfig(tls.WithDestination(dest))
 					if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
