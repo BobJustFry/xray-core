@@ -9,12 +9,22 @@ import (
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/finalmask"
 )
 
 type auto41Key struct{}
 
+// ctxDialer — what FinalMask hands to udphop: every socket (the first one and
+// the ones opened on a hop) is dialled with the context of the original dial,
+// as memory_settings.go does through DialSystem(ctx, ...).
+func ctxDialer(ctx context.Context) *finalmask.Dialer {
+	return &finalmask.Dialer{DialUDP: func(d net.Destination) (net.Conn, error) {
+		return internet.DialSystem(ctx, d, nil)
+	}}
+}
+
 // Vupen (core 74, CR-102): a port hop opens its new socket with
-// internet.VupenNetEpochContextFor(original) — tracked by the network epochs
+// the context of the original dial (upstream dialer closure, v26.9.30) — tracked by the network epochs
 // exactly when the original socket of an AUTO 4.1 instance is.
 func TestVupenHopSocketTrackedLikeOriginal(t *testing.T) {
 	internet.VupenSetNetEpochHooks(&internet.VupenNetEpochHooks{Auto41: func(ctx context.Context) bool {
@@ -36,20 +46,20 @@ func TestVupenHopSocketTrackedLikeOriginal(t *testing.T) {
 		if auto41 {
 			ctx = context.WithValue(ctx, auto41Key{}, true)
 		}
-		raw, err := internet.DialSystem(ctx, dest, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		pc, err := NewUDPHopConn(&Config{IntervalMin: 5, IntervalMax: 5, Local: true}, raw.(*internet.PacketConnWrapper).PacketConn)
+		d := dest
+		pc, err := NewUDPHopConn(&Config{IntervalMin: 5, IntervalMax: 5, Local: true}, &d, ctxDialer(ctx))
 		if err != nil {
 			t.Fatal(err)
 		}
 		hc := pc.(*udpHopConn)
 		hc.mu.Lock()
-		hc.hop(&net.UDPAddr{IP: addr.IP, Port: addr.Port})
+		first := hc.cur
+		hc.mu.Unlock()
+		hc.hop()
+		hc.mu.Lock()
 		cur := hc.cur
 		hc.mu.Unlock()
-		if cur == nil || cur == hc.conn {
+		if cur == nil || cur == first {
 			t.Fatal("hop did not open a new socket")
 		}
 		// VupenNetEpochContextFor returns plain context.Background() for an
@@ -82,24 +92,22 @@ func TestVupenHopTrackingSurvivesNetworkChanges(t *testing.T) {
 	defer srv.Close()
 	addr := srv.LocalAddr().(*stdnet.UDPAddr)
 	dest := net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port))
-	hopTo := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 
 	internet.VupenSetUplink("wifi", "hop-wifi")
-	raw, err := internet.DialSystem(context.WithValue(context.Background(), auto41Key{}, true), dest, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := raw.(*internet.PacketConnWrapper).PacketConn
-	pc, err := NewUDPHopConn(&Config{IntervalMin: 5, IntervalMax: 5, Local: true}, original)
+	d := dest
+	pc, err := NewUDPHopConn(&Config{IntervalMin: 5, IntervalMax: 5, Local: true}, &d, ctxDialer(context.WithValue(context.Background(), auto41Key{}, true)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pc.Close()
 	hc := pc.(*udpHopConn)
+	hc.mu.Lock()
+	original := hc.cur
+	hc.mu.Unlock()
 	hop := func() net.PacketConn {
+		hc.hop() // takes hc.mu itself
 		hc.mu.Lock()
 		defer hc.mu.Unlock()
-		hc.hop(hopTo)
 		return hc.cur
 	}
 	closed := func(c net.PacketConn) bool {

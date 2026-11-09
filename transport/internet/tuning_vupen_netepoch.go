@@ -480,7 +480,7 @@ func vupenNetEpochTrack(conn net.Conn, snap *vupenNetSnap) error {
 		s.mu.Unlock()
 		conn.Close()
 		return errors.New("[netchange] connection opened on ", snap.id.sig,
-			", closed after the switch to ", base.sig).AtWarning()
+			", closed after the switch to ", base.sig)
 	}
 	key := vupenNetEntrySeq.Add(1)
 	get, idx := vupenNetWeakConn(conn, key)
@@ -522,7 +522,7 @@ func vupenNetWeakConn(conn net.Conn, key uint64) (func() net.Conn, any) {
 		return vupenNetWeak(c, key)
 	case *net.UDPConn:
 		return vupenNetWeak(c, key)
-	case *PacketConnWrapper:
+	case *net.PacketConnWrapper:
 		if u, ok := c.PacketConn.(*net.UDPConn); ok {
 			return vupenNetWeak(u, key)
 		}

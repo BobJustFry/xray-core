@@ -188,7 +188,7 @@ func TestVupenNetEpochInertWithoutAPI(t *testing.T) {
 	if _, ok := tcp.(*net.TCPConn); !ok {
 		t.Fatalf("tcp conn type changed: %T", tcp)
 	}
-	if _, ok := udp.(*PacketConnWrapper); !ok {
+	if _, ok := udp.(*net.PacketConnWrapper); !ok {
 		t.Fatalf("udp conn type changed: %T", udp)
 	}
 	if vupenNetEpochBeforeDial(auto41Ctx("proxy-1")) != nil || netEntries() != 0 {
@@ -460,7 +460,7 @@ func TestVupenNetEpochTracksInnerUDPSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inner := raw.(*PacketConnWrapper).PacketConn.(*net.UDPConn)
+	inner := raw.(*net.PacketConnWrapper).PacketConn.(*net.UDPConn)
 	t.Cleanup(func() { inner.Close() })
 	raw = nil // keep only the inner socket, like the QUIC transports do
 	for i := 0; i < 3; i++ {
@@ -570,11 +570,11 @@ func TestVupenNetEpochContextFor(t *testing.T) {
 	if vupenNetEpochBeforeDial(VupenNetEpochContextFor(stray)) != nil {
 		t.Fatal("an untracked socket must give an untracked context")
 	}
-	plain := dial(t, plainCtx("proxy-hy2"), dest).(*PacketConnWrapper).PacketConn
+	plain := dial(t, plainCtx("proxy-hy2"), dest).(*net.PacketConnWrapper).PacketConn
 	if vupenNetEpochBeforeDial(VupenNetEpochContextFor(plain)) != nil {
 		t.Fatal("a non-AUTO-4.1 socket must give an untracked context")
 	}
-	auto := dial(t, auto41Ctx("proxy-hy2"), dest).(*PacketConnWrapper).PacketConn
+	auto := dial(t, auto41Ctx("proxy-hy2"), dest).(*net.PacketConnWrapper).PacketConn
 	if vupenNetEpochBeforeDial(VupenNetEpochContextFor(auto)) == nil {
 		t.Fatal("replacement of a tracked socket must be tracked")
 	}
@@ -687,7 +687,7 @@ func TestVupenNetEpochContextForCarriesTag(t *testing.T) {
 	clock := netEpochTest(t)
 	VupenSetUplink("cellular", fmt.Sprintf("hop-tag-%d", time.Now().UnixNano()))
 	dest := udpServer(t)
-	orig := dial(t, auto41Ctx("lte-proxy-hy"), dest).(*PacketConnWrapper).PacketConn
+	orig := dial(t, auto41Ctx("lte-proxy-hy"), dest).(*net.PacketConnWrapper).PacketConn
 	hop := dial(t, VupenNetEpochContextFor(orig), dest)
 	vupenNet.mu.Lock()
 	tags := map[string]int{}
