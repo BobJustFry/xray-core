@@ -120,7 +120,7 @@ func (t *stackGVisor) Start() error {
 	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket)
 	t.udp = udpForwarder
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-		data := pkt.Clone().Data().AsRange().ToSlice()
+		data := pkt.Data().AsRange().ToSlice()
 		// if len(data) == 0 {
 		// 	return false
 		// }

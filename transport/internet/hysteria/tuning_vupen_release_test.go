@@ -114,7 +114,8 @@ func TestVupenHysteriaCleanSkipsBusyClient(t *testing.T) {
 	busy.Lock()
 	done := make(chan struct{})
 	go func() {
-		busy.clean()
+		busy.clean(false)
+		busy.clean(true)
 		close(done)
 	}()
 	select {
@@ -123,5 +124,12 @@ func TestVupenHysteriaCleanSkipsBusyClient(t *testing.T) {
 		busy.Unlock()
 		t.Fatal("clean waits for a busy client")
 	}
+	if busy.forced {
+		busy.Unlock()
+		t.Fatal("a skipped (busy) client must not be marked forced: the next tick retries")
+	}
 	busy.Unlock()
+	if !busy.clean(true) || !busy.forced {
+		t.Fatal("a free client must be cleaned and marked forced")
+	}
 }

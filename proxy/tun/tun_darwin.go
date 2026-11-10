@@ -162,44 +162,35 @@ func NewTun(options *Config) (Tun, error) {
 	fdStr := platform.NewEnvFlag(platform.TunFdKey).GetValue(func() string { return "" })
 	if fdStr != "" {
 		// iOS: use provided fd from NetworkExtension
-		fd, err := strconv.Atoi(fdStr)
+		providedFd, err := strconv.Atoi(fdStr)
 		if err != nil {
 			return nil, err
 		}
 
-		// Vupen: каждый экземпляр получает СВОЙ дубликат дескриптора.
-		//
-		// os.NewFile по документации забирает дескриптор во владение и вешает
-		// финализатор, который закрывает его при сборке мусора. При hot reload
-		// (softRestart) новое ядро открывало os.NewFile на тот же номер fd, а старый
-		// *os.File оставался жив в заблокированном цикле чтения; когда тот наконец
-		// просыпался и выходил, GC закрывал fd под новым ядром: Swift-насосы
-		// получали EOF/EPIPE, новый цикл чтения вис навсегда, tx уходил в txDrop —
-		// «интернета нет, VPN зелёный» на 91 минуту (iOS 586, 2026-09-08 19:51).
-		// С dup закрытие любого экземпляра трогает только его собственный
-		// дескриптор; socketpair расширения живёт, пока живёт мост.
-		dupFd, err := unix.Dup(fd)
+		// duplicate NetworkExtension fd so Xray can close its own handle
+		// without closing the original.
+		fd, err := unix.FcntlInt(uintptr(providedFd), unix.F_DUPFD_CLOEXEC, 0)
 		if err != nil {
 			return nil, err
 		}
 
-		if err = unix.SetNonblock(dupFd, true); err != nil {
-			_ = unix.Close(dupFd)
+		if err = unix.SetNonblock(fd, true); err != nil {
+			_ = unix.Close(fd)
 			return nil, err
 		}
 
 		t := &DarwinTun{
-			tunFile: os.NewFile(uintptr(dupFd), "utun"),
+			tunFile: os.NewFile(uintptr(fd), "utun"),
 			options: options,
-			tunFd:   dupFd,
-			ownsFd:  true,
-			// kqueue апстрима (#6580) на нашем дубликате: описание сокета общее,
-			// readiness видна через любой из дескрипторов.
-			waitKq: newWaitKqueue(dupFd),
+			tunFd:   fd,
+			ownsFd:  false,
+			waitKq:  newWaitKqueue(fd),
 		}
-		// Потоковый сокет (socketpair расширения) — включаем фреймер. Настоящий
-		// utun или датаграммный сокет отвечают ENOTSOCK / SOCK_DGRAM — читаем как раньше.
-		if soType, err := unix.GetsockoptInt(dupFd, unix.SOL_SOCKET, unix.SO_TYPE); err == nil && soType == unix.SOCK_STREAM {
+		// Vupen: потоковый сокет (socketpair расширения) — включаем фреймер.
+		// Настоящий utun или датаграммный сокет отвечают ENOTSOCK / SOCK_DGRAM —
+		// читаем как раньше. Дубликат дескриптора (против GC-закрытия под новым
+		// ядром при hot reload) теперь делает сам апстрим (#6883).
+		if soType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE); err == nil && soType == unix.SOCK_STREAM {
 			t.framer = newStreamFramer()
 			xerrors.LogWarning(context.Background(), "[tun] fd ", fd, " is a stream socket: frame parsing on")
 		}
@@ -265,13 +256,7 @@ func (t *DarwinTun) Close() error {
 		t.waitKq.close()
 	}
 	routeErr := t.unsetSystemRoutes()
-	// Закрытие нашего дескриптора (на iOS — дубликата) будит цикл чтения,
-	// застрявший в Read: он получает os.ErrClosed и выходит с записью в лог,
-	// вместо того чтобы читать один сокет наперегонки с новым экземпляром.
-	if t.ownsFd {
-		return xerrors.Combine(routeErr, t.tunFile.Close())
-	}
-	return routeErr
+	return xerrors.Combine(routeErr, t.tunFile.Close())
 }
 
 func (t *DarwinTun) monitorRouteChanges() {

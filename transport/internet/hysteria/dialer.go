@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
@@ -28,6 +29,8 @@ import (
 type client struct {
 	sync.Mutex
 
+	instance     *core.Instance
+	forced       bool
 	dest         net.Destination
 	config       *Config
 	tlsConfig    *gotls.Config
@@ -64,11 +67,14 @@ func (c *client) close() {
 }
 
 func (c *client) dial(ctx context.Context) error {
-	status := c.status()
-	if status == StatusActive {
-		return nil
+	if c.forced {
+		return errors.New("client is closed")
 	}
-	if status == StatusInactive {
+
+	switch c.status() {
+	case StatusActive:
+		return nil
+	case StatusInactive:
 		c.close()
 	}
 
@@ -90,7 +96,7 @@ func (c *client) dial(ctx context.Context) error {
 		ChromeParrot:                   !quicParams.DisableChromeParrot,
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           MaxDatagramFrameSize,
-		OmitMaxDatagramFrameSize:       time.Now().After(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)),
+		OmitMaxDatagramFrameSize:       true,
 		DisablePathManager:             true,
 	}
 	if quicParams.InitStreamReceiveWindow == 0 {
@@ -256,18 +262,25 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	return c.udpSM.udp()
 }
 
-func (c *client) clean() {
-	// Vupen (T-075, CR-101): клиент посреди рукопожатия держит свой замок до
-	// 5–30 с; ждать его здесь под manager.RLock значило бы остановить все Dial
-	// Hysteria в процессе (ожидающий manager.Lock блокирует новые RLock) —
-	// живой туннель замирал на ~3 с на каждый молчащий узел. Занят — следующий тик.
+// Vupen (T-075, CR-101): клиент посреди рукопожатия держит свой замок до 5–30 с;
+// ждать его здесь под manager.RLock значило бы остановить все Dial Hysteria в
+// процессе (ожидающий manager.Lock блокирует новые RLock) — живой туннель
+// замирал на ~3 с на каждый молчащий узел. Занят — не ждём и возвращаем false:
+// следующий тик повторит (force пересчитывается заново, запись остаётся в map).
+// Апстрим на этом коммите ещё делает c.Lock() под RLock (канальный замок и
+// снимок map вне RLock приходят с #7122 в v26.10.21).
+func (c *client) clean(force bool) bool {
 	if !c.TryLock() {
-		return
+		return false
 	}
-	if c.status() == StatusInactive {
+	if force {
+		c.forced = true
+	}
+	if status := c.status(); force && status != StatusNull || status == StatusInactive {
 		c.close()
 	}
 	c.Unlock()
+	return true
 }
 
 type dialerConf struct {
@@ -283,11 +296,22 @@ type clientManager struct {
 func (m *clientManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
 	for range ticker.C {
+		var forced []dialerConf
+
 		m.RLock()
-		for _, c := range m.m {
-			c.clean()
+		for k, c := range m.m {
+			force := c.instance != nil && !c.instance.IsRunning()
+			if c.clean(force) && force {
+				forced = append(forced, k)
+			}
 		}
 		m.RUnlock()
+
+		for i := range forced {
+			m.Lock()
+			delete(m.m, forced[i])
+			m.Unlock()
+		}
 	}
 }
 
@@ -313,15 +337,18 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		internet.VupenRegisterStreamRelease(vupenReleaseHysteria) // Vupen (T-075): кэш клиентов — по outbound'у
 	})
 
+	dialerConfKey := dialerConf{dest, streamSettings}
+
 	manager.RLock()
-	c := manager.m[dialerConf{dest, streamSettings}]
+	c := manager.m[dialerConfKey]
 	manager.RUnlock()
 
 	if c == nil {
 		manager.Lock()
-		c = manager.m[dialerConf{dest, streamSettings}]
+		c = manager.m[dialerConfKey]
 		if c == nil {
 			c = &client{
+				instance:     core.FromContext(ctx),
 				dest:         dest,
 				config:       streamSettings.ProtocolSettings.(*Config),
 				tlsConfig:    tlsConfig.GetTLSConfig(tls.WithDestination(dest)),
@@ -329,7 +356,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				finalMask:    streamSettings.FinalMask,
 				quicParams:   streamSettings.QuicParams,
 			}
-			manager.m[dialerConf{dest, streamSettings}] = c
+			manager.m[dialerConfKey] = c
 		}
 		manager.Unlock()
 	}

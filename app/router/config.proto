@@ -115,6 +115,8 @@ message Config {
   DomainStrategy domain_strategy = 1;
   repeated RoutingRule rule = 2;
   repeated BalancingRule balancing_rule = 3;
+  // Absolute path to the Lua routing script.
+  string script = 4;
 }
 
 // Vupen: hand the pick over to another balancer (e.g. "LTE") when the device
