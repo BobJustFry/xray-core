@@ -54,6 +54,20 @@ import (
 //     searching), второй поиск не начинается: сразу busy_searching, итог поиска —
 //     в VupenAutoState. Смена по switch видна и после ответа: lastSwitch с reason
 //     "switch", from, to, atMs.
+//   - "switch" с полем target (ядро 89, D-71; тап по узлу во вкладке «Серверы» в АВТО):
+//     target — тег узла в пуле, как в vupenSticky.initial (адрес:порт ядро не
+//     принимает — как и initial). Узел должен быть в пуле того, кто сейчас выбирает
+//     (REG, при переливе — LTE); иначе not_in_pool (другой ярус тоже; LTE не на
+//     сотовой — D-21). Цель проверяется той же загрузкой 24 КБ, что heal (параметры
+//     запроса, VupenSetCheckURL); прошла — ядро держит её без перезапуска, АВТО
+//     остаётся, соединения прежнего закрываются (closeConnections), switched. Не
+//     прошла или «не поняли» — target_failed, текущий не меняется, цель не
+//     исключается. Исключённая по провалу цель (D-42: такие не выбираются) не
+//     проверяется — target_failed. Цель = текущий — switched, from = to, без проверки.
+//     Без текущего (no-working) прошедшая цель становится текущим. visited, перелив,
+//     повторная проверка после поиска (ядро 88) — не трогаются. Вердикт: switched |
+//     target_failed | not_in_pool | busy_searching | unknown (в т. ч. сеть сменилась
+//     во время проверки — текущий остаётся).
 
 var (
 	// VupenCheckRouteHealWait — сколько VupenCheckRoute(heal) ждёт итог; дальше
@@ -72,6 +86,7 @@ var (
 	vupenRouteMaxMs       = int64(60_000)
 	vupenRouteMaxSwitches = 10
 	vupenRouteMaxExclude  = 24 * 60
+	vupenRouteMaxTarget   = 1024 // длина target (ядро 89)
 )
 
 // Вердикты VupenCheckRoute.
@@ -93,12 +108,17 @@ const (
 	vupenRouteNoAlternative = "no_alternative"
 	// Ядро 80 (D-43).
 	vupenRouteBusySearching = "busy_searching"
+	// Ядро 89 (D-71): switch с target.
+	vupenRouteTargetFailed = "target_failed"
+	vupenRouteNotInPool    = "not_in_pool"
 )
 
 // vupenStickyRouteObs — что ещё нужно от обсерватории для VupenCheckRoute (burst, ядро 78).
 type vupenStickyRouteObs interface {
 	VupenStickyCheckWith(tag string, opt burst.VupenCheckOptions) burst.VupenCheckResult
 	VupenStickyExcludeFor(tag, reason string, d time.Duration)
+	// Ядро 89 (T-228): снять исключение (исключённая цель switch прошла проверку).
+	VupenStickyUnexclude(tag, reason string) bool
 	VupenStickyCloseConns(tag string) int
 	// Ядро 80 (D-43): быстрый поиск switch (burst, tuning_vupen_switch.go).
 	VupenStickyRecent(tags []string, maxAge time.Duration) map[string]time.Duration
@@ -120,6 +140,7 @@ type vupenRouteReq struct {
 	ExcludeMin       int    `json:"excludeMin"`     // 0 — 15 (switch не исключает — поле не действует)
 	CloseConnections *bool  `json:"closeConnections"`
 	Reason           string `json:"reason"` // foreground | after-connect | manual (для журнала)
+	Target           string `json:"target"` // ядро 89: switch — тег узла пула; "" — по кругу, как было
 }
 
 // vupenRouteResp — ответ VupenCheckRoute.
@@ -155,6 +176,12 @@ func parseVupenRouteReq(raw string) (vupenRouteReq, string) {
 	}
 	if q.Mode != vupenRouteCheckMode && q.Mode != vupenRouteHealMode && q.Mode != vupenRouteSwitchMode {
 		return q, fmt.Sprintf("bad request: mode %q (want check, heal or switch)", q.Mode)
+	}
+	if q.Target != "" && q.Mode != vupenRouteSwitchMode {
+		return q, fmt.Sprintf("bad request: target with mode %q (only switch)", q.Mode)
+	}
+	if len(q.Target) > vupenRouteMaxTarget {
+		return q, fmt.Sprintf("bad request: target longer than %d bytes", vupenRouteMaxTarget)
 	}
 	for _, u := range []struct{ name, v string }{{"url", q.URL}, {"fallbackUrl", q.FallbackURL}} {
 		if u.v != "" {
@@ -280,8 +307,12 @@ func (r *Router) vupenCheckRoute(raw string) vupenRouteResp {
 	x.setReport(func(rep *vupenStickyReport) {
 		rep.lastRoute = vupenStickyMark{at: vupenStickyNow(), kind: q.Mode, detail: resp.Verdict, from: resp.From, to: resp.To, reason: q.Reason}
 	})
+	mode := q.Mode
+	if q.Target != "" {
+		mode += fmt.Sprintf(" target=%q", q.Target) // ядро 89
+	}
 	errors.LogWarning(x.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute %s (%s): %s from=%q to=%q tried=%d %dms %s %s",
-		x.balancer, q.Mode, q.Reason, resp.Verdict, resp.From, resp.To, resp.Tried, resp.Ms, resp.Kind, resp.Detail))
+		x.balancer, mode, q.Reason, resp.Verdict, resp.From, resp.To, resp.Tried, resp.Ms, resp.Kind, resp.Detail))
 	return resp
 }
 
@@ -373,6 +404,12 @@ func (s *vupenSticky) checkRoute(q vupenRouteReq) vupenRouteResp {
 // дольше VupenCheckRouteHealWait.
 func (s *vupenSticky) requestHeal(q vupenRouteReq) vupenRouteResp {
 	if q.Mode == vupenRouteSwitchMode {
+		// Ядро 89 (D-71): цель не из пула того, кто выбирает (или LTE не на сотовой) — сразу.
+		if q.Target != "" {
+			if why := s.targetNotInPool(q.Target); why != "" {
+				return vupenRouteResp{Verdict: vupenRouteNotInPool, From: s.viewTag(), Detail: why}
+			}
+		}
 		// Ядро 80 (D-43): ядро уже ищет — второй поиск не начинаем.
 		if p := s.getPhase(); p == vupenPhaseNew || p == vupenPhaseChecking || p == vupenPhaseSearching {
 			return vupenRouteResp{Verdict: vupenRouteBusySearching, From: s.viewTag(), Detail: vupenBusyDetail(p)}
@@ -582,9 +619,14 @@ func vupenBusyDetail(p vupenStickyPhase) string {
 
 // switchRoute — режим switch (ядро 79–80, D-42, D-43; горутина обработчика):
 // сменить работающий узел по просьбе пользователя, без проверки и без
-// исключения текущего, без раунда обсерватории.
+// исключения текущего, без раунда обсерватории. С target (ядро 89, D-71) —
+// switchToTarget: цель проверяется 24 КБ (как heal), текущий по-прежнему не
+// проверяется и не исключается.
 func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 	q := h.q
+	if q.Target != "" {
+		return s.switchToTarget(q) // ядро 89 (D-71)
+	}
 	resp := vupenRouteResp{Verdict: vupenRouteUnknown, From: s.viewTag()}
 	obs, ro, why := s.routeObs()
 	if why != "" {
@@ -701,6 +743,106 @@ func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 	}
 	errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": checkRoute switch: ", resp.Detail)
 	return resp
+}
+
+// switchToTarget — switch с target (ядро 89, D-71; горутина обработчика): перейти на
+// выбранный пользователем узел пула после проверки 24 КБ (как heal), АВТО остаётся.
+// Текущий не проверяется и не исключается; цель при провале не исключается; visited,
+// перелив и повторная проверка ядра 88 не трогаются. Исключённая цель тоже
+// проверяется (T-228): прошла — исключение снимается.
+func (s *vupenSticky) switchToTarget(q vupenRouteReq) vupenRouteResp {
+	target := q.Target
+	resp := vupenRouteResp{Verdict: vupenRouteUnknown, From: s.viewTag()}
+	// Пул того, кто сейчас выбирает: REG (при переливе — LTE). Другой ярус и LTE, в
+	// который сейчас не переливают (в том числе не на сотовой — D-21), — не в пуле.
+	if why := s.targetNotInPool(target); why != "" {
+		resp.Verdict, resp.Detail = vupenRouteNotInPool, why
+		return resp
+	}
+	obs, ro, why := s.routeObs()
+	if why != "" {
+		resp.Detail = why
+		return resp
+	}
+	prev := ""
+	switch p := s.getPhase(); p {
+	case vupenPhaseHolding:
+		prev = s.current
+	case vupenPhaseNoWorking:
+		// Рабочих не было: прошедшая цель становится текущим.
+	default:
+		resp.Verdict, resp.Detail = vupenRouteBusySearching, vupenBusyDetail(p)
+		return resp
+	}
+	resp.From, resp.To = prev, prev
+	kept := prev
+	if kept == "" {
+		kept = "no node (no working)"
+	}
+	if target == prev {
+		resp.Verdict, resp.Detail = vupenRouteSwitched, "the target is the current node"
+		return resp
+	}
+	// T-228 (решение владельца 2026-11-10): исключённая по провалу цель (D-42) не
+	// отбрасывается, а проверяется заново той же проверкой 24 КБ — один раз на тап.
+	// Прошла — исключение снимается ДО holdBecause (держать исключённый узел нельзя:
+	// pick сразу начал бы поиск); не прошла или проверку бросили — исключение остаётся
+	// как есть (срок не продлевается).
+	excluded := obs.VupenStickyExcluded(target)
+	// Как heal: проверка бросается при смене сети (результат из прежней сети не годится).
+	run := s.beginSearch(vupenNetEpochNow())
+	res := s.checkWithCtx(run, ro, target, q.options())
+	aborted := res.Verdict != vupenStickyOK && run.aborted()
+	s.endSearch(run)
+	resp.Tried = 1
+	if aborted {
+		resp.Detail = "the network changed during the check of the target — kept " + kept
+		select {
+		case <-s.stopCh: // CR-003 (T-227): остановленный балансировщик — не «смена сети»
+		default:
+			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch to %s: aborted, the network changed (epoch %d → %d) → kept %q",
+				s.balancer, target, run.epoch, vupenNetEpochNow(), prev))
+		}
+		return resp
+	}
+	resp.Kind, resp.Detail = res.Kind, res.Detail
+	if res.Verdict != vupenStickyOK {
+		// Провал или «не поняли»: остаёмся на текущем, цель не исключается (исключённая
+		// остаётся исключённой с прежним сроком).
+		resp.Verdict = vupenRouteTargetFailed
+		resp.Detail += " → kept " + kept
+		if excluded {
+			resp.Detail += " (the target stays excluded)"
+		}
+		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch to %s: check %s (%s) → kept %q",
+			s.balancer, target, res.Verdict, res.Detail, prev))
+		return resp
+	}
+	if excluded {
+		// Порядок важен: сначала снять исключение, потом держать (см. выше).
+		ro.VupenStickyUnexclude(target, "switch target passed the 24 KB check")
+	}
+	s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
+	s.noteAlive(target)
+	s.holdBecause(target, "switch")
+	resp.Verdict, resp.To = vupenRouteSwitched, target
+	if prev != "" && q.closeConns() {
+		resp.Closed = ro.VupenStickyCloseConns(prev)
+	}
+	errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch: %q → %s (target, checked), %d connections of %q closed",
+		s.balancer, prev, target, resp.Closed, prev))
+	return resp
+}
+
+// targetNotInPool — почему target нельзя выбрать в этом балансировщике ("" — можно).
+func (s *vupenSticky) targetNotInPool(target string) string {
+	if s.dormant() {
+		return fmt.Sprintf("%s is not selecting now (no spill or the network is not cellular)", s.balancer)
+	}
+	if cands, _ := s.b.SelectOutbounds(); !slices.Contains(cands, target) {
+		return fmt.Sprintf("%q is not in the pool of %s", target, s.balancer)
+	}
+	return ""
 }
 
 // cacheMaxAge — до какой давности замеры обсерватории годятся для switch:

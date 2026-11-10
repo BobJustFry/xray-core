@@ -46,6 +46,7 @@ type stickyFakeObs struct {
 	routeOpts   []burst.VupenCheckOptions
 	excludedFor map[string]time.Duration
 	closedTags  []string
+	unexcluded  []string // ядро 89 (T-228): VupenStickyUnexclude
 	// Ядро 80 (switch): кэш замеров (задержка или -1) и их возраст; быстрые пробы
 	// отвечают узлам из delay (по возрастанию задержки), если не задан quickDelay.
 	recent     map[string]time.Duration

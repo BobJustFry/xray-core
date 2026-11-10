@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -225,5 +226,87 @@ func TestVupenStickyExcludeFor(t *testing.T) {
 	h.tspu.mu.Unlock()
 	if d := time.Until(until); d < VupenTspuFrozenFor-time.Minute || d > VupenTspuFrozenFor {
 		t.Fatalf("0 → default %v, got %v", VupenTspuFrozenFor, d)
+	}
+}
+
+// Ядро 89 (T-228): снятие исключения — и явного (ExcludeFor), и заморозки 64 КБ;
+// «проверен» не ставится и не снимается; не исключённый — false, ничего не меняется.
+func TestVupenStickyUnexclude(t *testing.T) {
+	h := NewHealthPing(context.Background(), nil, nil)
+	t.Cleanup(h.cancelCtx)
+	o := &Observer{hp: h}
+	if o.VupenStickyUnexclude("proxy-0", "test") {
+		t.Fatal("unknown node: nothing to lift")
+	}
+	o.VupenStickyExcludeFor("proxy-1", "test", 15*time.Minute)
+	if !o.VupenStickyUnexclude("proxy-1", "test") || o.VupenStickyExcluded("proxy-1") {
+		t.Fatal("an explicit exclusion must be lifted")
+	}
+	if o.VupenStickyUnexclude("proxy-1", "test") {
+		t.Fatal("second lift: the node is not excluded any more")
+	}
+	now := time.Now()
+	h.tspu.mu.Lock()
+	e := h.tspu.entryLocked("proxy-2") // заморозка проверки 64 КБ
+	e.frozenUntil, e.frozenAt = now.Add(VupenTspuFrozenFor), now
+	v := h.tspu.entryLocked("proxy-3") // проверен, не исключён
+	v.verifiedUntil = now.Add(time.Hour)
+	h.tspu.mu.Unlock()
+	if !o.VupenStickyUnexclude("proxy-2", "test") || o.VupenStickyExcluded("proxy-2") || o.VupenTspuVerified("proxy-2") {
+		t.Fatal("a 64 KB freeze must be lifted, without marking the node verified")
+	}
+	h.tspu.mu.Lock()
+	frozenAt := h.tspu.m["proxy-2"].frozenAt
+	h.tspu.mu.Unlock()
+	if !frozenAt.IsZero() {
+		t.Fatal("frozenAt must be cleared with the freeze")
+	}
+	if o.VupenStickyUnexclude("proxy-3", "test") || !o.VupenTspuVerified("proxy-3") {
+		t.Fatal("a verified node is untouched")
+	}
+	// Истёкшее исключение — уже не исключён.
+	h.tspu.mu.Lock()
+	h.tspu.entryLocked("proxy-4").frozenUntil = now.Add(-time.Second)
+	h.tspu.mu.Unlock()
+	if o.VupenStickyUnexclude("proxy-4", "test") {
+		t.Fatal("an expired exclusion is not an exclusion")
+	}
+}
+
+// Ядро 89 (T-228): снятие исключения одновременно с исключениями, снятием заморозок БС
+// и чтением состояния (итоги проверок обсерватории) — без гонок (-race), итог согласован.
+func TestVupenStickyUnexcludeConcurrent(t *testing.T) {
+	h := NewHealthPing(context.Background(), nil, nil)
+	t.Cleanup(h.cancelCtx)
+	o := &Observer{hp: h}
+	tags := []string{"proxy-1", "proxy-2", "proxy-3"}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				tag := tags[(i+j)%len(tags)]
+				switch (i + j) % 5 {
+				case 0:
+					o.VupenStickyExcludeFor(tag, "race", time.Minute)
+				case 1:
+					o.VupenStickyUnexclude(tag, "race")
+				case 2:
+					o.VupenStickyUnfreezeTags(time.Time{}, nil)
+				case 3:
+					_ = o.VupenStickyExcluded(tag)
+				default:
+					_ = o.VupenTspuVerified(tag)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, tag := range tags {
+		o.VupenStickyExcludeFor(tag, "final", time.Minute)
+		if !o.VupenStickyUnexclude(tag, "final") || o.VupenStickyExcluded(tag) {
+			t.Fatalf("%s: lift after the race", tag)
+		}
 	}
 }
