@@ -2,10 +2,7 @@ package tun
 
 import (
 	"fmt"
-	"sync"
 	"sync/atomic"
-
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // Vupen: счётчики тракта TUN для heartbeat расширения.
@@ -27,6 +24,7 @@ var tunStats struct {
 	tcpAccepted      atomic.Uint64 // рукопожатий завершено
 	tcpHandshakeFail atomic.Uint64 // CreateEndpoint вернул ошибку (таймаут ACK и т.п.)
 	tcpRefused       atomic.Uint64 // из них сброс самим приложением (T-083), в журнал — Debug
+	synDrop          atomic.Uint64 // SYN отброшен: рукопожатий в полёте уже tcpMaxInFlight
 	udpSessions      atomic.Int32
 	udpCapDrops      atomic.Uint64 // пакетов отброшено по лимиту UDP-сессий
 	udpEvicted       atomic.Uint64 // сессий вытеснено при полной таблице (ядро 72)
@@ -35,27 +33,10 @@ var tunStats struct {
 	udpQueueDrops    atomic.Uint64 // пакетов отброшено по потолку байт в очередях (T-075)
 }
 
-var (
-	tunStackMu sync.Mutex
-	tunStack   *stack.Stack
-)
-
-func setTunStack(s *stack.Stack) {
-	tunStackMu.Lock()
-	tunStack = s
-	tunStackMu.Unlock()
-}
-
-// Stats — одна строка для heartbeat NE. `synDrop` — счётчик самого gVisor
-// (ForwardMaxInFlightDrop): SYN, отброшенные из-за maxInFlight; до ядра 47 это
-// был единственный след того, что лимит соединений сработал, и он не читался.
+// Stats — одна строка для heartbeat NE. `synDrop` — SYN, отброшенные из-за
+// лимита рукопожатий в полёте (при gVisor это был его ForwardMaxInFlightDrop);
+// до ядра 47 это был единственный след того, что лимит сработал.
 func Stats() string {
-	var synDrop uint64
-	tunStackMu.Lock()
-	if tunStack != nil {
-		synDrop = tunStack.Stats().TCP.ForwardMaxInFlightDrop.Value()
-	}
-	tunStackMu.Unlock()
 	return fmt.Sprintf(
 		"reader=%d rx=%d rxErr=%d rxMulti=%d rxDesync=%d tx=%d txDrop=%d tcpLive=%d tcpAcc=%d hsFail=%d synDrop=%d udp=%d udpDrop=%d udpEvict=%d dnsReap=%d udpQ=%dKB udpQDrop=%d hsRefused=%d",
 		tunStats.readerAlive.Load(),
@@ -68,7 +49,7 @@ func Stats() string {
 		tunStats.tcpLive.Load(),
 		tunStats.tcpAccepted.Load(),
 		tunStats.tcpHandshakeFail.Load(),
-		synDrop,
+		tunStats.synDrop.Load(),
 		tunStats.udpSessions.Load(),
 		tunStats.udpCapDrops.Load(),
 		tunStats.udpEvicted.Load(),

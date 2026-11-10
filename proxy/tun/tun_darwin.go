@@ -20,9 +20,6 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -47,8 +44,8 @@ type DarwinTun struct {
 	ownsFd  bool // true for macOS (we created the fd), false for iOS (fd from system)
 
 	// Genuinely blocks Wait() until tunFd is readable, instead of the
-	// previous procyield-only busy-spin (dispatchLoop in
-	// stack_gvisor_endpoint.go calls ReadPacket() then Wait() in a tight
+	// previous procyield-only busy-spin (ReadPacket() reads and then calls
+	// Wait() in a tight
 	// loop with no other throttling whenever the queue is empty -- with
 	// only procyield(1), that pins a full CPU core for as long as the
 	// tunnel is up, observed causing severe device heating/thermal
@@ -56,13 +53,6 @@ type DarwinTun struct {
 	// back to a bounded time.Sleep instead. See waitKqueue's own doc
 	// comment for why this is a dedicated type rather than a bare fd.
 	waitKq *waitKqueue
-
-	// Vupen (ядро 51): fd расширения — socketpair(SOCK_STREAM), а не utun, и
-	// границ пакетов в нём нет. Не nil, когда SO_TYPE дескриптора — SOCK_STREAM;
-	// тогда ReadPacket режет поток на кадры сам (stream_framer.go).
-	framer *streamFramer
-	// кадров выдано после последнего Read — для счётчика rxCoalesced.
-	framesSinceRead int
 
 	routeMonitor     *os.File
 	routeMonitorOnce sync.Once
@@ -73,7 +63,7 @@ type DarwinTun struct {
 // waitKqueue owns a kqueue fd used by DarwinTun.Wait() to block on
 // read-readiness. Closing and waiting can race from different goroutines
 // (Close() from the caller that tears down the tunnel, Wait() from
-// dispatchLoop's own goroutine) -- reviewer feedback on XTLS/Xray-core#6580
+// the goroutine that reads packets) -- reviewer feedback on XTLS/Xray-core#6580
 // found that a bare `int` fd field let Close() race Wait()'s use of the
 // same fd number, and on Darwin a closed fd number can be reused by an
 // unrelated concurrent open() before Wait() gets to call Kevent on it,
@@ -117,9 +107,9 @@ func newWaitKqueue(fd int) *waitKqueue {
 // wait blocks until the registered fd is readable, timeout elapses, or a
 // benign interrupt occurs -- all three are "this kqueue is still healthy,
 // the caller should just try again" and return true; the caller
-// (DarwinTun.Wait) doesn't need to distinguish them since it always calls
-// ReadPacket() right after anyway, and that already handles "nothing was
-// actually there" via ErrQueueEmpty. Returns false only when the kqueue
+// (DarwinTun.Wait) doesn't need to distinguish them since ReadPacket()
+// reads right after anyway, and that already handles "nothing was
+// actually there" by waiting again. Returns false only when the kqueue
 // itself is no longer usable -- already closed, or the kevent syscall
 // failed for a reason other than EINTR -- see its own call site in
 // DarwinTun.Wait for why a persistent failure must not be silently
@@ -152,10 +142,7 @@ func (w *waitKqueue) close() {
 	})
 }
 
-var (
-	_ Tun          = (*DarwinTun)(nil)
-	_ GVisorDevice = (*DarwinTun)(nil)
-)
+var _ Tun = (*DarwinTun)(nil)
 
 func NewTun(options *Config) (Tun, error) {
 	// Check if fd is provided via environment (iOS mode)
@@ -179,22 +166,13 @@ func NewTun(options *Config) (Tun, error) {
 			return nil, err
 		}
 
-		t := &DarwinTun{
+		return &DarwinTun{
 			tunFile: os.NewFile(uintptr(fd), "utun"),
 			options: options,
 			tunFd:   fd,
 			ownsFd:  false,
 			waitKq:  newWaitKqueue(fd),
-		}
-		// Vupen: потоковый сокет (socketpair расширения) — включаем фреймер.
-		// Настоящий utun или датаграммный сокет отвечают ENOTSOCK / SOCK_DGRAM —
-		// читаем как раньше. Дубликат дескриптора (против GC-закрытия под новым
-		// ядром при hot reload) теперь делает сам апстрим (#6883).
-		if soType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE); err == nil && soType == unix.SOCK_STREAM {
-			t.framer = newStreamFramer()
-			xerrors.LogWarning(context.Background(), "[tun] fd ", fd, " is a stream socket: frame parsing on")
-		}
-		return t, nil
+		}, nil
 	}
 
 	// macOS: create our own utun interface
@@ -290,126 +268,42 @@ func (t *DarwinTun) Index() (int, error) {
 	return iface.Index, nil
 }
 
-// WritePacket implements GVisorDevice method to write one packet to the tun device
-func (t *DarwinTun) WritePacket(packet *stack.PacketBuffer) tcpip.Error {
-	// request memory to write from reusable buffer pool
-	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
-	defer b.Release()
-
-	// prepare Darwin specific packet header
-	_, _ = b.Write([]byte{0x0, 0x0, 0x0, 0x0})
-	// copy the bytes of slices that compose the packet into the allocated buffer
-	for _, packetElement := range packet.AsSlices() {
-		_, _ = b.Write(packetElement)
-	}
-	// fill Darwin specific header from the first raw packet byte, that we can access now
+// WritePacket implements Tun: the two parts are copied behind the header that the system wants in front of a packet
+func (t *DarwinTun) WritePacket(header, payload []byte) error {
 	var family byte
-	switch b.Byte(4) >> 4 {
+	switch header[0] >> 4 {
 	case 4:
 		family = unix.AF_INET
 	case 6:
 		family = unix.AF_INET6
 	default:
-		return &tcpip.ErrAborted{}
+		return xerrors.New("not an ip packet")
 	}
-	b.SetByte(3, family)
 
-	if _, err := t.tunFile.Write(b.Bytes()); err != nil {
-		if errors.Is(err, unix.EAGAIN) {
-			return &tcpip.ErrWouldBlock{}
-		}
-		return &tcpip.ErrAborted{}
-	}
-	return nil
-}
-
-// ReadPacket implements GVisorDevice method to read one packet from the tun device
-// It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
-// which will make the stack call Wait which should implement desired push-back
-func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
-	if t.framer != nil {
-		return t.readFramedPacket()
-	}
 	// request memory to write from reusable buffer pool
-	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
+	b := buf.NewWithSize(int32(utunHeaderSize + len(header) + len(payload)))
+	defer b.Release()
+	b.Extend(utunHeaderSize)[3] = family
+	_, _ = b.Write(header)
+	_, _ = b.Write(payload)
 
-	// read the bytes to the interface file
-	n, err := b.ReadFrom(t.tunFile)
-	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
-		b.Release()
-		return 0, nil, ErrQueueEmpty
-	}
-	if err != nil {
-		b.Release()
-		return 0, nil, err
-	}
-
-	// discard empty or sub-empty packets
-	if n <= utunHeaderSize {
-		b.Release()
-		return 0, nil, ErrQueueEmpty
-	}
-
-	// network protocol version from first byte of the raw packet, the one that follows Darwin specific header
-	version := b.Byte(utunHeaderSize) >> 4
-	packetBuffer := buffer.MakeWithData(b.BytesFrom(utunHeaderSize))
-	return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload:           packetBuffer,
-		IsForwardedPacket: true,
-		OnRelease: func() {
-			b.Release()
-		},
-	}), nil
+	_, err := t.tunFile.Write(b.Bytes())
+	return err
 }
 
-// readFramedPacket — ReadPacket для потокового сокета расширения: один Read
-// может принести несколько кадров или кусок кадра; целые кадры отдаются по
-// одному, неполный ждёт следующего Read (ErrQueueEmpty → Wait на kqueue).
-// Почему это нужно — см. stream_framer.go.
-func (t *DarwinTun) readFramedPacket() (byte, *stack.PacketBuffer, error) {
-	f := t.framer
+// ReadPacket implements Tun: it reads into b, the packet follows the header that the system puts in front of it
+func (t *DarwinTun) ReadPacket(b []byte) ([]byte, error) {
 	for {
-		frame, err := f.frameLen()
-		if err != nil {
-			n := tunStats.rxDesync.Add(1)
-			dropped := f.resync()
-			if logEvery(n) {
-				xerrors.LogError(context.Background(), "[tun] stream desync (", n, "): ", err.Error(), " — dropped ", dropped, " bytes")
-			}
+		n, err := t.tunFile.Read(b)
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) || err == nil && n <= utunHeaderSize {
+			// nothing on the line, or an empty packet
+			t.Wait()
 			continue
 		}
-		if frame > 0 {
-			if t.framesSinceRead > 0 {
-				tunStats.rxCoalesced.Add(1)
-			}
-			t.framesSinceRead++
-			size := int32(frame - streamHeaderSize)
-			b := buf.NewWithSize(size)
-			f.pop(frame, b.Extend(size))
-			version := b.Byte(0) >> 4
-			return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload:           buffer.MakeWithData(b.Bytes()),
-				IsForwardedPacket: true,
-				OnRelease: func() {
-					b.Release()
-				},
-			}), nil
-		}
-		free := f.free()
-		if len(free) == 0 {
-			// Недостижимо: кадр длиннее накопителя отбраковывает complete().
-			f.n = 0
-			continue
-		}
-		t.framesSinceRead = 0
-		n, err := t.tunFile.Read(free)
-		f.commit(n)
-		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
-			return 0, nil, ErrQueueEmpty
-		}
 		if err != nil {
-			return 0, nil, err
+			return nil, err
 		}
+		return b[utunHeaderSize:n], nil
 	}
 }
 
@@ -419,8 +313,8 @@ func (t *DarwinTun) readFramedPacket() (byte, *stack.PacketBuffer, error) {
 // happens to race a call already parked here.
 //
 // Reviewer feedback (XTLS/Xray-core#6580, P2): the original version
-// discarded every error from the underlying kevent syscall. dispatchLoop
-// (stack_gvisor_endpoint.go) calls ReadPacket() then Wait() in an
+// discarded every error from the underlying kevent syscall. ReadPacket()
+// reads and then calls Wait() in an
 // unconditional tight loop -- if kevent started failing at runtime for a
 // persistent reason (not just a benign EINTR), Wait() returning
 // immediately every time reintroduces exactly the busy-spin this whole
@@ -448,12 +342,8 @@ func (t *DarwinTun) Wait() {
 	// real Darwin systems, or having just failed permanently above)
 	// instead of always -- a genuine bounded sleep actually yields the CPU
 	// instead of being a near-instant scheduler hint that lets the tight
-	// dispatchLoop caller spin just as hot as before.
+	// loop of ReadPacket() spin just as hot as before.
 	time.Sleep(time.Millisecond)
-}
-
-func (t *DarwinTun) newEndpoint() (stack.LinkEndpoint, error) {
-	return &LinkEndpoint{deviceMTU: t.options.MTU, device: t}, nil
 }
 
 // open the interface, by creating new utunN if in the system and returning its file descriptor
