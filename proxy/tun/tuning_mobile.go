@@ -18,16 +18,24 @@ var (
 )
 
 // SetTCPBufMaxKB sets max TCP RX/TX buffer per connection in kilobytes.
+// Since the built-in stack (upstream #7130) it caps the window of every
+// connection: what is taken from the system before the outbound reads it and
+// what is sent to the system before it is acknowledged. It can only lower the
+// upstream window (256 KiB, 1 MiB for a tun that takes large segments), never
+// raise it, and is not below tcpWindowMinKB. Read when the stack is created.
 func SetTCPBufMaxKB(kb int) {
 	if kb > 0 {
 		atomic.StoreInt32(&tcpBufMaxKB, int32(kb))
 	}
 }
 
-// SetTCPMaxInFlight sets gVisor's forwarder maxInFlight: the number of TCP
-// handshakes in progress at once (per gVisor docs), NOT of live connections.
-// Until core 47 Complete() was called after the whole connection had ended, so
-// this capped live connections and the 97th SYN was dropped silently.
+// SetTCPMaxInFlight sets the number of TCP handshakes in progress at once
+// (SYN-ACK sent, final ACK not yet received), NOT of live connections. With
+// gVisor it was the forwarder's maxInFlight; with the built-in stack (#7130) it
+// replaces the tcpOpening constant (65535): a SYN over the limit is dropped
+// silently, as upstream does, and counted in Stats() as synDrop. Read when the
+// stack is created. Until core 47 it capped live connections (Complete() was
+// called after the whole connection had ended); it does not now.
 func SetTCPMaxInFlight(n int) {
 	if n > 0 {
 		atomic.StoreInt32(&tcpMaxInFlight, int32(n))
@@ -96,4 +104,22 @@ func mobileUDPEgressDepth() int {
 		return 128
 	}
 	return n
+}
+
+// tcpWindowMinKB is the least window SetTCPBufMaxKB can set: a few segments,
+// below that a connection crawls.
+const tcpWindowMinKB = 64
+
+// vupenTCPWindow caps the window of the built-in stack by tcpBufMaxKB.
+func vupenTCPWindow(upstream int32) int32 {
+	w := int32(min(mobileTCPBufMaxBytes(), int(upstream)))
+	return max(w, min(tcpWindowMinKB<<10, upstream))
+}
+
+// openingLimit is how many connections may wait for the answer to their SYN-ACK.
+func (s *stack) openingLimit() int32 {
+	if s.maxOpening <= 0 {
+		return tcpOpening
+	}
+	return s.maxOpening
 }

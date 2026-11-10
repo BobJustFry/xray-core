@@ -51,6 +51,8 @@ type stack struct {
 	closed bool
 	// opening is how many of conns wait for the answer to their SYN-ACK
 	opening atomic.Int32
+	// Vupen: maxOpening caps opening (SetTCPMaxInFlight); 0 means tcpOpening
+	maxOpening int32
 }
 
 // NewStack builds new ip stack
@@ -67,6 +69,9 @@ func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stac
 		s.segmenter = t
 		s.window = tcpLargeWindow
 	}
+	// Vupen: mobile limits (tuning_mobile.go), read once per stack
+	s.window = vupenTCPWindow(s.window)
+	s.maxOpening = int32(mobileTCPMaxInFlight())
 	s.udp = newUdpConnectionHandler(s.handle, s.writeUDP)
 	return s, nil
 }
@@ -161,7 +166,11 @@ func (s *stack) handleTCP(p packet) {
 		return
 	}
 
-	if s.opening.Load() >= tcpOpening {
+	if s.opening.Load() >= s.openingLimit() {
+		// Vupen: the SYN is dropped silently as upstream does, but counted for the NE heartbeat
+		if n := tunStats.synDrop.Add(1); logEvery(n) {
+			errors.LogWarning(s.ctx, "[tun] drop syn: ", s.openingLimit(), " handshakes in flight (drops ", n, ")")
+		}
 		return
 	}
 	c = newTCPConn(s, f, seg)
