@@ -617,7 +617,9 @@ func vupenBusyDetail(p vupenStickyPhase) string {
 
 // switchRoute — режим switch (ядро 79–80, D-42, D-43; горутина обработчика):
 // сменить работающий узел по просьбе пользователя, без проверки и без
-// исключения текущего, без раунда обсерватории.
+// исключения текущего, без раунда обсерватории. С target (ядро 89, D-71) —
+// switchToTarget: цель проверяется 24 КБ (как heal), текущий по-прежнему не
+// проверяется и не исключается.
 func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 	q := h.q
 	if q.Target != "" {
@@ -793,8 +795,12 @@ func (s *vupenSticky) switchToTarget(q vupenRouteReq) vupenRouteResp {
 	resp.Tried = 1
 	if aborted {
 		resp.Detail = "the network changed during the check of the target — kept " + kept
-		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch to %s: aborted, the network changed (epoch %d → %d) → kept %q",
-			s.balancer, target, run.epoch, vupenNetEpochNow(), prev))
+		select {
+		case <-s.stopCh: // CR-003 (T-227): остановленный балансировщик — не «смена сети»
+		default:
+			errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch to %s: aborted, the network changed (epoch %d → %d) → kept %q",
+				s.balancer, target, run.epoch, vupenNetEpochNow(), prev))
+		}
 		return resp
 	}
 	resp.Kind, resp.Detail = res.Kind, res.Detail

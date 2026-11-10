@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Ядро 89 (D-71): VupenCheckRoute(switch) с target — тап по узлу во вкладке «Серверы» в АВТО.
@@ -168,5 +169,111 @@ func TestVupenCheckRouteSwitchTargetWhileSpilled(t *testing.T) {
 	}
 	if !r.reg.spilledNow() || r.pick() != "lte-1" {
 		t.Fatalf("still spilled, via lte-1: spilled=%v pick=%s", r.reg.spilledNow(), r.pick())
+	}
+}
+
+// CR-002 (T-227): сеть сменилась во время проверки цели — unknown, текущий остаётся
+// (Holding, выдача та же), цель не исключается, соединения не закрываются.
+func TestVupenCheckRouteSwitchTargetAbortsOnEpochChange(t *testing.T) {
+	r, f, eo := epochRig(t)
+	t.Cleanup(eo.closeRelease)
+	r.pick()
+	r.drain()
+	prev := r.pick()
+	if r.reg.getPhase() != vupenPhaseHolding || prev == "" {
+		t.Fatalf("setup: phase %v, current %q", r.reg.getPhase(), prev)
+	}
+	target := "p-3"
+	if prev == target {
+		target = "p-2"
+	}
+	eo.blockRoute = true // проверка 24 КБ цели висит до отмены
+	h := &vupenHealReq{q: vupenRouteReq{V: 1, Mode: vupenRouteSwitchMode, Reason: "manual", Target: target}, reply: make(chan vupenRouteResp, 1)}
+	got := make(chan vupenRouteResp, 1)
+	go func() { got <- r.reg.switchRoute(h) }()
+	waitHung(t, eo, "route")
+	f.newEpoch()
+	select {
+	case resp := <-got:
+		if resp.Verdict != vupenRouteUnknown || resp.From != prev || resp.To != prev || resp.Tried != 1 || resp.Closed != 0 ||
+			!strings.Contains(resp.Detail, "network changed") || !strings.Contains(resp.Detail, "kept "+prev) {
+			t.Fatalf("aborted switch to target: %+v", resp)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("switch to target is still blocked in the check of the previous network")
+	}
+	if r.reg.getPhase() != vupenPhaseHolding || r.reg.viewTag() != prev || r.pick() != prev {
+		t.Fatalf("current node must be kept: phase %v view %q pick %q", r.reg.getPhase(), r.reg.viewTag(), r.pick())
+	}
+	r.obs.mu.Lock()
+	excluded, excludedFor, closed := len(r.obs.excluded), len(r.obs.excludedFor), len(r.obs.closedTags)
+	r.obs.mu.Unlock()
+	if excluded != 0 || excludedFor != 0 || closed != 0 {
+		t.Fatalf("an aborted target check must not exclude or close: excluded=%d excludedFor=%d closed=%d", excluded, excludedFor, closed)
+	}
+}
+
+// CR-002 (T-227): рабочих не было — прошедшая проверку цель становится текущим
+// (Holding), повтор поиска по графику снят (holdBecause останавливает таймер).
+func TestVupenCheckRouteSwitchTargetWhenNoWorking(t *testing.T) {
+	r := newStickyRig(t, "", "p-1", "p-1", "p-2")
+	rt := routerWith(map[string]*Balancer{"REG": r.b})
+	r.pick()
+	r.drain()
+	r.expectPhase(vupenPhaseNoWorking)
+	if r.s.stopRetry == nil || len(r.clock.pendingIn()) == 0 || autoState(t, rt).Sticky.NextSearchAtMs == 0 {
+		t.Fatalf("setup: the retry timer must be armed (pending %v)", r.clock.pendingIn())
+	}
+	pending := len(r.clock.pendingIn())
+	go r.s.loop()
+	resp := pressTarget(t, rt, "p-2")
+	if resp.Verdict != vupenRouteSwitched || resp.From != "" || resp.To != "p-2" || resp.Tried != 1 || resp.Closed != 0 {
+		t.Fatalf("switch to target with no working node: %+v", resp)
+	}
+	r.expectPhase(vupenPhaseHolding)
+	if got := r.s.viewTag(); got != "p-2" {
+		t.Fatalf("new connections via %q, want p-2", got)
+	}
+	if n := len(r.clock.pendingIn()); n != pending-1 {
+		t.Fatalf("the retry timer must be stopped: %d live timers, was %d", n, pending)
+	}
+	st := autoState(t, rt)
+	if st.Phase != "holding" || st.Current.Tag != "p-2" || st.NoWorking || st.Sticky.NextSearchAtMs != 0 ||
+		st.LastSwitch.To != "p-2" || st.LastSwitch.Reason != "switch" {
+		t.Fatalf("state: %+v", st)
+	}
+	r.obs.mu.Lock()
+	checks := slices.Clone(r.obs.routeChecks)
+	r.obs.mu.Unlock()
+	if !slices.Equal(checks, []string{"p-2"}) {
+		t.Fatalf("24 KB checks %v, want only the target", checks)
+	}
+}
+
+// CR-002 (T-227): пока ядро само выбирает узел (new / поиск) — busy_searching и с target,
+// цель не проверяется, второй поиск не ставится.
+func TestVupenCheckRouteSwitchTargetBusySearching(t *testing.T) {
+	r := newStickyRig(t, "", "p-1", "p-1", "p-2")
+	rt := routerWith(map[string]*Balancer{"REG": r.b})
+	if resp := pressTarget(t, rt, "p-2"); resp.Verdict != vupenRouteBusySearching || !strings.Contains(resp.Detail, "not chosen a node yet") {
+		t.Fatalf("new: %+v", resp)
+	}
+	r.pick() // старт: поиск в очереди
+	r.expectPhase(vupenPhaseSearching)
+	start := time.Now()
+	if resp := pressTarget(t, rt, "p-2"); resp.Verdict != vupenRouteBusySearching || !strings.Contains(resp.Detail, "searching") ||
+		time.Since(start) > time.Second {
+		t.Fatalf("searching: %+v", resp)
+	}
+	if n := len(r.s.events); n != 1 {
+		t.Fatalf("only the start search is queued: %d events", n)
+	}
+	// И внутри обработчика (запрос прошёл до начала поиска).
+	h := &vupenHealReq{q: vupenRouteReq{Mode: vupenRouteSwitchMode, Target: "p-2"}, reply: make(chan vupenRouteResp, 1)}
+	if resp := r.s.switchRoute(h); resp.Verdict != vupenRouteBusySearching {
+		t.Fatalf("handler: %+v", resp)
+	}
+	if n := r.obs.routeCount(); n != 0 {
+		t.Fatalf("busy: the target must not be checked, %d checks", n)
 	}
 }
