@@ -4,12 +4,26 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 )
+
+// maskDialCtx is the context for a dial made through a Dialer closure handed
+// to a mask. While the mask is still being wrapped (the first dial) the
+// caller's context is used as is, so cancel/timeout apply. Once the
+// connection is established, later re-dials made by the mask (udphop hops)
+// keep the context values (AUTO 4.1 flag, outbound tag, net-epoch binding)
+// but drop cancellation and deadline of the long-finished first request.
+func maskDialCtx(ctx context.Context, established *atomic.Bool) context.Context {
+	if established.Load() {
+		return context.WithoutCancel(ctx)
+	}
+	return ctx
+}
 
 type Dialer struct {
 	DialTCP func(net.Destination) (net.Conn, error)
@@ -73,12 +87,13 @@ func (fm *FinalMask) DialTCP(ctx context.Context, dest net.Destination) (net.Con
 			return nil, err
 		}
 	}
+	established := &atomic.Bool{}
 	dialer := &Dialer{
 		DialTCP: func(dest net.Destination) (net.Conn, error) {
-			return fm.dialTCP(ctx, dest)
+			return fm.dialTCP(maskDialCtx(ctx, established), dest)
 		},
 		DialUDP: func(dest net.Destination) (net.Conn, error) {
-			conn, addr, err := fm.dialUDP(ctx, dest)
+			conn, addr, err := fm.dialUDP(maskDialCtx(ctx, established), dest)
 			if err != nil {
 				return nil, err
 			}
@@ -94,6 +109,7 @@ func (fm *FinalMask) DialTCP(ctx context.Context, dest net.Destination) (net.Con
 		}
 		conn = newConn
 	}
+	established.Store(true)
 	return conn, nil
 }
 
@@ -162,12 +178,13 @@ func (fm *FinalMask) DialUDP(ctx context.Context, dest net.Destination) (net.Con
 			return nil, err
 		}
 	}
+	established := &atomic.Bool{}
 	dialer := &Dialer{
 		DialTCP: func(dest net.Destination) (net.Conn, error) {
-			return fm.dialTCP(ctx, dest)
+			return fm.dialTCP(maskDialCtx(ctx, established), dest)
 		},
 		DialUDP: func(dest net.Destination) (net.Conn, error) {
-			conn, addr, err := fm.dialUDP(ctx, dest)
+			conn, addr, err := fm.dialUDP(maskDialCtx(ctx, established), dest)
 			if err != nil {
 				return nil, err
 			}
@@ -208,6 +225,7 @@ func (fm *FinalMask) DialUDP(ctx context.Context, dest net.Destination) (net.Con
 	if addr == nil {
 		addr = &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
 	}
+	established.Store(true)
 	return &net.PacketConnWrapper{PacketConn: conn, Dest: addr}, nil
 }
 
