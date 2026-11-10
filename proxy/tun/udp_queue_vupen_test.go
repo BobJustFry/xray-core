@@ -6,8 +6,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 )
+
+// testPkt — пакет, как его отдаёт стек (#7130): *buf.Buffer из пула.
+func testPkt(data []byte) *buf.Buffer {
+	b := buf.NewWithSize(int32(len(data)))
+	b.Write(data)
+	return b
+}
+
+// pktCost — сколько потолок байт считает за пакет из size байт (ёмкость буфера пула).
+func pktCost(size int) int64 {
+	b := testPkt(make([]byte, size))
+	defer b.Release()
+	return udpQueueCost(b)
+}
 
 // Vupen (T-075): потолок байт во всех очередях UDP-сессий TUN.
 
@@ -66,26 +81,27 @@ func waitQueued(t *testing.T, want int64) {
 func TestUDPQueueBytesCap(t *testing.T) {
 	base := settledQueued()
 	drops := tunStats.udpQueueDrops.Load()
-	u, release := stalledUDPHandler(t, 2) // 2048 байт на все очереди
 	pkt := make([]byte, 500)
+	cost := pktCost(len(pkt))                           // 2 КиБ: буфер пула, а не 500 байт данных
+	u, release := stalledUDPHandler(t, int(4*cost>>10)) // ровно 4 пакета на все очереди
 	for i := 0; i < 6; i++ {
-		u.HandlePacket(testSrc(1), testDst(443), pkt)
+		u.HandlePacket(testSrc(1), testDst(443), testPkt(pkt))
 	}
-	if got := tunStats.udpQueued.Load() - base; got != 2000 {
-		t.Fatalf("queued %d, want 2000 (4 packets)", got)
+	if got := tunStats.udpQueued.Load() - base; got != 4*cost {
+		t.Fatalf("queued %d, want %d (4 packets)", got, 4*cost)
 	}
 	if d := tunStats.udpQueueDrops.Load() - drops; d != 2 {
 		t.Fatalf("drops %d, want 2", d)
 	}
 	// Потолок общий: вторая сессия тоже упирается в него.
-	u.HandlePacket(testSrc(2), testDst(443), pkt)
+	u.HandlePacket(testSrc(2), testDst(443), testPkt(pkt))
 	if d := tunStats.udpQueueDrops.Load() - drops; d != 3 {
 		t.Fatalf("the cap is shared by sessions: drops %d, want 3", d)
 	}
 	close(release)
 	waitQueued(t, base)
 	// Место вернулось: снова принимаем.
-	u.HandlePacket(testSrc(1), testDst(443), pkt)
+	u.HandlePacket(testSrc(1), testDst(443), testPkt(pkt))
 	waitQueued(t, base) // прочитан сразу
 	if d := tunStats.udpQueueDrops.Load() - drops; d != 3 {
 		t.Fatalf("no new drops after release: %d", d)
@@ -99,12 +115,13 @@ func TestUDPQueueBytesReleasedOnRemove(t *testing.T) {
 	u, release := stalledUDPHandler(t, 1024)
 	defer close(release)
 	pkt := make([]byte, 300)
+	cost := pktCost(len(pkt))
 	for i := 0; i < 5; i++ {
-		u.HandlePacket(testSrc(7), testDst(53), pkt)
+		u.HandlePacket(testSrc(7), testDst(53), testPkt(pkt))
 	}
 	c := u.testConn(testSrc(7))
-	if got := tunStats.udpQueued.Load() - base; got != 1500 {
-		t.Fatalf("queued %d, want 1500", got)
+	if got := tunStats.udpQueued.Load() - base; got != 5*cost {
+		t.Fatalf("queued %d, want %d", got, 5*cost)
 	}
 	u.Lock()
 	u.removeLocked(c)
@@ -123,8 +140,8 @@ func TestUDPQueueBytesReleasedOnRead(t *testing.T) {
 	prev := atomic.LoadInt32(&udpQueueMaxKB)
 	t.Cleanup(func() { atomic.StoreInt32(&udpQueueMaxKB, prev) })
 	SetUDPQueueMaxKB(64)
-	c := &udpConn{egress: make(chan *packet, 4)}
-	if !c.enqueue(&packet{data: make([]byte, 100)}) {
+	c := &udpConn{egress: make(chan *buf.Buffer, 4)}
+	if !c.enqueue(testPkt(make([]byte, 100))) {
 		t.Fatal("enqueue")
 	}
 	b := make([]byte, 200)
@@ -142,12 +159,13 @@ func TestUDPQueueBytesReleasedOnCloseAll(t *testing.T) {
 	u, release := stalledUDPHandler(t, 1024)
 	defer close(release)
 	pkt := make([]byte, 200)
+	cost := pktCost(len(pkt))
 	for p := uint16(1); p <= 5; p++ {
 		for i := 0; i < 3; i++ {
-			u.HandlePacket(testSrc(p), testDst(443), pkt)
+			u.HandlePacket(testSrc(p), testDst(443), testPkt(pkt))
 		}
 	}
-	if got := tunStats.udpQueued.Load() - base; got != 3000 || u.testLen() != 5 {
+	if got := tunStats.udpQueued.Load() - base; got != 15*cost || u.testLen() != 5 {
 		t.Fatalf("setup: queued %d, sessions %d", got, u.testLen())
 	}
 	u.closeAll()
@@ -183,11 +201,27 @@ func TestUDPQueueBytesParallel(t *testing.T) {
 			defer wg.Done()
 			pkt := make([]byte, 700)
 			for i := 0; i < 2000; i++ {
-				u.HandlePacket(testSrc(uint16(100+w%4)), testDst(443), pkt)
+				u.HandlePacket(testSrc(uint16(100+w%4)), testDst(443), testPkt(pkt))
 			}
 		}(w)
 	}
 	wg.Wait()
 	u.closeAll()
 	waitQueued(t, base)
+}
+
+// T-237: stack.Close (built-in stack) closes the UDP sessions like the gVisor stack did.
+func TestUDPSessionsClosedWithStack(t *testing.T) {
+	base := settledQueued()
+	u, release := stalledUDPHandler(t, 1024)
+	defer close(release)
+	s := &stack{conns: make(map[flow]*tcpConn), udp: u}
+	u.HandlePacket(testSrc(1), testDst(443), testPkt(make([]byte, 100)))
+	if u.testLen() != 1 {
+		t.Fatal("setup: no session")
+	}
+	s.Close()
+	if got := tunStats.udpQueued.Load() - base; got != 0 || u.testLen() != 0 {
+		t.Fatalf("after stack.Close: queued %d, sessions %d", got, u.testLen())
+	}
 }

@@ -53,14 +53,14 @@ func (u *udpConnectionHandler) testAge(src net.Destination, age time.Duration) {
 func TestUDPFullTableEvictsIdlest(t *testing.T) {
 	u := newTestUDPHandler(t, 3)
 	for p := uint16(1); p <= 3; p++ {
-		u.HandlePacket(testSrc(p), testDst(443), []byte{1})
+		u.HandlePacket(testSrc(p), testDst(443), testPkt([]byte{1}))
 	}
 	u.testAge(testSrc(1), 30*time.Second)
 	u.testAge(testSrc(2), 60*time.Second) // самая давно молчащая
 	u.testAge(testSrc(3), 20*time.Second)
 	evicted := tunStats.udpEvicted.Load()
 
-	u.HandlePacket(testSrc(4), testDst(443), []byte{1})
+	u.HandlePacket(testSrc(4), testDst(443), testPkt([]byte{1}))
 
 	if u.testConn(testSrc(4)) == nil {
 		t.Fatal("new session was not admitted into the full table")
@@ -78,11 +78,11 @@ func TestUDPFullTableEvictsIdlest(t *testing.T) {
 
 func TestUDPFullTableOfLiveTrafficDrops(t *testing.T) {
 	u := newTestUDPHandler(t, 2)
-	u.HandlePacket(testSrc(1), testDst(443), []byte{1})
-	u.HandlePacket(testSrc(2), testDst(443), []byte{1})
+	u.HandlePacket(testSrc(1), testDst(443), testPkt([]byte{1}))
+	u.HandlePacket(testSrc(2), testDst(443), testPkt([]byte{1}))
 	drops := tunStats.udpCapDrops.Load()
 
-	u.HandlePacket(testSrc(3), testDst(443), []byte{1})
+	u.HandlePacket(testSrc(3), testDst(443), testPkt([]byte{1}))
 
 	if u.testConn(testSrc(3)) != nil {
 		t.Fatal("a session was admitted by evicting live traffic")
@@ -97,13 +97,13 @@ func TestUDPFullTableOfLiveTrafficDrops(t *testing.T) {
 
 func TestUDPEvictedSessionCloseKeepsItsSuccessor(t *testing.T) {
 	u := newTestUDPHandler(t, 1)
-	u.HandlePacket(testSrc(1), testDst(53), []byte{1})
+	u.HandlePacket(testSrc(1), testDst(53), testPkt([]byte{1}))
 	old := u.testConn(testSrc(1))
 
 	u.Lock()
 	u.removeLocked(old)
 	u.Unlock()
-	u.HandlePacket(testSrc(1), testDst(53), []byte{2})
+	u.HandlePacket(testSrc(1), testDst(53), testPkt([]byte{2}))
 	successor := u.testConn(testSrc(1))
 	if successor == nil || successor == old {
 		t.Fatal("no new session under the same source")
@@ -118,9 +118,9 @@ func TestUDPEvictedSessionCloseKeepsItsSuccessor(t *testing.T) {
 
 func TestUDPDNSReaper(t *testing.T) {
 	u := newTestUDPHandler(t, 16)
-	u.HandlePacket(testSrc(1), testDst(53), []byte{1})  // DNS, замолчит
-	u.HandlePacket(testSrc(2), testDst(53), []byte{1})  // DNS, свежая
-	u.HandlePacket(testSrc(3), testDst(443), []byte{1}) // не DNS, тоже молчит
+	u.HandlePacket(testSrc(1), testDst(53), testPkt([]byte{1}))  // DNS, замолчит
+	u.HandlePacket(testSrc(2), testDst(53), testPkt([]byte{1}))  // DNS, свежая
+	u.HandlePacket(testSrc(3), testDst(443), testPkt([]byte{1})) // не DNS, тоже молчит
 	u.testAge(testSrc(1), udpDNSIdle+time.Second)
 	u.testAge(testSrc(3), time.Minute)
 	reaped := tunStats.udpDNSReaped.Load()
@@ -155,10 +155,10 @@ func TestUDPDNSReaper(t *testing.T) {
 
 func TestUDPPacketsKeepSessionAlive(t *testing.T) {
 	u := newTestUDPHandler(t, 4)
-	u.HandlePacket(testSrc(1), testDst(53), []byte{1})
+	u.HandlePacket(testSrc(1), testDst(53), testPkt([]byte{1}))
 	u.testAge(testSrc(1), udpDNSIdle+time.Second)
 
-	u.HandlePacket(testSrc(1), testDst(53), []byte{2}) // новый запрос с того же порта
+	u.HandlePacket(testSrc(1), testDst(53), testPkt([]byte{2})) // новый запрос с того же порта
 
 	u.reapDNSOnce(time.Now())
 	if u.testConn(testSrc(1)) == nil {

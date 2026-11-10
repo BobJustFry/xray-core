@@ -98,6 +98,11 @@ func (s *stack) Close() error {
 		}
 		c.mu.Unlock()
 	}
+	// Vupen (T-075): the stack gives no more packets, so the UDP sessions go too and the bytes of
+	// their queues return to the shared cap (it is per process, the core may come up again)
+	if s.udp != nil {
+		s.udp.closeAll()
+	}
 	return nil
 }
 
