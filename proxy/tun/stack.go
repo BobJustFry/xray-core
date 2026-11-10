@@ -69,6 +69,11 @@ func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stac
 		s.segmenter = t
 		s.window = tcpLargeWindow
 	}
+	// Vupen: writes to the tun are counted for the NE heartbeat (tuning_stats.go)
+	s.tun = vupenCountingTun{options.Tun}
+	if s.segmenter != nil {
+		s.segmenter = vupenCountingSegmenter{s.segmenter}
+	}
 	// Vupen: mobile limits (tuning_mobile.go), read once per stack
 	s.window = vupenTCPWindow(s.window)
 	s.maxOpening = int32(mobileTCPMaxInFlight())
@@ -110,17 +115,29 @@ func (s *stack) Close() error {
 func (s *stack) read() {
 	// a tun that does not split segments gives them as large as a packet can be
 	b := make([]byte, packetRoom+1<<16)
+	// Vupen: a counter, not a flag: after a hot reload the old loop may still sit in a read,
+	// and the heartbeat has to show 2, a leak, not the norm
+	tunStats.readerAlive.Add(1)
+	defer tunStats.readerAlive.Add(-1)
+	var backoff time.Duration
 	for {
 		b, err := s.tun.ReadPacket(b)
 		if err != nil {
 			s.mu.Lock()
 			closed := s.closed
 			s.mu.Unlock()
-			if !closed {
-				errors.LogErrorInner(s.ctx, err, "[tun] failed to read a packet, no more are read")
+			if closed {
+				return
 			}
-			return
+			// Vupen: a temporary error is retried with a pause of up to 250 ms, only a closed
+			// descriptor stops the loop; before, any error ended it and the TUN died silently
+			if !vupenReadRetry(s.ctx, err, &backoff) {
+				return
+			}
+			continue
 		}
+		backoff = 0
+		tunStats.readPackets.Add(1)
 		p, ok := parsePacket(b)
 		if !ok {
 			continue

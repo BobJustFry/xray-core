@@ -350,7 +350,8 @@ func (c *tcpConn) input(s segment) bool {
 			c.clocked()
 		}
 		c.stack.opening.Add(-1)
-		go c.stack.handle(c, c.dst)
+		// Vupen: tcpAccepted, tcpLive (tuning_stats.go)
+		go c.stack.handleTCPConn(c)
 	} else {
 		c.acknowledge(s)
 	}
@@ -789,6 +790,7 @@ func (c *tcpConn) abort(err error) {
 		return
 	}
 	c.err = err
+	vupenTCPAborted(c, err)
 	if c.timer != nil {
 		c.timer.Stop()
 	}

@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,7 +83,7 @@ func TestVupenSynDropAtLimit(t *testing.T) {
 		t.Fatal("no SYN-ACK to the first SYN: flags ", first.flags)
 	}
 	// second SYN from another port: dropped
-	p.src = p.src.WithPort(1001)
+	p.src = netip.AddrPortFrom(p.src.Addr(), 1001)
 	p.send(5000, tcpSyn, nil, nil)
 	p.silent(200 * time.Millisecond)
 	if d := tunStats.synDrop.Load() - drops; d != 1 {
@@ -93,12 +94,12 @@ func TestVupenSynDropAtLimit(t *testing.T) {
 	}
 
 	// the first handshake completes: room for the next one
-	p.src = p.src.WithPort(1000)
+	p.src = netip.AddrPortFrom(p.src.Addr(), 1000)
 	p.ack = first.seq + 1
 	p.send(p.seq+1, tcpAck, nil, nil)
 	a := take(t, conns)
 	defer a.conn.Close()
-	p.src = p.src.WithPort(1001)
+	p.src = netip.AddrPortFrom(p.src.Addr(), 1001)
 	p.send(5000, tcpSyn, nil, nil)
 	if s := p.receive(); s.flags != tcpSyn|tcpAck {
 		t.Fatal("no SYN-ACK after the limit was freed: flags ", s.flags)
