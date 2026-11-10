@@ -117,6 +117,8 @@ const (
 type vupenStickyRouteObs interface {
 	VupenStickyCheckWith(tag string, opt burst.VupenCheckOptions) burst.VupenCheckResult
 	VupenStickyExcludeFor(tag, reason string, d time.Duration)
+	// Ядро 89 (T-228): снять исключение (исключённая цель switch прошла проверку).
+	VupenStickyUnexclude(tag, reason string) bool
 	VupenStickyCloseConns(tag string) int
 	// Ядро 80 (D-43): быстрый поиск switch (burst, tuning_vupen_switch.go).
 	VupenStickyRecent(tags []string, maxAge time.Duration) map[string]time.Duration
@@ -746,7 +748,8 @@ func (s *vupenSticky) switchRoute(h *vupenHealReq) vupenRouteResp {
 // switchToTarget — switch с target (ядро 89, D-71; горутина обработчика): перейти на
 // выбранный пользователем узел пула после проверки 24 КБ (как heal), АВТО остаётся.
 // Текущий не проверяется и не исключается; цель при провале не исключается; visited,
-// перелив и повторная проверка ядра 88 не трогаются.
+// перелив и повторная проверка ядра 88 не трогаются. Исключённая цель тоже
+// проверяется (T-228): прошла — исключение снимается.
 func (s *vupenSticky) switchToTarget(q vupenRouteReq) vupenRouteResp {
 	target := q.Target
 	resp := vupenRouteResp{Verdict: vupenRouteUnknown, From: s.viewTag()}
@@ -780,13 +783,12 @@ func (s *vupenSticky) switchToTarget(q vupenRouteReq) vupenRouteResp {
 		resp.Verdict, resp.Detail = vupenRouteSwitched, "the target is the current node"
 		return resp
 	}
-	if obs.VupenStickyExcluded(target) {
-		// D-42: исключённые по провалу не выбираются (держать исключённый узел нельзя —
-		// pick сразу начал бы поиск).
-		resp.Verdict, resp.Detail = vupenRouteTargetFailed, "the target is excluded after a failed check → kept "+kept
-		errors.LogWarning(s.logCtx(), "[sticky] ", s.balancer, ": checkRoute switch to ", target, ": ", resp.Detail)
-		return resp
-	}
+	// T-228 (решение владельца 2026-11-10): исключённая по провалу цель (D-42) не
+	// отбрасывается, а проверяется заново той же проверкой 24 КБ — один раз на тап.
+	// Прошла — исключение снимается ДО holdBecause (держать исключённый узел нельзя:
+	// pick сразу начал бы поиск); не прошла или проверку бросили — исключение остаётся
+	// как есть (срок не продлевается).
+	excluded := obs.VupenStickyExcluded(target)
 	// Как heal: проверка бросается при смене сети (результат из прежней сети не годится).
 	run := s.beginSearch(vupenNetEpochNow())
 	res := s.checkWithCtx(run, ro, target, q.options())
@@ -805,12 +807,20 @@ func (s *vupenSticky) switchToTarget(q vupenRouteReq) vupenRouteResp {
 	}
 	resp.Kind, resp.Detail = res.Kind, res.Detail
 	if res.Verdict != vupenStickyOK {
-		// Провал или «не поняли»: остаёмся на текущем, цель не исключается.
+		// Провал или «не поняли»: остаёмся на текущем, цель не исключается (исключённая
+		// остаётся исключённой с прежним сроком).
 		resp.Verdict = vupenRouteTargetFailed
 		resp.Detail += " → kept " + kept
+		if excluded {
+			resp.Detail += " (the target stays excluded)"
+		}
 		errors.LogWarning(s.logCtx(), fmt.Sprintf("[sticky] %s: checkRoute switch to %s: check %s (%s) → kept %q",
 			s.balancer, target, res.Verdict, res.Detail, prev))
 		return resp
+	}
+	if excluded {
+		// Порядок важен: сначала снять исключение, потом держать (см. выше).
+		ro.VupenStickyUnexclude(target, "switch target passed the 24 KB check")
 	}
 	s.setReport(func(r *vupenStickyReport) { r.network = vupenNetUp })
 	s.noteAlive(target)

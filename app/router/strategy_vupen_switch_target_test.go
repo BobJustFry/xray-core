@@ -3,6 +3,7 @@ package router
 import (
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -74,9 +75,8 @@ func TestVupenCheckRouteSwitchTargetDead(t *testing.T) {
 	}
 }
 
-// Неизвестный тег — not_in_pool без проверок; цель = текущий — switched без проверки;
-// исключённая по провалу цель (D-42) — target_failed без проверки.
-func TestVupenCheckRouteSwitchTargetNotInPoolCurrentExcluded(t *testing.T) {
+// Неизвестный тег — not_in_pool без проверок; цель = текущий — switched без проверки.
+func TestVupenCheckRouteSwitchTargetNotInPoolCurrent(t *testing.T) {
 	r, rt := switchRig(t)
 	if resp := pressTarget(t, rt, "p-9"); resp.Verdict != vupenRouteNotInPool || resp.From != "p-1" || resp.Tried != 0 {
 		t.Fatalf("unknown tag: %+v", resp)
@@ -84,16 +84,112 @@ func TestVupenCheckRouteSwitchTargetNotInPoolCurrentExcluded(t *testing.T) {
 	if resp := pressTarget(t, rt, "p-1"); resp.Verdict != vupenRouteSwitched || resp.From != "p-1" || resp.To != "p-1" || resp.Tried != 0 || resp.Closed != 0 {
 		t.Fatalf("target = current: %+v", resp)
 	}
-	r.obs.VupenStickyExclude("p-2", "test: dead")
-	if resp := pressTarget(t, rt, "p-2"); resp.Verdict != vupenRouteTargetFailed || resp.To != "p-1" || resp.Tried != 0 {
-		t.Fatalf("excluded target: %+v", resp)
-	}
 	if n := r.obs.routeCount(); n != 0 || r.s.viewTag() != "p-1" {
 		t.Fatalf("no check expected: %d checks, view %s", n, r.s.viewTag())
 	}
-	_, _, closed, verifies, _ := r.obs.snapshot()
-	if len(closed) != 0 || len(verifies) != 0 || len(r.obs.quickBatches()) != 0 {
-		t.Fatalf("closed %v verifies %v quick %v", closed, verifies, r.obs.quickBatches())
+}
+
+// T-228: исключённая по провалу цель (D-42) проверяется заново (одна проверка 24 КБ);
+// прошла — исключение снято до перехода, switched, поиск не начинается (pick отдаёт
+// цель, фаза Holding, ни проб, ни 64 КБ, ни других проверок 24 КБ).
+func TestVupenCheckRouteSwitchTargetExcludedPasses(t *testing.T) {
+	r, rt := switchRig(t)
+	r.obs.VupenStickyExclude("p-2", "test: dead")
+	resp := pressTarget(t, rt, "p-2")
+	if resp.Verdict != vupenRouteSwitched || resp.From != "p-1" || resp.To != "p-2" || resp.Tried != 1 || resp.Closed != 2 {
+		t.Fatalf("excluded target that passes: %+v", resp)
+	}
+	if r.obs.VupenStickyExcluded("p-2") {
+		t.Fatal("the exclusion must be lifted")
+	}
+	r.obs.mu.Lock()
+	unexcluded := slices.Clone(r.obs.unexcluded)
+	r.obs.mu.Unlock()
+	if !slices.Equal(unexcluded, []string{"p-2"}) {
+		t.Fatalf("unexclude calls %v, want [p-2]", unexcluded)
+	}
+	if got := r.pick(); got != "p-2" {
+		t.Fatalf("pick %q, want p-2", got)
+	}
+	time.Sleep(50 * time.Millisecond) // поиск, если бы pick его поставил, уже начался бы
+	excluded, _, closed, verifies, _ := r.obs.snapshot()
+	if r.s.getPhase() != vupenPhaseHolding || r.s.viewTag() != "p-2" || len(excluded) != 0 || len(verifies) != 0 ||
+		len(r.obs.quickBatches()) != 0 || r.obs.routeCount() != 1 || !slices.Equal(closed, []string{"p-1"}) {
+		t.Fatalf("no search expected: phase %v view %s excluded %v verifies %v quick %v checks %d closed %v",
+			r.s.getPhase(), r.s.viewTag(), excluded, verifies, r.obs.quickBatches(), r.obs.routeCount(), closed)
+	}
+	if st := autoState(t, rt); st.Phase != "holding" || st.Current.Tag != "p-2" || st.LastSwitch.To != "p-2" || st.LastSwitch.Reason != "switch" {
+		t.Fatalf("state: %+v", st)
+	}
+}
+
+// T-228: исключённая цель не прошла проверку (или «не поняли») — target_failed, текущий
+// остаётся, исключение остаётся (не снимается и не ставится заново/не продлевается).
+func TestVupenCheckRouteSwitchTargetExcludedFails(t *testing.T) {
+	for _, v := range []string{vupenStickyFailed, vupenStickyUnknown} {
+		r, rt := switchRig(t)
+		r.obs.VupenStickyExclude("p-2", "test: dead")
+		r.obs.setRoute("p-2", v, "stall")
+		resp := pressTarget(t, rt, "p-2")
+		if resp.Verdict != vupenRouteTargetFailed || resp.From != "p-1" || resp.To != "p-1" || resp.Tried != 1 ||
+			!strings.Contains(resp.Detail, "kept p-1") || !strings.Contains(resp.Detail, "stays excluded") {
+			t.Fatalf("%s: %+v", v, resp)
+		}
+		excluded, excludedFor, closed, verifies, _ := r.obs.snapshot()
+		r.obs.mu.Lock()
+		unexcluded := len(r.obs.unexcluded)
+		r.obs.mu.Unlock()
+		if !excluded["p-2"] || len(excluded) != 1 || len(excludedFor) != 0 || unexcluded != 0 || len(closed) != 0 || len(verifies) != 0 {
+			t.Fatalf("%s: excluded %v excludedFor %v unexcluded %d closed %v verifies %v", v, excluded, excludedFor, unexcluded, closed, verifies)
+		}
+		if r.pick() != "p-1" || r.s.getPhase() != vupenPhaseHolding || r.s.viewTag() != "p-1" {
+			t.Fatalf("%s: the current node must be kept: phase %v view %s", v, r.s.getPhase(), r.s.viewTag())
+		}
+	}
+}
+
+// T-228: снятие исключения цели одновременно с исключениями/снятиями других узлов
+// (итоги проверок обсерватории) и выдачей pick — без гонок (-race); цель снята, текущий
+// — цель.
+func TestVupenCheckRouteSwitchTargetExcludedRace(t *testing.T) {
+	r, rt := switchRig(t)
+	r.obs.VupenStickyExclude("p-2", "test: dead")
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // обсерватория: исключает и снимает p-3
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				r.obs.VupenStickyExcludeFor("p-3", "race", time.Minute)
+			} else {
+				r.obs.VupenStickyUnexclude("p-3", "race")
+			}
+			_ = r.obs.VupenStickyExcluded("p-2")
+		}
+	}()
+	go func() { // соединения: выдача узла
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = r.b.PickOutbound()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	resp := pressTarget(t, rt, "p-2")
+	close(stop)
+	wg.Wait()
+	if resp.Verdict != vupenRouteSwitched || resp.To != "p-2" || r.obs.VupenStickyExcluded("p-2") || r.s.viewTag() != "p-2" {
+		t.Fatalf("race: %+v excluded=%v view %s", resp, r.obs.VupenStickyExcluded("p-2"), r.s.viewTag())
 	}
 }
 

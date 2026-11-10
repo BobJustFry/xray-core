@@ -273,6 +273,29 @@ func (o *Observer) VupenStickyExcludeFor(tag, reason string, d time.Duration) {
 	errors.LogWarning(h.ctx, "[sticky] ", tag, " excluded for ", d, " (", reason, ")")
 }
 
+// VupenStickyUnexclude — снять исключение узла (любое: VupenStickyExcludeFor или
+// заморозку проверки 64 КБ) — ядро 89 (T-228): исключённый узел, выбранный
+// пользователем, прошёл проверку 24 КБ. То же, что делает успешная проверка 64 КБ
+// (frozenUntil сбрасывается); «проверен» не ставится. Возвращает, был ли узел исключён.
+func (o *Observer) VupenStickyUnexclude(tag, reason string) bool {
+	if o.hp == nil {
+		return false
+	}
+	h := o.hp
+	h.tspu.mu.Lock()
+	e := h.tspu.m[tag]
+	was := e != nil && time.Now().Before(e.frozenUntil)
+	if e != nil {
+		e.frozenUntil = time.Time{}
+		e.frozenAt = time.Time{}
+	}
+	h.tspu.mu.Unlock()
+	if was {
+		errors.LogWarning(h.ctx, "[sticky] ", tag, " exclusion lifted (", reason, ")")
+	}
+	return was
+}
+
 // VupenStickyCloseConns — закрыть сразу соединения узла tag этого экземпляра
 // ядра (сторож заморозки и эпоха сети). Возвращает сколько закрыто.
 func (o *Observer) VupenStickyCloseConns(tag string) int {

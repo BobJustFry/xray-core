@@ -43,6 +43,15 @@ func (f *stickyFakeObs) VupenStickyExcludeFor(tag, reason string, d time.Duratio
 	f.excludedFor[tag] = d
 }
 
+func (f *stickyFakeObs) VupenStickyUnexclude(tag, reason string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	was := f.excluded[tag]
+	delete(f.excluded, tag)
+	f.unexcluded = append(f.unexcluded, tag)
+	return was
+}
+
 func (f *stickyFakeObs) VupenStickyCloseConns(tag string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
