@@ -30,8 +30,9 @@ func TestVupenTCPWindow(t *testing.T) {
 		want     int32
 	}{
 		{1024, tcpWindow, tcpWindow},           // default: upstream 256 KiB
-		{512, tcpWindow, tcpWindow},            // iPhone .mobile preset: still 256 KiB
-		{128, tcpWindow, 128 << 10},            // lowered
+		{512, tcpWindow, tcpWindow},            // still 256 KiB
+		{128, tcpWindow, 128 << 10},            // iPhone .mobile preset: lowered
+		{64, tcpWindow, 128 << 10},             // floor
 		{16, tcpWindow, tcpWindowMinKB << 10},  // floor
 		{1024, tcpLargeWindow, tcpLargeWindow}, // large segments (Linux)
 		{512, tcpLargeWindow, 512 << 10},

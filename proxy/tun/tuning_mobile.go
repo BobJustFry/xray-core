@@ -106,9 +106,12 @@ func mobileUDPEgressDepth() int {
 	return n
 }
 
-// tcpWindowMinKB is the least window SetTCPBufMaxKB can set: a few segments,
-// below that a connection crawls.
-const tcpWindowMinKB = 64
+// tcpWindowMinKB is the least window SetTCPBufMaxKB can set: 128 KiB, the
+// value of the iPhone .mobile preset, the smallest one the apps ship. Below it
+// the stack's ACK on arrival (once tcpWindow/4 = 64 KiB, a constant, is
+// unacknowledged) fires only on a full window, so the system waits for the
+// outbound to read or for tcpTick, and one stream gets ~5 Mbit/s at 100 ms RTT.
+const tcpWindowMinKB = 128
 
 // vupenTCPWindow caps the window of the built-in stack by tcpBufMaxKB.
 func vupenTCPWindow(upstream int32) int32 {
