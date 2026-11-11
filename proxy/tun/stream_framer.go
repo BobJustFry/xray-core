@@ -22,8 +22,12 @@ import (
 // берётся из IP-заголовка (IPv4 TotalLength, IPv6 PayloadLength + 40), как это
 // делает нисходящий поток на стороне Swift. Битый заголовок — resync по
 // следующему правдоподобному `AF + version`, со счётчиком и строкой в лог.
+// Накопитель acc[off:n]: off — начало первого неразобранного кадра. pop только
+// двигает off, сдвиг остатка в начало делает free() перед следующим Read — один
+// memmove хвоста (неполного кадра) на Read, а не всего остатка на каждый кадр.
 type streamFramer struct {
 	acc    []byte
+	off    int
 	n      int
 	desync int
 }
@@ -42,8 +46,17 @@ func newStreamFramer() *streamFramer {
 	return &streamFramer{acc: make([]byte, streamFramerAccSize)}
 }
 
-// free — сколько байт ещё можно дочитать в накопитель.
-func (f *streamFramer) free() []byte { return f.acc[f.n:] }
+// free — куда дочитать следующий Read; неполный хвост сначала сдвигается в начало.
+func (f *streamFramer) free() []byte {
+	if f.off > 0 {
+		f.n = copy(f.acc, f.acc[f.off:f.n])
+		f.off = 0
+	}
+	return f.acc[f.n:]
+}
+
+// reset — выбросить всё накопленное.
+func (f *streamFramer) reset() { f.off, f.n = 0, 0 }
 
 // commit — Read положил n байт в free().
 func (f *streamFramer) commit(n int) { f.n += n }
@@ -51,50 +64,54 @@ func (f *streamFramer) commit(n int) { f.n += n }
 // frameLen — длина первого целого кадра (включая 4 байта AF); 0 — кадр ещё
 // неполный; errStreamDesync — заголовок не похож на кадр.
 func (f *streamFramer) frameLen() (int, error) {
-	if f.n < streamHeaderSize+1 {
+	p := f.acc[f.off:f.n]
+	if len(p) < streamHeaderSize+1 {
 		return 0, nil
 	}
-	af, ver := f.acc[3], f.acc[4]>>4
-	if f.acc[0] != 0 || f.acc[1] != 0 || f.acc[2] != 0 {
+	af, ver := p[3], p[4]>>4
+	if p[0] != 0 || p[1] != 0 || p[2] != 0 {
 		return 0, errStreamDesync
 	}
 	switch {
 	case af == streamAFInet && ver == 4:
-		if f.n < streamHeaderSize+20 {
+		if len(p) < streamHeaderSize+20 {
 			return 0, nil
 		}
-		total := int(binary.BigEndian.Uint16(f.acc[streamHeaderSize+2 : streamHeaderSize+4]))
+		total := int(binary.BigEndian.Uint16(p[streamHeaderSize+2 : streamHeaderSize+4]))
 		if total < 20 {
 			return 0, errStreamDesync
 		}
-		return f.complete(streamHeaderSize + total)
+		return f.complete(len(p), streamHeaderSize+total)
 	case af == streamAFInet6 && ver == 6:
-		if f.n < streamHeaderSize+40 {
+		if len(p) < streamHeaderSize+40 {
 			return 0, nil
 		}
-		payload := int(binary.BigEndian.Uint16(f.acc[streamHeaderSize+4 : streamHeaderSize+6]))
-		return f.complete(streamHeaderSize + 40 + payload)
+		payload := int(binary.BigEndian.Uint16(p[streamHeaderSize+4 : streamHeaderSize+6]))
+		return f.complete(len(p), streamHeaderSize+40+payload)
 	default:
 		return 0, errStreamDesync
 	}
 }
 
-func (f *streamFramer) complete(frame int) (int, error) {
+// complete — кадр длиной frame целиком среди have накопленных байт? Кадр
+// длиннее накопителя не дочитать никогда — это desync.
+func (f *streamFramer) complete(have, frame int) (int, error) {
 	if frame > streamMaxFrame || frame > len(f.acc) {
 		return 0, errStreamDesync
 	}
-	if f.n < frame {
+	if have < frame {
 		return 0, nil
 	}
 	return frame, nil
 }
 
 // pop — вырезает первый кадр длиной frame: IP-пакет без AF-заголовка копируется
-// в dst (длины frame-4, из пула buf), остаток накопителя сдвигается в начало.
+// в dst (длины frame-4), off сдвигается за кадр; остаток не двигается (free).
 func (f *streamFramer) pop(frame int, dst []byte) int {
-	n := copy(dst, f.acc[streamHeaderSize:frame])
-	copy(f.acc, f.acc[frame:f.n])
-	f.n -= frame
+	n := copy(dst, f.acc[f.off+streamHeaderSize:f.off+frame])
+	if f.off += frame; f.off == f.n {
+		f.reset()
+	}
 	return n
 }
 
@@ -103,18 +120,18 @@ func (f *streamFramer) pop(frame int, dst []byte) int {
 // найдено — накопитель очищается целиком. Возвращает число выброшенных байт.
 func (f *streamFramer) resync() int {
 	f.desync++
-	for i := 1; i+streamHeaderSize < f.n; i++ {
-		if f.acc[i] != 0 || f.acc[i+1] != 0 || f.acc[i+2] != 0 {
+	p := f.acc[f.off:f.n]
+	for i := 1; i+streamHeaderSize < len(p); i++ {
+		if p[i] != 0 || p[i+1] != 0 || p[i+2] != 0 {
 			continue
 		}
-		af, ver := f.acc[i+3], f.acc[i+4]>>4
+		af, ver := p[i+3], p[i+4]>>4
 		if (af == streamAFInet && ver == 4) || (af == streamAFInet6 && ver == 6) {
-			copy(f.acc, f.acc[i:f.n])
-			f.n -= i
+			f.off += i
 			return i
 		}
 	}
-	dropped := f.n
-	f.n = 0
+	dropped := len(p)
+	f.reset()
 	return dropped
 }

@@ -352,7 +352,7 @@ func (t *DarwinTun) readFramedPacket(b []byte) ([]byte, error) {
 		free := f.free()
 		if len(free) == 0 {
 			// Недостижимо: кадр длиннее накопителя отбраковывает complete().
-			f.n = 0
+			f.reset()
 			continue
 		}
 		t.framesSinceRead = 0

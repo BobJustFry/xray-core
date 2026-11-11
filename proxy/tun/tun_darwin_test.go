@@ -3,10 +3,15 @@
 package tun
 
 import (
+	"errors"
+	"io"
+	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/platform"
 	"golang.org/x/sys/unix"
 )
 
@@ -229,5 +234,71 @@ func TestWaitKqueueReportsPersistentFailure(t *testing.T) {
 		if kq.wait(50 * time.Millisecond) {
 			t.Fatalf("wait() call %d returned true against a closed underlying fd -- should report failure, not spin", i)
 		}
+	}
+}
+
+// T-253: the iOS path end to end. NewTun gets the extension's fd through
+// xray.tun.fd, sees a SOCK_STREAM socket and turns the framer on; ReadPacket
+// then gives whole IP packets whether the writer coalesces frames, splits one
+// across writes or pauses in the middle of a header (EAGAIN -> Wait); when the
+// writer closes its end the reader gets a fatal error, not an endless retry.
+func TestDarwinTunFramedRead(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	ext, writer := fds[0], fds[1]
+	defer unix.Close(ext) // NewTun dups it
+	t.Setenv(platform.TunFdKey, strconv.Itoa(ext))
+	tn, err := NewTun(&Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dt := tn.(*DarwinTun)
+	defer dt.Close()
+	if dt.framer == nil {
+		t.Fatal("framer is off on a SOCK_STREAM fd")
+	}
+
+	a, b, c := ipv4Frame(1208), ipv4Frame(1046), ipv6Frame(3000)
+	go func() {
+		w := func(p []byte) { _, _ = unix.Write(writer, p) }
+		w(append(append([]byte{}, a...), b...)) // two frames in one write
+		time.Sleep(20 * time.Millisecond)
+		w(c[:2]) // inside the AF header
+		time.Sleep(20 * time.Millisecond)
+		w(c[2:1500])
+		time.Sleep(20 * time.Millisecond)
+		w(c[1500:])
+		time.Sleep(20 * time.Millisecond)
+		unix.Close(writer)
+	}()
+
+	buf := make([]byte, packetRoom+1<<16)
+	for i, want := range [][]byte{a, b, c} {
+		got, err := dt.ReadPacket(buf)
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		if len(got) != len(want)-streamHeaderSize || string(got) != string(want[streamHeaderSize:]) {
+			t.Fatalf("packet %d: len %d, want %d", i, len(got), len(want)-streamHeaderSize)
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := dt.ReadPacket(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !isTunReadFatal(err) {
+			t.Fatalf("after the writer closed: %v, not fatal", err)
+		}
+		if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.ENOTCONN) {
+			t.Logf("closed peer answered %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ReadPacket did not return after the writer closed")
 	}
 }

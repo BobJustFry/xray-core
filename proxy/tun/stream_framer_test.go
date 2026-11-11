@@ -115,6 +115,62 @@ func TestStreamFramerResync(t *testing.T) {
 	}
 }
 
+// T-253: pop only moves off; the tail of a partial frame is moved to the start
+// by free() before the next Read, so a frame that does not fit behind off still
+// fits after it, and nothing is lost or reordered.
+func TestStreamFramerCompactsOnFree(t *testing.T) {
+	f := newStreamFramer()
+	var stream []byte
+	for i := range 60 {
+		stream = append(stream, ipv4Frame(1000+i)...)
+	}
+	big := ipv6Frame(20000)
+	stream = append(stream, big...)
+	want := 61
+	var got [][]byte
+	for len(stream) > 0 {
+		room := f.free()
+		if f.off != 0 {
+			t.Fatalf("free left off=%d", f.off)
+		}
+		n := copy(room, stream[:min(len(stream), 9000)])
+		f.commit(n)
+		stream = stream[n:]
+		got = append(got, popAll(t, f)...)
+	}
+	if len(got) != want || f.n != 0 || f.off != 0 {
+		t.Fatalf("got %d frames, want %d; n=%d off=%d", len(got), want, f.n, f.off)
+	}
+	for i := range 60 {
+		if len(got[i]) != 20+1000+i || got[i][0] != 0x45 {
+			t.Fatalf("frame %d: len %d", i, len(got[i]))
+		}
+	}
+	if len(got[60]) != 40+20000 || got[60][0] != 0x60 {
+		t.Fatalf("last frame: len %d", len(got[60]))
+	}
+}
+
+// resync after frames that were popped: it searches from off, not from 0.
+func TestStreamFramerResyncAfterPop(t *testing.T) {
+	f := newStreamFramer()
+	a, b := ipv4Frame(100), ipv4Frame(50)
+	feed(t, f, append(append(append([]byte{}, a...), 0xff, 0xff, 0xff), b...))
+	if fl, err := f.frameLen(); err != nil || fl != len(a) {
+		t.Fatalf("first frame %d %v", fl, err)
+	}
+	f.pop(len(a), make([]byte, len(a)-streamHeaderSize))
+	if _, err := f.frameLen(); err == nil {
+		t.Fatal("expected desync")
+	}
+	if dropped := f.resync(); dropped != 3 {
+		t.Fatalf("dropped %d, want 3", dropped)
+	}
+	if got := popAll(t, f); len(got) != 1 || len(got[0]) != 70 {
+		t.Fatalf("got %v", lens(got))
+	}
+}
+
 func lens(b [][]byte) []int {
 	out := make([]int, len(b))
 	for i := range b {
