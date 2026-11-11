@@ -101,14 +101,21 @@ func vupenTCPAborted(c *tcpConn, err error) {
 	}
 }
 
-// isTunReadFatal — дескриптор закрыт или EOF: повторять нечего.
+// isTunReadFatal — дескриптор закрыт, EOF или другой конец ушёл: повторять
+// нечего. На iOS fd — socketpair(SOCK_STREAM) расширения: когда Swift закрыл
+// свой конец, Read отвечает ECONNRESET / ENOTCONN (EPIPE — на всякий случай,
+// так же отвечает запись), и без них цикл чтения крутил бы ретраи по 250 мс
+// вечно, с readerAlive=1 в heartbeat.
 func isTunReadFatal(err error) bool {
 	if goerrors.Is(err, io.EOF) || goerrors.Is(err, os.ErrClosed) || goerrors.Is(err, gonet.ErrClosed) {
 		return true
 	}
 	var errno syscall.Errno
 	if goerrors.As(err, &errno) {
-		return errno == syscall.EBADF
+		switch errno {
+		case syscall.EBADF, syscall.ECONNRESET, syscall.ENOTCONN, syscall.EPIPE:
+			return true
+		}
 	}
 	return false
 }

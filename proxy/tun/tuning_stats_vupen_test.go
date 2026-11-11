@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -159,8 +161,20 @@ func TestVupenStatsWriteDrop(t *testing.T) {
 }
 
 func TestVupenReadFatal(t *testing.T) {
-	if !isTunReadFatal(io.EOF) || isTunReadFatal(errors.New("temporary")) {
-		t.Fatal("isTunReadFatal")
+	fatal := []error{
+		io.EOF, os.ErrClosed,
+		syscall.EBADF, syscall.ECONNRESET, syscall.ENOTCONN, syscall.EPIPE,
+		&os.PathError{Op: "read", Path: "utun", Err: syscall.ECONNRESET}, // as os.File.Read wraps it
+	}
+	for _, err := range fatal {
+		if !isTunReadFatal(err) {
+			t.Errorf("%v: not fatal", err)
+		}
+	}
+	for _, err := range []error{errors.New("temporary"), syscall.EAGAIN, syscall.EINTR, syscall.ENOBUFS} {
+		if isTunReadFatal(err) {
+			t.Errorf("%v: fatal", err)
+		}
 	}
 }
 
