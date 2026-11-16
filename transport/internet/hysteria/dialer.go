@@ -267,8 +267,8 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 // процессе (ожидающий manager.Lock блокирует новые RLock) — живой туннель
 // замирал на ~3 с на каждый молчащий узел. Занят — не ждём и возвращаем false:
 // следующий тик повторит (force пересчитывается заново, запись остаётся в map).
-// Апстрим на этом коммите ещё делает c.Lock() под RLock (канальный замок и
-// снимок map вне RLock приходят с #7122 в v26.10.21).
+// Апстрим (#7122) делает c.Lock() вне manager.RLock; здесь — TryLock (CR-101),
+// снимок map вне RLock см. в clientManager.clean (T-322).
 func (c *client) clean(force bool) bool {
 	if !c.TryLock() {
 		return false
@@ -296,21 +296,28 @@ type clientManager struct {
 func (m *clientManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
 	for range ticker.C {
-		var forced []dialerConf
-
+		// Vupen (T-322, upstream #7122): IsRunning() takes Instance.statusLock, which
+		// Instance.Close holds while it closes every outbound -> Handler.Close ->
+		// vupenReleaseHysteria -> manager.Lock. Calling it under manager.RLock
+		// deadlocks the two (core 90, Windows TUN stop). So: snapshot under RLock,
+		// release, and only then ask the instance; manager.Lock is taken only for
+		// the delete, never while a client or the instance is consulted.
 		m.RLock()
+		entries := make(map[dialerConf]*client, len(m.m))
 		for k, c := range m.m {
-			force := c.instance != nil && !c.instance.IsRunning()
-			if c.clean(force) && force {
-				forced = append(forced, k)
-			}
+			entries[k] = c
 		}
 		m.RUnlock()
 
-		for i := range forced {
-			m.Lock()
-			delete(m.m, forced[i])
-			m.Unlock()
+		for k, c := range entries {
+			force := c.instance != nil && !c.instance.IsRunning()
+			if c.clean(force) && force {
+				m.Lock()
+				if m.m[k] == c { // a release/Dial may have replaced it meanwhile
+					delete(m.m, k)
+				}
+				m.Unlock()
+			}
 		}
 	}
 }
